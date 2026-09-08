@@ -606,4 +606,111 @@ abstract class Material {
     gpu.Shader shader,
     TransientWriter transientsBuffer,
   ) {}
+
+  /// Binds what the surface-content object mask shaders (`MaskAlbedoFragment`,
+  /// `MaskNormalFragment`, see `MaskContent`) sample: the base color texture
+  /// with its factor and UV transform, and the normal map with its scale, in
+  /// the `MaskSurfaceInfo` block. The base material has neither, so it binds
+  /// a white base color and a flat normal; materials with textures override.
+  ///
+  /// [baseColor] and [normal] say which samplers [shader] actually declares:
+  /// the albedo shader never reads the normal map and the normal shader
+  /// never reads the base color, the compiler drops the unused sampler, and
+  /// binding a slot the shader no longer has throws (`no texture named
+  /// 'normal_texture'`) — which took the whole custom pass down on its first
+  /// frame.
+  @internal
+  void bindMaskSurface(
+    gpu.RenderPass pass,
+    gpu.Shader shader,
+    TransientWriter transientsBuffer, {
+    required bool baseColor,
+    required bool normal,
+  }) {
+    bindMaskSurfaceInputs(
+      pass,
+      shader,
+      transientsBuffer,
+      bindBaseColor: baseColor,
+      bindNormal: normal,
+      color: const [1.0, 1.0, 1.0],
+      vertexColorWeight: 0.0,
+      baseColorTexture: null,
+      baseColorSampler: null,
+      normalTexture: null,
+      normalSampler: null,
+      normalScale: 1.0,
+    );
+  }
+
+  /// The shared implementation behind [bindMaskSurface]: packs the
+  /// `MaskSurfaceInfo` block (six vec4s — color factor and vertex-color
+  /// weight, base color UV transform and rotation/channel, normal UV
+  /// transform and rotation/channel, normal-map flag and scale) and binds
+  /// the samplers the shader declares ([bindBaseColor], [bindNormal]),
+  /// substituting the neutral placeholders for missing textures. The
+  /// transforms are packed offset/scale + cos/sin/channel, eight floats each
+  /// (see `PhysicallyBasedMaterial`), identity when null.
+  @internal
+  static void bindMaskSurfaceInputs(
+    gpu.RenderPass pass,
+    gpu.Shader shader,
+    TransientWriter transientsBuffer, {
+    required bool bindBaseColor,
+    required bool bindNormal,
+    required List<double> color,
+    required double vertexColorWeight,
+    required gpu.Texture? baseColorTexture,
+    required gpu.SamplerOptions? baseColorSampler,
+    required gpu.Texture? normalTexture,
+    required gpu.SamplerOptions? normalSampler,
+    required double normalScale,
+    Float32List? baseColorTransform,
+    Float32List? normalTransform,
+  }) {
+    final info = Float32List(24)
+      ..[0] = color[0]
+      ..[1] = color[1]
+      ..[2] = color[2]
+      ..[3] = vertexColorWeight
+      // Identity transforms: offset 0, scale 1, cos 1, sin 0, channel 0.
+      ..[6] = 1
+      ..[7] = 1
+      ..[8] = 1
+      ..[14] = 1
+      ..[15] = 1
+      ..[16] = 1
+      ..[20] = normalTexture != null ? 1.0 : 0.0
+      ..[21] = normalScale;
+    if (baseColorTransform != null) {
+      info.setRange(4, 12, baseColorTransform);
+    }
+    if (normalTransform != null) {
+      info.setRange(12, 20, normalTransform);
+    }
+    pass.bindUniform(
+      shader.getUniformSlot('MaskSurfaceInfo'),
+      transientsBuffer.emplace(ByteData.sublistView(info)),
+    );
+    if (bindBaseColor) {
+      pass.bindTexture(
+        shader.getUniformSlot('base_color_texture'),
+        whitePlaceholder(baseColorTexture),
+        sampler: baseColorSampler ?? _maskRepeatSampler,
+      );
+    }
+    if (bindNormal) {
+      pass.bindTexture(
+        shader.getUniformSlot('normal_texture'),
+        normalPlaceholder(normalTexture),
+        sampler: normalSampler ?? _maskRepeatSampler,
+      );
+    }
+  }
+
+  // Material textures tile; sample them with repeat.
+  static final gpu.SamplerOptions _maskRepeatSampler = gpu.SamplerOptions(
+    widthAddressMode: gpu.SamplerAddressMode.repeat,
+    heightAddressMode: gpu.SamplerAddressMode.repeat,
+  );
 }

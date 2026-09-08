@@ -115,6 +115,14 @@
     "type": "fragment",
     "file": "shaders/flutter_scene_mask.frag"
   },
+  "MaskAlbedoFragment": {
+    "type": "fragment",
+    "file": "shaders/flutter_scene_mask_albedo.frag"
+  },
+  "MaskNormalFragment": {
+    "type": "fragment",
+    "file": "shaders/flutter_scene_mask_normal.frag"
+  },
   "OutlineFragment": {
     "type": "fragment",
     "file": "shaders/flutter_scene_outline.frag"

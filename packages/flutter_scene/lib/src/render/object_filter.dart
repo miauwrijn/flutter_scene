@@ -49,6 +49,26 @@ class NodeFilter {
   }
 }
 
+/// What an object-filtered draw writes for each covered pixel.
+/// 
+/// {@category Rendering}
+enum MaskContent {
+  /// The per-item color as given: a flat silhouette.
+  flat,
+
+  /// The per-item color multiplied by the material's textured base color
+  /// (linear; base color factor, texture and weighted vertex color), so a
+  /// pass can shade with the surface's own albedo at full resolution. Alpha
+  /// is the per-item color's alpha.
+  albedo,
+
+  /// The material's shading normal — the geometric normal perturbed by its
+  /// normal map, as the color pass lights with — in world space, encoded
+  /// `n * 0.5 + 0.5` in rgb. Alpha is the per-item color's alpha. The
+  /// per-item rgb is ignored.
+  normal,
+}
+
 /// Draws a filtered set of the scene's geometry flat into [target], each
 /// item filled with a solid color (coverage in alpha), with its own cleared
 /// depth so the filtered objects self-occlude but are not occluded by the
@@ -69,6 +89,7 @@ void renderObjectMask({
   required int layerMask,
   required NodeFilter filter,
   required Vector4 Function(RenderItem item) colorOf,
+  MaskContent content = MaskContent.flat,
 }) {
   final renderTarget = gpu.RenderTarget.singleColor(
     gpu.ColorAttachment(texture: target, clearValue: clearColor),
@@ -87,6 +108,7 @@ void renderObjectMask({
     layerMask,
     filter,
     colorOf,
+    content,
   );
   renderScene.cull(encoder.frustum, encoder.submit);
   rendererSubmissions.submit(commandBuffer);
@@ -104,6 +126,7 @@ class _ObjectMaskEncoder {
     this._layerMask,
     this._filter,
     this._colorOf,
+    this._content,
   ) {
     frustum = Frustum.matrix(_cameraTransform);
     _renderPass.setDepthWriteEnable(true);
@@ -120,8 +143,19 @@ class _ObjectMaskEncoder {
   final int _layerMask;
   final NodeFilter _filter;
   final Vector4 Function(RenderItem item) _colorOf;
+  final MaskContent _content;
 
   static final gpu.Shader _maskShader = baseShaderLibrary['MaskFragment']!;
+  static final gpu.Shader _albedoShader =
+      baseShaderLibrary['MaskAlbedoFragment']!;
+  static final gpu.Shader _normalShader =
+      baseShaderLibrary['MaskNormalFragment']!;
+
+  gpu.Shader get _fragmentShader => switch (_content) {
+    MaskContent.flat => _maskShader,
+    MaskContent.albedo => _albedoShader,
+    MaskContent.normal => _normalShader,
+  };
 
   late final Frustum frustum;
   gpu.RenderPipeline? _boundPipeline;
@@ -140,16 +174,39 @@ class _ObjectMaskEncoder {
     // A `vertex { }` material displaces geometry, so pick against its displaced
     // silhouette by running the material's vertex variant here too. This pass
     // binds the real camera, so a camera-relative displacement is correct.
-    final depthVertex = geometry.depthOnlyVertex;
+    // The surface contents sample the material through the full varyings
+    // (UVs, normal, tangent), so they skip the position-only path as the
+    // masked depth prepass does.
+    final surfaceContent = _content != MaskContent.flat;
+    final depthVertex = surfaceContent ? null : geometry.depthOnlyVertex;
     final materialVertex = item.material.materialVertexShader(
       depthVertex != null ? 'depth' : geometry.materialVertexVariant,
     );
     final activeVertex =
         materialVertex ?? depthVertex?.shader ?? geometry.vertexShader;
+    final fragmentShader = _fragmentShader;
+    // Without the position-only path this runs the material's color vertex
+    // variant, which declares its per-instance attribute inputs, so the
+    // instance record has to be as wide here as in the color pass (see the
+    // depth prepass encoder).
+    final instanceSchema = depthVertex == null
+        ? item.material.instanceAttributes
+        : null;
+    final attributeFloats = instanceSchema?.floatCount ?? 0;
+    // The instance-rate record sits in the slot after the bound vertex
+    // streams: slot 1 on the position-only path, [vertexStreamCount] on the
+    // full path — and on the full path it is the wide instance-data record
+    // (transform, color, material attributes), not the bare transform. The
+    // first version of the surface contents bound a transform at slot 1 on
+    // the full path: every object landed at a garbage transform, the mask
+    // came out cleared, and the pass multiplying by it showed nothing.
+    final instanceSlot = depthVertex != null ? 1 : geometry.vertexStreamCount;
     final pipeline = resolvePipeline(
       activeVertex,
-      _maskShader,
-      vertexLayout: depthVertex?.layout ?? geometry.instancedVertexLayout,
+      fragmentShader,
+      vertexLayout:
+          depthVertex?.layout ??
+          geometry.instancedVertexLayoutFor(instanceSchema),
     );
     if (!identical(_boundPipeline, pipeline)) {
       _renderPass.bindPipeline(pipeline);
@@ -169,9 +226,20 @@ class _ObjectMaskEncoder {
       ..[2] = highlight.z
       ..[3] = highlight.w == 0 ? 1.0 : highlight.w;
     _renderPass.bindUniform(
-      _maskShader.getUniformSlot('MaskInfo'),
+      fragmentShader.getUniformSlot('MaskInfo'),
       _transientsBuffer.emplace(ByteData.sublistView(color)),
     );
+    if (surfaceContent) {
+      // Each surface shader declares only the sampler it reads (see
+      // Material.bindMaskSurface for why the other must not be bound).
+      item.material.bindMaskSurface(
+        _renderPass,
+        fragmentShader,
+        _transientsBuffer,
+        baseColor: _content == MaskContent.albedo,
+        normal: _content == MaskContent.normal,
+      );
+    }
 
     // Binds the vertex/index buffers and the per-frame uniform for one draw.
     void bindDraw(Matrix4 worldTransform) {
@@ -222,19 +290,37 @@ class _ObjectMaskEncoder {
         return;
       }
       bindDraw(item.worldTransform);
-      final packed = packInstanceTransforms(
-        item.worldTransform,
-        instances,
-        nodeWindingFlipped: item.windingFlipped,
-        scratch: transientInstancePackingScratch,
-      );
+      final PackedInstances packed = depthVertex == null
+          ? packInstanceData(
+              item.worldTransform,
+              instances,
+              item.instanceColors!,
+              nodeWindingFlipped: item.windingFlipped,
+              instanceWindingFlipped: item.instanceWindingFlipped,
+              attributeData: item.instanceAttributeData,
+              attributeFloats: attributeFloats,
+              scratch: transientInstancePackingScratch,
+            )
+          : packInstanceTransforms(
+              item.worldTransform,
+              instances,
+              nodeWindingFlipped: item.windingFlipped,
+              scratch: transientInstancePackingScratch,
+            );
+      void bindPacked(Float32List buffer) {
+        if (depthVertex == null) {
+          bindInstanceData(_renderPass, buffer, slot: instanceSlot);
+        } else {
+          bindInstanceTransforms(_renderPass, buffer, slot: instanceSlot);
+        }
+      }
       if (packed.ccwCount > 0) {
-        bindInstanceTransforms(_renderPass, packed.ccw);
+        bindPacked(packed.ccw);
         _renderPass.setWindingOrder(gpu.WindingOrder.clockwise);
         geometry.draw(_renderPass, instanceCount: packed.ccwCount);
       }
       if (packed.cwCount > 0) {
-        bindInstanceTransforms(_renderPass, packed.cw);
+        bindPacked(packed.cw);
         _renderPass.setWindingOrder(gpu.WindingOrder.counterClockwise);
         geometry.draw(_renderPass, instanceCount: packed.cwCount);
       }
@@ -249,7 +335,20 @@ class _ObjectMaskEncoder {
     // a transform matrix.
     if (geometry.instancedVertexLayout != null &&
         geometry.bindsModelTransformInstance) {
-      bindSingleInstanceTransform(_renderPass, item.worldTransform);
+      if (depthVertex == null) {
+        bindSingleInstanceData(
+          _renderPass,
+          item.worldTransform,
+          slot: instanceSlot,
+          attributeFloats: attributeFloats,
+        );
+      } else {
+        bindSingleInstanceTransform(
+          _renderPass,
+          item.worldTransform,
+          slot: instanceSlot,
+        );
+      }
     }
     _renderPass.setWindingOrder(
       item.windingFlipped

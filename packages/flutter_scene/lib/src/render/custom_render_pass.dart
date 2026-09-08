@@ -332,12 +332,19 @@ class RenderPassContext {
   ///
   /// [filter] selects which nodes draw. [colorOf] gives a per-node color
   /// (linear RGBA); when null every object uses [color] (default opaque
-  /// white). The mask is view-sized and valid for the rest of the frame.
+  /// white). [content] picks what a covered pixel holds: the color as given
+  /// ([MaskContent.flat]), the color times the material's textured base
+  /// color ([MaskContent.albedo]), or the material's normal-mapped shading
+  /// normal ([MaskContent.normal]) — the two surface contents let a pass
+  /// shade with the surface's own detail, the way the color pass does (see
+  /// [MaskContent] for why they exist). The mask is view-sized and valid for
+  /// the rest of the frame.
   gpu.Texture drawObjects({
     NodeFilter filter = const NodeFilter.all(),
     Vector4? color,
     Vector4 Function(Object node)? colorOf,
     Vector4? clearColor,
+    MaskContent content = MaskContent.flat,
   }) {
     final width = dimensions.width.toInt();
     final height = dimensions.height.toInt();
@@ -375,6 +382,7 @@ class RenderPassContext {
               final node = item.sourceNode;
               return node == null ? fill : colorOf(node);
             },
+      content: content,
     );
     return mask;
   }
