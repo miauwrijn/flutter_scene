@@ -1817,6 +1817,48 @@ class PhysicallyBasedMaterial extends Material {
   }
 
   @override
+  void bindMaskSurface(
+    gpu.RenderPass pass,
+    gpu.Shader shader,
+    TransientWriter transientsBuffer, {
+    required bool baseColor,
+    required bool normal,
+  }) {
+    // The same inputs Surface() shades with: base color factor, texture and
+    // weighted vertex color; the normal map with its scale.
+    final baseTransform = Float32List(8);
+    _packTextureTransform(
+      baseTransform,
+      0,
+      baseColorTextureTransform,
+      baseColorTextureTexCoord,
+    );
+    final normalTransform = Float32List(8);
+    _packTextureTransform(
+      normalTransform,
+      0,
+      normalTextureTransform,
+      normalTextureTexCoord,
+    );
+    Material.bindMaskSurfaceInputs(
+      pass,
+      shader,
+      transientsBuffer,
+      bindBaseColor: baseColor,
+      bindNormal: normal,
+      color: [baseColorFactor.r, baseColorFactor.g, baseColorFactor.b],
+      vertexColorWeight: vertexColorWeight,
+      baseColorTexture: resolveTextureSource(baseColorTexture),
+      baseColorSampler: textureSourceSampler(baseColorTexture),
+      normalTexture: resolveTextureSource(normalTexture),
+      normalSampler: textureSourceSampler(normalTexture),
+      normalScale: normalScale,
+      baseColorTransform: baseTransform,
+      normalTransform: normalTransform,
+    );
+  }
+
+  @override
   bool isOpaque() {
     // BLEND always goes through the translucent pass. OPAQUE and MASK
     // are drawn in the opaque pass (MASK relies on the shader's
