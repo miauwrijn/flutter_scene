@@ -646,7 +646,11 @@ abstract class Material {
   /// The shared implementation behind [bindMaskSurface]: packs the
   /// `MaskSurfaceInfo` block (six vec4s — color factor and vertex-color
   /// weight, base color UV transform and rotation/channel, normal UV
-  /// transform and rotation/channel, normal-map flag and scale) and binds
+  /// transform and rotation/channel, normal-map flag and scale, and for a
+  /// cut-out material its [alphaCutoff] with the [vertexAlphaWeight] its
+  /// coverage multiplies in — 0 skips the test; and [triplanarRepeat], the
+  /// per-unit repeat a UV-less surface samples its base color with by
+  /// position, 0 for none) and binds
   /// the samplers the shader declares ([bindBaseColor], [bindNormal]),
   /// substituting the neutral placeholders for missing textures. The
   /// transforms are packed offset/scale + cos/sin/channel, eight floats each
@@ -667,6 +671,9 @@ abstract class Material {
     required double normalScale,
     Float32List? baseColorTransform,
     Float32List? normalTransform,
+    double alphaCutoff = 0.0,
+    double vertexAlphaWeight = 0.0,
+    double triplanarRepeat = 0.0,
   }) {
     final info = Float32List(24)
       ..[0] = color[0]
@@ -681,10 +688,17 @@ abstract class Material {
       ..[15] = 1
       ..[16] = 1
       ..[20] = normalTexture != null ? 1.0 : 0.0
-      ..[21] = normalScale;
+      ..[21] = normalScale
+      // A cut-out material's coverage test (see MaskSurfaceAlphaTest): the
+      // cutoff, 0 for none, and the vertex-color alpha weight.
+      ..[22] = alphaCutoff
+      ..[23] = vertexAlphaWeight;
     if (baseColorTransform != null) {
       info.setRange(4, 12, baseColorTransform);
     }
+    // A surface with no UVs samples its base color by position (see
+    // MaskSurfaceTriplanar): the repeat per world unit, 0 for none.
+    info[11] = triplanarRepeat;
     if (normalTransform != null) {
       info.setRange(12, 20, normalTransform);
     }

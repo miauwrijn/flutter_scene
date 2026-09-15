@@ -230,13 +230,14 @@ class _ObjectMaskEncoder {
       _transientsBuffer.emplace(ByteData.sublistView(color)),
     );
     if (surfaceContent) {
-      // Each surface shader declares only the sampler it reads (see
-      // Material.bindMaskSurface for why the other must not be bound).
+      // Each surface shader declares only the samplers it reads (see
+      // Material.bindMaskSurface for why the others must not be bound).
+      // Both read the base color: its alpha is the cut-out test.
       item.material.bindMaskSurface(
         _renderPass,
         fragmentShader,
         _transientsBuffer,
-        baseColor: _content == MaskContent.albedo,
+        baseColor: true,
         normal: _content == MaskContent.normal,
       );
     }
@@ -290,23 +291,49 @@ class _ObjectMaskEncoder {
         return;
       }
       bindDraw(item.worldTransform);
-      final PackedInstances packed = depthVertex == null
-          ? packInstanceData(
-              item.worldTransform,
-              instances,
-              item.instanceColors!,
-              nodeWindingFlipped: item.windingFlipped,
-              instanceWindingFlipped: item.instanceWindingFlipped,
-              attributeData: item.instanceAttributeData,
-              attributeFloats: attributeFloats,
-              scratch: transientInstancePackingScratch,
-            )
-          : packInstanceTransforms(
-              item.worldTransform,
-              instances,
-              nodeWindingFlipped: item.windingFlipped,
-              scratch: transientInstancePackingScratch,
+      // The world records the item packed once (see
+      // RenderItem.refreshInstanceData) when it has them, as the depth
+      // prepass does: recomposing every instance here was a Matrix4
+      // multiply per instance per frame, most of a frame on a site with a
+      // few hundred thousand grass clumps.
+      final packedWorldData = item.instanceWorldData;
+      final packedWinding = item.instanceWorldWindingFlipped;
+      final cached = packedWorldData == null || packedWinding == null
+          ? null
+          : transientInstancePackingScratch.singleCachedBatch(
+              packedWorldData: packedWorldData,
+              packedWindingFlipped: packedWinding,
+              attributeFloats: item.instanceAttributeFloats,
             );
+      final PackedInstances packed = depthVertex == null
+          ? (cached == null
+                ? packInstanceData(
+                    item.worldTransform,
+                    instances,
+                    item.instanceColors!,
+                    nodeWindingFlipped: item.windingFlipped,
+                    instanceWindingFlipped: item.instanceWindingFlipped,
+                    attributeData: item.instanceAttributeData,
+                    attributeFloats: attributeFloats,
+                    scratch: transientInstancePackingScratch,
+                  )
+                : packInstanceDataBatches(
+                    cached,
+                    attributeFloats: attributeFloats,
+                    scratch: transientInstancePackingScratch,
+                  ))
+          : (cached == null
+                ? packInstanceTransforms(
+                    item.worldTransform,
+                    instances,
+                    nodeWindingFlipped: item.windingFlipped,
+                    scratch: transientInstancePackingScratch,
+                  )
+                : packInstanceTransformBatches(
+                    cached,
+                    scratch: transientInstancePackingScratch,
+                  ));
+      transientInstancePackingScratch.releaseSingleBatch();
       void bindPacked(Float32List buffer) {
         if (depthVertex == null) {
           bindInstanceData(_renderPass, buffer, slot: instanceSlot);

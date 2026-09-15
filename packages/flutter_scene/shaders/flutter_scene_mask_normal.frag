@@ -15,6 +15,7 @@ uniform MaskInfo {
 mask_info;
 
 void main() {
+  MaskSurfaceAlphaTest();
   vec3 normal = GetWorldNormal();
   if (mask_surface.normal_params.x > 0.5) {
     vec2 uv = MaterialTextureUv(mask_surface.normal_uv_transform,

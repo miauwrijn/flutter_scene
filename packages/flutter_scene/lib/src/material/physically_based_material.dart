@@ -1855,6 +1855,11 @@ class PhysicallyBasedMaterial extends Material {
       normalScale: normalScale,
       baseColorTransform: baseTransform,
       normalTransform: normalTransform,
+      // MASK coverage, as the color and depth passes test it.
+      alphaCutoff: alphaMode == AlphaMode.mask
+          ? alphaCutoff / math.max(baseColorFactor.a, 1e-3)
+          : 0.0,
+      vertexAlphaWeight: vertexColorWeight,
     );
   }
 

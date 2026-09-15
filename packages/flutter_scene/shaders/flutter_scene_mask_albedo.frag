@@ -15,6 +15,7 @@ uniform MaskInfo {
 mask_info;
 
 void main() {
+  MaskSurfaceAlphaTest();
   frag_color = vec4(mask_info.color.rgb * MaskSurfaceAlbedo(),
                     mask_info.color.a);
 }
