@@ -186,6 +186,108 @@ class PreprocessedMaterial extends Material implements HotReloadableFmat {
   /// The material's parameters, set by name. See [MaterialParameters].
   final MaterialParameters parameters;
 
+  // --- Surface-content object masks --------------------------------------------
+  //
+  // A custom pass that shades with the surface's own albedo (a surface-cache
+  // GI composite, say) reads it from a `MaskContent.albedo` object mask —
+  // and that mask cannot run the material's `Surface()`. A PBR material
+  // hands the mask its base colour texture and factor; a `.fmat` has no
+  // notion of one, so the base binding was flat white, and every `.fmat`
+  // surface bounced as if it were snow. These let the owner of a `.fmat`
+  // say what the mask should sample instead: the texture the shader
+  // samples for its colour, a factor, and how much of the vertex colour
+  // multiplies in — the same three inputs the PBR path packs.
+
+  /// The texture the albedo object mask samples for this material, or null
+  /// for [maskBaseColorFactor] alone.
+  TextureSource? maskBaseColorTexture;
+
+  /// Linear RGB multiplier the albedo mask applies, default white.
+  List<double> maskBaseColorFactor = const [1.0, 1.0, 1.0];
+
+  /// How much the vertex colour multiplies into the albedo mask, 0..1.
+  double maskVertexColorWeight = 0.0;
+
+  /// UV transform and channel for [maskBaseColorTexture].
+  TextureTransform maskBaseColorTransform = TextureTransform();
+  int maskBaseColorTexCoord = 0;
+
+  /// Repeats per world unit the albedo mask samples [maskBaseColorTexture]
+  /// with by world position, on the vertices that carry no UVs (u below
+  /// -0.5), for a surface the material draws triplanar. 0 samples by UV.
+  double maskTriplanarRepeat = 0.0;
+
+  /// The normal map the normal object mask perturbs with, or null for the
+  /// geometric normal, and its scale.
+  TextureSource? maskNormalTexture;
+  double maskNormalScale = 1.0;
+  TextureTransform maskNormalTransform = TextureTransform();
+  int maskNormalTexCoord = 0;
+
+  @override
+  void bindMaskSurface(
+    gpu.RenderPass pass,
+    gpu.Shader shader,
+    TransientWriter transientsBuffer, {
+    required bool baseColor,
+    required bool normal,
+  }) {
+    final baseTransform = Float32List(8);
+    _packMaskTransform(
+      baseTransform,
+      maskBaseColorTransform,
+      maskBaseColorTexCoord,
+    );
+    final normalTransform = Float32List(8);
+    _packMaskTransform(normalTransform, maskNormalTransform, maskNormalTexCoord);
+    final factor = maskBaseColorFactor;
+    Material.bindMaskSurfaceInputs(
+      pass,
+      shader,
+      transientsBuffer,
+      bindBaseColor: baseColor,
+      bindNormal: normal,
+      color: [
+        factor.isNotEmpty ? factor[0] : 1.0,
+        factor.length > 1 ? factor[1] : 1.0,
+        factor.length > 2 ? factor[2] : 1.0,
+      ],
+      vertexColorWeight: maskVertexColorWeight.clamp(0.0, 1.0),
+      baseColorTexture: resolveTextureSource(maskBaseColorTexture),
+      baseColorSampler: textureSourceSampler(maskBaseColorTexture),
+      normalTexture: resolveTextureSource(maskNormalTexture),
+      normalSampler: textureSourceSampler(maskNormalTexture),
+      normalScale: maskNormalScale,
+      baseColorTransform: baseTransform,
+      normalTransform: normalTransform,
+      // A cut-out (configureDepthAlphaMask) is cut out of its masks too,
+      // at the same coverage the depth passes use.
+      alphaCutoff: _depthMaskTexture != null
+          ? _depthMaskCutoff / math.max(_depthMaskAlpha, 1e-3)
+          : 0.0,
+      vertexAlphaWeight: maskVertexColorWeight.clamp(0.0, 1.0),
+      triplanarRepeat: maskTriplanarRepeat,
+    );
+  }
+
+  /// Offset, scale, cos/sin of the rotation and the UV channel — the
+  /// eight-float record `MaskSurfaceInfo` reads (see the PBR material's
+  /// packer, which lays its records out the same way).
+  static void _packMaskTransform(
+    Float32List target,
+    TextureTransform transform,
+    int texCoord,
+  ) {
+    target[0] = transform.offset.x;
+    target[1] = transform.offset.y;
+    target[2] = transform.scale.x;
+    target[3] = transform.scale.y;
+    target[4] = math.cos(transform.rotation);
+    target[5] = math.sin(transform.rotation);
+    target[6] = texCoord.clamp(0, 1).toDouble();
+    target[7] = 0.0;
+  }
+
   TextureSource? _depthMaskTexture;
   TextureTransform _depthMaskTransform = TextureTransform();
   double _depthMaskCutoff = 0.5;
