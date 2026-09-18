@@ -43,10 +43,15 @@ base class GpuContext {
   late final web.WebGL2RenderingContext _gl;
 
   /// Cached vertex-array objects keyed by (pipeline, vertex streams, index
-  /// buffer), in least-recently-used order; see RenderPass._applyVertexState.
+  /// buffer); see RenderPass._applyVertexState. Each entry remembers when
+  /// it was last drawn with, and the least recently used one goes when the
+  /// cache is full. The key is a small object with a precomputed hash —
+  /// it used to be a string built and hashed per draw, which (dart2js does
+  /// not cache string hashes) was a third of the UI thread on a building
+  /// of a thousand draws.
   static const int _kMaxCachedVaos = 512;
-  final Map<String, web.WebGLVertexArrayObject> _vaoCache =
-      <String, web.WebGLVertexArrayObject>{};
+  final Map<VaoKey, VaoEntry> _vaoCache = <VaoKey, VaoEntry>{};
+  int _vaoUse = 0;
 
   int _maxSupportedAnisotropy = 1;
 
@@ -357,3 +362,63 @@ Future<ui.Image> presentTextureAsImage(
   texture,
   transferOwnership: transferOwnership,
 );
+
+/// The attribute state a VAO holds: which attribute locations are enabled
+/// and each one's divisor. Both are VAO state, so a draw that re-points an
+/// instance stream on a cached VAO (its offset moves every draw, it rides
+/// the per-frame allocator) need only call vertexAttribPointer; the enable
+/// and divisor calls it made alongside, every attribute of every draw of
+/// every pass, were a quarter of the UI thread on a building of 150 draws.
+final class VaoAttributeState {
+  final Set<int> enabled = {};
+  final Map<int, int> divisors = {};
+}
+
+/// A cached VAO with its attribute state and the draw counter at its last
+/// use (see `GpuContext._vaoCache`).
+final class VaoEntry {
+  VaoEntry(this.vao);
+  final web.WebGLVertexArrayObject vao;
+  final VaoAttributeState state = VaoAttributeState();
+  int lastUsed = 0;
+}
+
+/// The identity of a cached VAO: the pipeline, then per geometry stream its
+/// buffer, byte offset and slot, then the index buffer and its offset (or
+/// nothing). Objects compare by identity, ints by value; the hash is
+/// computed once, when the key is built.
+final class VaoKey {
+  VaoKey(this.parts) : hashCode = _hashOf(parts);
+
+  final List<Object> parts;
+
+  @override
+  final int hashCode;
+
+  @override
+  bool operator ==(Object other) {
+    if (other is! VaoKey ||
+        other.hashCode != hashCode ||
+        other.parts.length != parts.length) {
+      return false;
+    }
+    for (var i = 0; i < parts.length; i++) {
+      final a = parts[i];
+      final b = other.parts[i];
+      if (a is int ? a != b : !identical(a, b)) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  static int _hashOf(List<Object> parts) {
+    var h = parts.length;
+    for (final part in parts) {
+      final v = part is int ? part : identityHashCode(part);
+      // Stays within 30 bits: an exact small integer on every backend.
+      h = (h * 31 + v) & 0x3FFFFFFF;
+    }
+    return h;
+  }
+}
