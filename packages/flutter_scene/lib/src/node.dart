@@ -685,6 +685,11 @@ base class Node implements SceneGraph {
   // The components attached to this node, in attach order.
   final List<Component> _components = [];
 
+  /// The components attached to this node, in attach order — for a reader
+  /// that walks the graph (a light cache building its own scene from the
+  /// nodes) and needs the instanced meshes a node draws.
+  Iterable<Component> get components => _components;
+
   // Typed fast paths: the subsets of [_components] that feed the render
   // layer, so the per-frame pre-pass refreshes their render items
   // without scanning the full component list.
