@@ -381,6 +381,15 @@ final class VaoEntry {
   final web.WebGLVertexArrayObject vao;
   final VaoAttributeState state = VaoAttributeState();
   int lastUsed = 0;
+
+  /// Per instance-rate slot: the buffer and byte offset its attributes
+  /// were last pointed at. A GL buffer is created once per [DeviceBuffer]
+  /// and never replaced, so the same buffer at the same offset means the
+  /// VAO's pointers are already right — which for a static scene, whose
+  /// instance data lands at the same offsets frame after frame, is nearly
+  /// every draw. Re-pointing an instance stream is five to six
+  /// `vertexAttribPointer` calls, each a varargs call on the web.
+  final Map<int, (DeviceBuffer, int)> instanceStreams = {};
 }
 
 /// The identity of a cached VAO: the pipeline, then per geometry stream its
