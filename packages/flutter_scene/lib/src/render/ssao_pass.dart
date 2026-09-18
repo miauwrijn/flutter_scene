@@ -36,7 +36,8 @@ const gpu.PixelFormat _aoFormat = gpu.PixelFormat.r8g8b8a8UNormInt;
 
 /// The render size of the ambient-occlusion chain for a full-resolution
 /// target of [dimensions], halved (floored, minimum 1) when
-/// [AmbientOcclusionSettings.halfResolution] is set.
+/// [AmbientOcclusionSettings.halfResolution] is set and quartered when
+/// [AmbientOcclusionSettings.quarterResolution] is.
 ///
 /// The depth prepass, occlusion pass, and blur all run at this resolution so
 /// the depth texture is sampled 1:1 (sampling a full-resolution depth from a
@@ -62,12 +63,17 @@ ui.Size ambientOcclusionTargetSize(
   ui.Size dimensions,
   AmbientOcclusionSettings settings,
 ) {
-  if (!settings.halfResolution) {
+  final divisor = settings.quarterResolution
+      ? 4
+      : settings.halfResolution
+      ? 2
+      : 1;
+  if (divisor == 1) {
     return dimensions;
   }
   return ui.Size(
-    math.max(1, (dimensions.width / 2).floor()).toDouble(),
-    math.max(1, (dimensions.height / 2).floor()).toDouble(),
+    math.max(1, (dimensions.width / divisor).floor()).toDouble(),
+    math.max(1, (dimensions.height / divisor).floor()).toDouble(),
   );
 }
 

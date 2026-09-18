@@ -138,6 +138,13 @@ class AmbientOcclusionSettings {
   /// cost of fine detail. Recommended on mobile.
   bool halfResolution = true;
 
+  /// Evaluates the occlusion buffer at a quarter of the resolution (each
+  /// axis halved twice), a sixteenth of the pixel work; takes precedence
+  /// over [halfResolution]. For the web at a device pixel ratio of two,
+  /// where the half-resolution pass was still a large share of the frame
+  /// and the bilateral upsample and temporal filter hide the difference.
+  bool quarterResolution = false;
+
   /// Renders the depth prepass at full resolution and samples it through a
   /// downsampled mip chain (a level per sample distance), instead of rasterising
   /// the depth at the occlusion resolution.
