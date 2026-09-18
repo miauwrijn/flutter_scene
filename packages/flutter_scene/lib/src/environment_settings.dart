@@ -103,6 +103,7 @@ class EnvironmentSettings {
     this.ambientOcclusionBentNormals = false,
     this.ambientOcclusionIndirectLight = 0.0,
     this.ambientOcclusionHalfResolution = true,
+    this.ambientOcclusionQuarterResolution = false,
     this.ambientOcclusionDepthMipChain = false,
     this.ambientOcclusionSpecularMode = SpecularAmbientOcclusionMode.none,
     this.screenSpaceReflectionsEnabled = false,
@@ -266,6 +267,7 @@ class EnvironmentSettings {
   bool ambientOcclusionBentNormals;
   double ambientOcclusionIndirectLight;
   bool ambientOcclusionHalfResolution;
+  bool ambientOcclusionQuarterResolution;
   bool ambientOcclusionDepthMipChain;
   SpecularAmbientOcclusionMode ambientOcclusionSpecularMode;
 
@@ -438,6 +440,7 @@ class EnvironmentSettings {
       ambientOcclusionBentNormals: ao.bentNormals,
       ambientOcclusionIndirectLight: ao.indirectLight,
       ambientOcclusionHalfResolution: ao.halfResolution,
+      ambientOcclusionQuarterResolution: ao.quarterResolution,
       ambientOcclusionDepthMipChain: ao.depthMipChain,
       ambientOcclusionSpecularMode: ao.specularMode,
       screenSpaceReflectionsEnabled: ssr.enabled,
@@ -606,6 +609,7 @@ class EnvironmentSettings {
       ..bentNormals = ambientOcclusionBentNormals
       ..indirectLight = ambientOcclusionIndirectLight
       ..halfResolution = ambientOcclusionHalfResolution
+      ..quarterResolution = ambientOcclusionQuarterResolution
       ..depthMipChain = ambientOcclusionDepthMipChain
       ..specularMode = ambientOcclusionSpecularMode;
 
@@ -842,6 +846,7 @@ class EnvironmentSettings {
         t,
       ),
       ambientOcclusionHalfResolution: d.ambientOcclusionHalfResolution,
+      ambientOcclusionQuarterResolution: d.ambientOcclusionQuarterResolution,
       ambientOcclusionDepthMipChain: d.ambientOcclusionDepthMipChain,
       ambientOcclusionSpecularMode: d.ambientOcclusionSpecularMode,
       screenSpaceReflectionsEnabled: d.screenSpaceReflectionsEnabled,
