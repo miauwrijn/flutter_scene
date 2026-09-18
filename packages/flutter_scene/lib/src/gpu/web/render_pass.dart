@@ -592,7 +592,15 @@ base class RenderPass {
       }
     }
     for (final (view, slot, instanceRate) in _pendingVertexBindings) {
-      if (instanceRate) _applyVertexBinding(view, slot);
+      if (!instanceRate) continue;
+      final last = entry.instanceStreams[slot];
+      if (last != null &&
+          identical(last.$1, view.buffer) &&
+          last.$2 == view.offsetInBytes) {
+        continue;
+      }
+      _applyVertexBinding(view, slot);
+      entry.instanceStreams[slot] = (view.buffer, view.offsetInBytes);
     }
   }
 

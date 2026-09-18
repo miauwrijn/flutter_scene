@@ -57,6 +57,11 @@ class InstancedMesh {
   int _revision = 0;
 
   /// The number of instances.
+  /// The instance transforms, in instance order, read-only — for a reader
+  /// that rebuilds the scene from the graph (a light cache) and wants each
+  /// placement of the geometry.
+  Iterable<Matrix4> get instanceTransforms => _instances;
+
   int get instanceCount => _instances.length;
 
   /// Adds an instance placed by [transform] and returns its index.
