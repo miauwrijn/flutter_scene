@@ -1,5 +1,7 @@
 ## 0.24.0
 
+* `MeshGeometry.sharingVertices` draws another geometry's vertices with indices of its own — nothing is uploaded but the indices. For one mesh drawn several times with a different subset of itself each time (a level-of-detail cut per instance, a culled subset per view, a sorted slice per pass): each draw needs its own index buffer and none of them needs its own copy of the vertices, which on a large asset placed many times is the whole of the memory.
+* `MeshGeometry.setIndexData` replaces the index buffer in place, keeping every vertex stream, for geometry whose vertices are fixed and whose topology is chosen per frame (a level-of-detail cut, a culled subset, a sorted transparency pass). `rebuild` re-uploads every attribute stream, which a static multi-megabyte vertex buffer cannot afford; this writes only the indices, into a ring of host-visible buffers so the GPU keeps reading the previously bound one. Works on fixed storage, which then keeps its single vertex upload and gains only the index ring.
 * Projected box decals via `DecalNode`, an oriented projection volume that paints a `.fmat` material onto whatever opaque surfaces it intersects (scorch marks, splats), with no mesh work at the impact site.
 * Radial screen distortion pulses via `Scene.screenDistortion`, expanding shockwave rings that warp the composed image with optional chromatic fringing.
 * `.fmat` materials accept `blending: additive` alongside `opaque`/`alpha`, and `depth_write`/`depth_test` configure the translucent depth state.
