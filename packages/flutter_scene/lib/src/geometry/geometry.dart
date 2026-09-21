@@ -235,6 +235,16 @@ abstract class Geometry {
     _vertexCount = vertexCount;
   }
 
+  /// The vertex streams currently bound, for a geometry that wants to draw
+  /// the same vertices with indices of its own (see
+  /// `MeshGeometry.sharingVertices`).
+  @internal
+  List<gpu.BufferView> get vertexStreams => _vertexStreams;
+
+  /// The vertex count the bound streams hold.
+  @internal
+  int get boundVertexCount => _vertexCount;
+
   // Extra per-vertex attribute streams a material's custom `attributes` read,
   // keyed by the shader `in` name (insertion order is the slot order). Bound
   // after the base vertex streams in the color pass; the depth passes fetch
