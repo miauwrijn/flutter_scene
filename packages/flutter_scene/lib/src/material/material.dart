@@ -235,6 +235,11 @@ abstract class Material {
   @internal
   int lightChannelMask = 0xFF;
 
+  /// Whether the scene's weather wets and snows this material
+  /// (`Scene.weather`). Water and glass turn it off. Cloud shadows fall on
+  /// it either way.
+  bool receivesWeather = true;
+
   /// The draw's model scale (world-space lengths of the model transform's
   /// basis vectors), set by the encoder right before [bind] and packed into
   /// `FragInfo.model_scale`. Scales local-space lengths like the transmission

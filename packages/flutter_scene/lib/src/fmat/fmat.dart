@@ -19,7 +19,8 @@ export 'package:flutter_scene/src/fmat/fmat_emitter.dart'
         buildSidecar,
         kFrameworkVaryingSchemaVersion,
         kMaterialParamsBlock,
-        kMaterialParamsInstance;
+        kMaterialParamsInstance,
+        kMaterialDepthOffsetDefine;
 export 'package:flutter_scene/src/fmat/fmat_parser.dart' show parseFmat;
 
 /// The result of preprocessing a `.fmat` source: the parsed material, the

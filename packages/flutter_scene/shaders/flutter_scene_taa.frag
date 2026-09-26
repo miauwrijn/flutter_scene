@@ -160,7 +160,8 @@ void main() {
       vec2 tap_uv = uv + vec2(float(dx), float(dy)) * texel_size;
       vec3 col = textureLod(current_color, tap_uv, 0.0).rgb;
       if (abs(dx) + abs(dy) == 1) {
-        cross_blur += col;
+        // Tone-mapped, like the blend it sharpens: see step 8.
+        cross_blur += ToneMap(col);
       }
       vec3 ycocg = RGB2YCoCg(col);
       m1 += ycocg;
@@ -192,18 +193,26 @@ void main() {
   vec3 tm_curr = ToneMap(current_center);
   vec3 tm_hist = ToneMap(clamped_history);
   vec3 resolved_tm = mix(tm_hist, tm_curr, weight);
+
+  // 8. Optional sharpening — in the tone-mapped space the blend happened in.
+  //
+  // In linear HDR the unsharp mask's negative lobe is unbounded: beside a
+  // sub-pixel highlight thousands of times brighter than its neighbours (the
+  // sun on rippled water, a glint on chrome) `resolved - blur` is hugely
+  // negative, the clamp to zero makes the pixel black, and the highlight
+  // grows a black fringe that TAA then smears into dashes. Tone-mapped, a
+  // neighbour can weigh at most ~1, so the lobe stays a sharpening.
+  if (info.taa_settings.z > 0.0) {
+    vec3 blur_tm = cross_blur * 0.25;
+    resolved_tm = max(vec3(0.0),
+        resolved_tm + (resolved_tm - blur_tm) * info.taa_settings.z);
+  }
+
   float tm_luma = dot(resolved_tm, vec3(0.2126, 0.7152, 0.0722));
   if (tm_luma > 0.999) {
     resolved_tm *= 0.999 / tm_luma;
   }
   vec3 resolved = max(vec3(0.0), UnToneMap(resolved_tm));
-
-  // 8. Optional sharpening.
-  if (info.taa_settings.z > 0.0) {
-    vec3 blur = cross_blur * 0.25;
-    vec3 sharpened = resolved + (resolved - blur) * info.taa_settings.z;
-    resolved = max(vec3(0.0), sharpened);
-  }
 
   frag_color = vec4(resolved, 1.0);
 }

@@ -128,6 +128,7 @@ export 'src/ambient_occlusion.dart'
 export 'src/auto_exposure.dart' show AutoExposureSettings;
 export 'src/depth_of_field.dart' show DepthOfField, DepthOfFieldQuality;
 export 'src/fog.dart' show Fog, FogMode;
+export 'src/weather.dart' show SceneWeather;
 export 'src/global_illumination.dart'
     show
         GlobalIlluminationSettings,

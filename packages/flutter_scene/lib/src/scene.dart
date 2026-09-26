@@ -25,6 +25,7 @@ import 'components/point_light_component.dart';
 import 'components/reflection_probe_component.dart';
 import 'components/spot_light_component.dart';
 import 'fog.dart';
+import 'weather.dart';
 import 'god_rays.dart';
 import 'light.dart';
 import 'material/environment.dart';
@@ -893,6 +894,7 @@ base class Scene implements SceneGraph {
             cascades: cascades,
             layerMask: lead.layerMask,
             fog: fog,
+            weather: weather,
             time: time,
             // Rejects whole objects behind the mirror on the CPU; the
             // oblique projection clips whatever straddles the plane.
@@ -1318,6 +1320,10 @@ base class Scene implements SceneGraph {
   /// on. Applied per-fragment by every material in linear HDR before tone
   /// mapping, so it works on any camera type.
   final Fog fog = Fog();
+
+  /// Weather on every lit surface: cloud shadows, wet and snowy surfaces.
+  /// Off by default; see [SceneWeather].
+  final SceneWeather weather = SceneWeather();
 
   /// Directional volumetric god rays. Off by default; set
   /// [GodRaysSettings.enabled] to turn them on. Requires a shadow-casting
@@ -2629,6 +2635,7 @@ base class Scene implements SceneGraph {
         irradianceField: irradianceBinding,
         layerMask: view.layerMask,
         fog: fog,
+        weather: weather,
         captureOpaqueColor: captureOpaqueColor,
         // Depth binding needs the prepass, which needs a perspective camera.
         bindSceneDepth: bindSceneDepth && perspectiveCamera != null,
