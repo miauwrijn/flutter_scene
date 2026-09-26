@@ -46,6 +46,22 @@ struct MaterialInputs {
   float specular;
   // Ambient occlusion in [0, 1]: 1 unoccluded.
   float occlusion;
+  // Where rain pools here, 0 (sheds) .. 1 (fills first), for the scene's
+  // weather (weather.glsl). Negative — the default — lets the weather judge
+  // by the surface's flatness alone; a terrain passes the lie of its land.
+  float pooling;
+#ifdef FLUTTER_SCENE_MATERIAL_DEPTH_OFFSET
+  // How far along the view ray, in metres away from the camera, this
+  // fragment's surface really is -- what a parallax material writes when its
+  // march hits below the polygon. The generated main() turns it into
+  // gl_FragDepth, so the relief occludes and is occluded like geometry
+  // instead of like a flat face. 0 keeps the interpolated depth.
+  //
+  // This field exists only in a material that declares `depth_offset: true`,
+  // because writing gl_FragDepth costs every surface drawn with the shader
+  // its early-depth rejection.
+  float depth_offset;
+#endif
 #ifdef FLUTTER_SCENE_PHYSICAL_MATERIAL
   // Advanced physical fields. These exist only in physical shader variants,
   // so standard/unlit materials keep their original interface and cost.
@@ -83,6 +99,10 @@ MaterialInputs InitMaterialInputs() {
   material.roughness = 1.0;
   material.specular = 1.0;
   material.occlusion = 1.0;
+  material.pooling = -1.0;
+#ifdef FLUTTER_SCENE_MATERIAL_DEPTH_OFFSET
+  material.depth_offset = 0.0;
+#endif
 #ifdef FLUTTER_SCENE_PHYSICAL_MATERIAL
   material.specular_color = vec3(1.0);
   material.specular_weight = 1.0;

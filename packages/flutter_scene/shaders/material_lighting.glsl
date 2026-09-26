@@ -29,6 +29,9 @@
 #endif
 
 #include <material_shadow_sampling.glsl>
+#ifndef FLUTTER_SCENE_SHADOW_CATCHER
+#include <weather.glsl>
+#endif
 
 // Parallax-corrected reflection for a local environment probe: intersects
 // the reflected ray with the probe's box proxy and re-aims the lookup from
@@ -284,6 +287,8 @@ vec3 EvaluateAnalyticLight(MaterialInputs material, vec3 light_vector,
 // the material contract; a material's Surface() function fills `material` and
 // main() calls this.
 vec4 EvaluateLighting(MaterialInputs material) {
+  // Wet and snowed on first: everything below lights the weathered surface.
+  ApplyWeathering(material, v_position);
   vec3 albedo = material.base_color.rgb;
   float alpha = material.base_color.a;
   vec3 normal = material.normal;
@@ -609,6 +614,9 @@ vec4 EvaluateLighting(MaterialInputs material) {
     shadow = min(shadow, ssao_sample.g);
   }
 #endif
+  // The cloud deck's shadow, direct light only: an overcast day keeps its
+  // sky light.
+  shadow *= WeatherCloudShadow(v_position);
   float sun_visibility = facing * shadow;
 
   // When shadow_ambient_strength (radiance_blend.y) is non-zero, the sun's

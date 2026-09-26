@@ -297,6 +297,8 @@ base class Texture {
     final sliceTarget = glSliceTarget(slice);
     _gpuContext._bindTextureForSetup(glTarget, _texture);
     if (_isCompressedFormat(format)) {
+      // Compressed uploads are block-based and unaffected by
+      // UNPACK_ALIGNMENT, which is why this returns before it is set.
       final blocks = sourceBytes.buffer
           .asUint8List(sourceBytes.offsetInBytes, sourceBytes.lengthInBytes)
           .toJS;
@@ -312,6 +314,24 @@ base class Texture {
       );
       return;
     }
+    // Rows are tightly packed, and GL has to be told so.
+    //
+    // UNPACK_ALIGNMENT defaults to 4: GL expects each row of a client upload
+    // to begin on a four-byte boundary. This method has already *required*
+    // the opposite — the length check above accepts only
+    // `width · height · bytesPerTexel`, with no row padding at all — so for
+    // any single-byte format whose width is not a multiple of four, the two
+    // disagree and GL rejects the call for want of
+    // `stride·(height−1) + width` bytes it was never going to be given.
+    //
+    // A rejected upload is worse than a failed one: it leaves the texture's
+    // previous contents in place, so the caller sees a stale image rather
+    // than an error, for widths that look arbitrary from the outside. An
+    // r8 atlas 50 texels wide fails and one 52 wide does not.
+    //
+    // Set per upload rather than once at context creation because it is
+    // global state, and one GL call against a texture upload is nothing.
+    gl.pixelStorei(web.WebGL2RenderingContext.UNPACK_ALIGNMENT, 1);
     // texSubImage2D requires the JS typed-array view to match the GL pixel
     // type: FLOAT wants a Float32Array, HALF_FLOAT a Uint16Array, and the
     // integer formats a Uint8Array. (A Uint8Array for a FLOAT texture throws

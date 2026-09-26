@@ -137,6 +137,7 @@ const _frameworkShaderFiles = <String>[
   'ssao_geometry.glsl',
   'texture.glsl',
   'tone_mapping.glsl',
+  'weather.glsl',
   'wireframe.glsl',
 ];
 

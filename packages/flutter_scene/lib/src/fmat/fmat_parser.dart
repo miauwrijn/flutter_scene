@@ -564,6 +564,7 @@ FmatMaterial _build(
     'culling',
     'depth_write',
     'depth_test',
+    'depth_offset',
     'parameters',
     'varyings',
     'attributes',
@@ -633,6 +634,25 @@ FmatMaterial _build(
     throw FmatException(
       '`depth_test` applies to the translucent pass, so it needs '
       '`blending: alpha` or `blending: additive`.',
+      fileName: fileName,
+    );
+  }
+
+  // `depth_offset` lets `Surface()` say where its surface really is, in metres
+  // along the view ray, and the generated main() writes that as the fragment's
+  // depth. A sky has no depth to offset -- it is drawn behind everything by
+  // construction -- so the flag is a surface material's alone.
+  final depthOffsetValue = tree['depth_offset'];
+  if (depthOffsetValue != null && depthOffsetValue is! bool) {
+    throw FmatException(
+      '`depth_offset` must be a boolean.',
+      fileName: fileName,
+    );
+  }
+  final depthOffset = depthOffsetValue as bool? ?? false;
+  if (depthOffset && domain == FmatDomain.sky) {
+    throw FmatException(
+      '`depth_offset` applies to a surface material; a sky writes no depth.',
       fileName: fileName,
     );
   }
@@ -838,6 +858,7 @@ FmatMaterial _build(
     culling: culling,
     depthWrite: depthWrite,
     depthTest: depthTest,
+    depthOffset: depthOffset,
     parameters: parameters,
     fragmentSource: body.content,
     fragmentSourceLine: body.startLine,
