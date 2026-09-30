@@ -53,6 +53,11 @@ uniform RadianceSampler prefiltered_radiance_b;
 #ifndef FLUTTER_SCENE_SKIP_SSAO
 uniform sampler2D ssao_texture;
 #endif
+#ifndef FLUTTER_SCENE_SHADOW_CATCHER
+// What stands overhead, per cell (SceneWeather.occlusionMap): where rain and
+// snow reach. rg a 16-bit height, b 1 where something stands.
+uniform sampler2D weather_occlusion;
+#endif
 // A shadow catcher's no-shadow variant compiles its spot loop out, leaving
 // the punctual textures with no live reference, so it declares neither.
 #if !defined(FLUTTER_SCENE_SHADOW_CATCHER) || !defined(FLUTTER_SCENE_SKIP_SHADOWS)

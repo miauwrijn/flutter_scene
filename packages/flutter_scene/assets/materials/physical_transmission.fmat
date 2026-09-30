@@ -67,6 +67,205 @@ fragment {
     return normalize(ray) * thickness * GetModelScale();
   }
 
+  // --- Rain on the glass ----------------------------------------------------
+  //
+  // Water on the outer face of a pane while it rains: beads that land and
+  // sit, and runnels sliding down through them, wiping a path. Each is a
+  // small lens, so the pane shows it twice: the view through it bends, and
+  // the sky and the sun glint off its curved top. Only where the rain can
+  // reach — the scene's weather already knows where that is (the sky
+  // occlusion, followed up the wind's slant: a pane facing the wind gets wet
+  // under an eave, a leeward one stays dry). Glass takes no other weathering
+  // (it opts out: a wet film would only grey it), so this is its own.
+
+  // How far out of a drop's outline a point is, in drop radii: a hanging
+  // drop is a pear — heavier below, narrower and shorter above — never a
+  // disc. `d` is local (x across, y up) in metres, `r` the radius, `k` how
+  // pear-like (0 round .. 1 a full teardrop), `lean` a slight sideways
+  // tilt. Returns (distance, the local point scaled into the unit drop).
+  vec3 GlassPear(vec2 d, float r, float k, float lean) {
+    d.x -= lean * d.y;
+    float yn = clamp(d.y / r, -1.0, 1.0);
+    float widen = 1.0 + k * 0.4 * (-yn);
+    vec2 q = vec2(d.x / widen, d.y * (d.y < 0.0 ? 0.82 : 1.0 + 0.35 * k));
+    return vec3(length(q) / r, q / r);
+  }
+
+  // A drop's surface from its distance: xy the slope, z the cover.
+  vec3 GlassLens(vec3 pear, float fade) {
+    float dist = pear.x;
+    if (dist >= 1.0) return vec3(0.0);
+    float height = sqrt(1.0 - dist * dist);
+    vec2 slope = -pear.yz / max(height, 0.15);
+    return vec3(slope * 0.6, smoothstep(1.0, 0.8, dist) * fade);
+  }
+
+  // Beads: the small drops the rain leaves sitting on the pane, each with
+  // its own size, shape, lean and clock — landing, sitting, drying off.
+  // One per cell of a grid `cell` metres a side (`uv` in metres on the
+  // pane), placed anywhere in it and free to spill over its edges: the
+  // neighbouring cells are asked too, so no bead is cut at a cell's edge
+  // and no row of them lines up. `amount` is how many cells hold one.
+  vec3 GlassBeads(vec2 uv, float cell, float amount, float t, float seed) {
+    vec2 g = uv / cell;
+    vec2 base = floor(g);
+    vec3 best = vec3(0.0);
+    for (int j = -1; j <= 1; j++) {
+      for (int i = -1; i <= 1; i++) {
+        vec2 id = base + vec2(float(i), float(j));
+        float h = CloudHash(id + seed);
+        float period = mix(6.0, 14.0, CloudHash(id + seed + 0.7));
+        float cycle = floor(t / period + h);
+        float life = fract(t / period + h);
+        vec2 key = id + vec2(cycle * 13.1, cycle * 7.7) + seed;
+        if (CloudHash(key + 11.3) > amount) continue;
+        float r = mix(0.14, 0.42, pow(CloudHash(key + 5.1), 1.6));
+        vec2 c = id + vec2(CloudHash(key + 2.3), CloudHash(key + 8.9));
+        float k = CloudHash(key + 4.4) * mix(0.3, 1.0, r / 0.42);
+        float lean = (CloudHash(key + 6.2) - 0.5) * 0.5;
+        float fade = smoothstep(0.0, 0.05, life) * smoothstep(1.0, 0.85, life);
+        vec3 d = GlassLens(GlassPear(g - c, r, k, lean), fade);
+        if (d.z > best.z) best = d;
+      }
+    }
+    return best;
+  }
+
+  // Runners: a drop that grew too heavy and slides down. It sits a moment,
+  // gathering, then goes in stick-slip steps — holds, lurches, holds —
+  // wandering a little and leaning with the wind (`push`, metres sideways
+  // per metre fallen, from the wind along the pane at this instant). The
+  // bigger it is the faster it goes. Behind it a thin trail that breaks into
+  // tiny beads and dries off. One runner per lane at a time, each lane on
+  // its own clock. xy slope, z cover, w 1 where it has passed (the beads
+  // there went with it).
+  // One lane's runner, seen from `uv` (already leaned by the wind).
+  vec4 GlassRunnerIn(vec2 uv, float lane, float amount, float t, float push,
+                     float gust, float seed) {
+    const float width = 0.055;
+    const float span = 1.4;
+    vec2 laneKey = vec2(lane, seed);
+    float h = CloudHash(laneKey);
+    float period = mix(5.0, 12.0, CloudHash(laneKey + 1.3));
+    float cycle = floor(t / period + h);
+    float tau = fract(t / period + h) * period;
+    vec2 key = vec2(lane * 1.7 + cycle * 3.1, cycle + seed);
+    if (CloudHash(key + 4.1) > amount) return vec4(0.0);
+    float grown = pow(CloudHash(key + 2.2), 1.5);
+    float size = mix(0.005, 0.011, grown);
+    // Stick-slip: over each step of T seconds it holds, then covers v·T in
+    // the last r of the step. Heavier drops and harder wind, faster.
+    float stepT = mix(0.3, 0.8, CloudHash(key + 3.3));
+    float slip = mix(0.18, 0.5, CloudHash(key + 6.6));
+    float v = mix(0.04, 0.2, grown) * (1.0 + 0.5 * gust);
+    float hold = mix(0.4, 2.2, CloudHash(key + 7.7));
+    float run = max(tau - hold, 0.0);
+    float fallen = v * stepT *
+        (floor(run / stepT) + smoothstep(1.0 - slip, 1.0, fract(run / stepT)));
+    if (fallen > span * 0.9) return vec4(0.0);
+    // How far below the drop's starting point this fragment is.
+    float start = CloudHash(key + 8.8) * span;
+    float below = mod(start - uv.y + span * 4.0, span);
+    // Its path: a start across the lane, a wander, the lean of the wind.
+    float x0 = (lane + 0.2 + 0.6 * CloudHash(key + 9.9)) * width;
+    float wander = (CloudNoise(vec2(key.x * 7.0, below * 11.0)) - 0.5) *
+                   0.01 * smoothstep(0.0, 0.1, below);
+    float dx = uv.x - (x0 + wander);
+    // The head: gathering water as it goes.
+    float r = size * (1.0 + 0.35 * smoothstep(0.0, 0.6, fallen));
+    // Signed for the head, so a drop still at its start is whole (its top
+    // half is "above" the start, which the wrap would put a span away).
+    float headBelow = below > span * 0.9 ? below - span : below;
+    vec2 d = vec2(dx, fallen - headBelow);
+    vec4 out_ = vec4(GlassLens(GlassPear(d, r, 0.85, push * 2.0), 1.0), 0.0);
+    // The trail: from where it started down to the head, thinner with age,
+    // broken into beads, drying a few seconds after the head went by.
+    if (below > 0.0 && below < fallen) {
+      float age = run - below / max(v, 1e-3);
+      float wet = 1.0 - smoothstep(1.0, 5.0, age);
+      float w = mix(0.0016, 0.0032, grown) * mix(0.55, 1.0, wet);
+      // A thin rounded rivulet — a long lens across its width, so it bends
+      // the view and catches a line of light — breaking up into beads
+      // along its length as it dries.
+      float beads = smoothstep(0.3, 0.45,
+          CloudNoise(vec2(key.x * 3.1, below * 140.0)) + wet * 0.35);
+      float across = abs(dx) / w;
+      float cover = smoothstep(1.0, 0.7, across) * beads *
+                    smoothstep(0.0, 0.15, wet);
+      if (cover > out_.z) {
+        out_.xy = vec2(-dx / (w * max(sqrt(max(1.0 - across * across, 0.0)),
+                                      0.2)) * 0.6, 0.0);
+        out_.z = cover;
+      }
+      // The path it swept clear of beads: wider than the drop, slowly
+      // spotted again as new rain lands on it.
+      out_.w = smoothstep(r * 2.6, r * 1.6, abs(dx)) *
+               (1.0 - smoothstep(4.0, 12.0, age));
+    }
+    return out_;
+  }
+
+  // Runners: the lanes around `uv` asked in turn, so a drop that wanders
+  // over its lane's edge is drawn whole. xy slope, z cover, w swept.
+  vec4 GlassRunners(vec2 uv, float amount, float t, float push, float gust,
+                    float seed) {
+    const float width = 0.055;
+    // The wind leans every lane alike.
+    uv.x -= push * uv.y;
+    float lane = floor(uv.x / width);
+    vec4 best = vec4(0.0);
+    float swept = 0.0;
+    for (int k = -1; k <= 1; k++) {
+      vec4 r = GlassRunnerIn(uv, lane + float(k), amount, t, push, gust, seed);
+      if (r.z > best.z) best = r;
+      swept = max(swept, r.w);
+    }
+    best.w = swept;
+    return best;
+  }
+
+  // The weather on this pane at world point `p` (normal `ng`, facing the
+  // eye): x how exposed it is (open to the falling rain or snow, and facing
+  // the wind), z how hard the rain reaching it falls, w how wet it is. Sets
+  // the pane's axes: `across` it and `up` it (down is where water runs).
+  vec4 GlassRain(vec3 p, vec3 ng, out vec3 across, out vec3 up) {
+    vec4 w = frag_info.weather_surface;
+    up = frag_info.weather_cloud_up.xyz;
+    across = vec3(0.0);
+    float rain = w.z;
+    float wet = w.x;
+    if (rain < 0.004 && wet < 0.02 && w.y < 0.002) return vec4(0.0);
+    vec3 ax = normalize(abs(up.x) < 0.9 ? cross(up, vec3(1.0, 0.0, 0.0))
+                                        : cross(up, vec3(0.0, 0.0, 1.0)));
+    vec3 ay = cross(up, ax);
+    vec2 plane = vec2(dot(p, ax), dot(p, ay));
+    vec3 flat_ = ng - up * dot(ng, up);
+    float side = length(flat_);
+    vec3 out_ = side > 0.3 ? flat_ / side : up;
+    // Either face of the pane: rain on the outside shows from indoors too,
+    // through the glass. The weather side is whichever the rain reaches.
+    float openOut = WeatherSkyOpen(p + out_ * 0.4, ax, ay, plane);
+    float openIn = WeatherSkyOpen(p - out_ * 0.45, ax, ay, plane);
+    float open = max(openOut, openIn);
+    if (open <= 0.001) return vec4(0.0);
+    vec3 weatherSide = openOut >= openIn ? out_ : -out_;
+    // Facing into the wind: the rain drives straight at it.
+    vec3 slant = frag_info.weather_rain.xyz - up * dot(frag_info.weather_rain.xyz, up);
+    float tanSlant = length(slant);
+    float windward = tanSlant > 0.01 ? dot(weatherSide, slant / tanSlant) : 0.0;
+    float exposure = side > 0.3
+        ? mix(0.35, 1.0, clamp(0.5 + 0.5 * windward * min(tanSlant * 2.0 + 0.3, 1.0), 0.0, 1.0))
+        : 1.0;
+    exposure *= open;
+    if (side > 0.3) {
+      across = normalize(cross(up, out_));
+    } else {
+      across = ax;
+      up = ay; // a skylight: "down the pane" is just a direction in it
+    }
+    return vec4(exposure, 0.0, rain * exposure, max(wet, rain) * exposure);
+  }
+
   void Surface(inout MaterialInputs material) {
     vec2 base_uv = ApplyMaterialUvTransform(
         GetUV(material_params.base_color_uv_set),
@@ -132,6 +331,79 @@ fragment {
     if (material_params.transmission_texture_kind == 1) transmission *= data.r;
     if (material_params.transmission_texture_kind == 2) thickness *= data.g;
 
+    // Rain on the glass: beads, runnels, their lensing and glints.
+    vec3 world = GetWorldPosition();
+    vec3 paneAcross;
+    vec3 paneUp;
+    vec4 rainAt = GlassRain(world, normalize(GetWorldNormal()), paneAcross,
+                            paneUp);
+    vec2 paneUv = vec2(dot(world, paneAcross), dot(world, paneUp));
+    // Past a few metres a bead is under a pixel: the drops fade into the
+    // sheen of a wet pane rather than sparkle. Taken before any branch.
+    float footprint = length(fwidth(paneUv));
+    vec3 drop = vec3(0.0);
+    float frost = 0.0;
+    if (rainAt.w > 0.001) {
+      float near = 1.0 - smoothstep(0.004, 0.012, footprint);
+      float t = GetTime();
+      float amount = clamp(rainAt.w * 1.1, 0.0, 1.0);
+      // The wind at this instant (the scene's one wind, gusts and all):
+      // it pushes the running drops along the pane and hurries them.
+      // weather_rain walks back up a drop's path, so the wind is its
+      // opposite, at the drops' ~7 m/s fall.
+      vec3 wind = -frag_info.weather_rain.xyz * 7.0;
+      float push = clamp(dot(wind, paneAcross) * 0.02, -0.2, 0.2);
+      float gust = clamp(length(wind) / 14.0, 0.0, 1.0);
+      float runners = clamp(rainAt.z * 1.5, 0.0, 1.0);
+      vec4 runA = GlassRunners(paneUv, runners, t, push, gust, 0.0);
+      vec4 runB = GlassRunners(paneUv + vec2(0.0275, 0.61), runners * 0.7, t,
+                               push, gust, 5.0);
+      vec4 run = runA.z >= runB.z ? runA : runB;
+      run.w = max(runA.w, runB.w);
+      // The smallest beads go first with distance: under a pixel they only
+      // alias into specks.
+      // Rain does not land evenly: drops gather in patches where the gusts
+      // threw them, and a pane's lower parts collect what ran down (the
+      // world height, looped storey by storey, stands in for the pane's).
+      float gathered = smoothstep(0.3, 0.75, CloudNoise(paneUv * 3.5 + 1.3));
+      float low = 1.0 - fract(paneUv.y / 3.2);
+      float gather = mix(0.35, 1.5, gathered) * mix(0.7, 1.25, low);
+      // Many tiny beads, fewer medium ones, a scattering of big ones.
+      vec3 tiny = GlassBeads(paneUv, 0.008, amount * 0.6 * gather, t, 0.0) *
+                  (1.0 - smoothstep(0.0009, 0.0022, footprint));
+      vec3 medium = GlassBeads(paneUv + 0.37, 0.02, amount * 0.35 * gather,
+                               t * 0.8, 7.0);
+      vec3 big = GlassBeads(paneUv + 0.91, 0.045, amount * 0.18 * gather,
+                            t * 0.6, 13.0);
+      vec3 beads = tiny.z > medium.z ? tiny : medium;
+      beads = big.z > beads.z ? big : beads;
+      // A runnel sweeps its path clear of beads.
+      beads *= 1.0 - run.w;
+      drop = run.z > beads.z ? run.xyz : beads;
+      drop *= near;
+      // A wet pane, drops or not: a thin film blurs it a touch.
+      material.roughness = mix(material.roughness,
+                               max(material.roughness, 0.06),
+                               rainAt.w * (1.0 - near * 0.5));
+      // The water's surface is the one the sky and the sun see — tilted
+      // gently: at its full slope the Fresnel took almost all the view
+      // through, and every drop went dark.
+      material.normal = normalize(material.normal +
+          (paneAcross * drop.x + paneUp * drop.y) * drop.z * 0.3);
+      material.roughness = mix(material.roughness, 0.02, drop.z);
+    }
+    // Snow: a faint frost on an open pane, and the odd flake melting on it.
+    float snow = frag_info.weather_surface.y * rainAt.x;
+    float flake = 0.0;
+    if (snow > 0.002) {
+      frost = snow * 0.5 * CloudNoise(paneUv * 9.0);
+      material.roughness = mix(material.roughness, 0.3, frost);
+      // A few flakes caught on the pane, melting to beads on their clock.
+      vec3 f = GlassBeads(paneUv + 1.7, 0.03, snow * 0.25, GetTime() * 0.6, 3.0);
+      flake = f.z * (1.0 - smoothstep(0.004, 0.012, footprint));
+      material.base_color.rgb = mix(material.base_color.rgb, vec3(0.92), flake);
+    }
+
     float ior = max(material_params.ior, 1.0);
     float half_spread = (ior - 1.0) * 0.025 * material_params.dispersion;
     vec3 iors = vec3(max(ior - half_spread, 1.0), ior,
@@ -139,6 +411,15 @@ fragment {
     vec3 ray_r = VolumeTransmissionRay(material.normal, thickness, iors.r);
     vec3 ray_g = VolumeTransmissionRay(material.normal, thickness, iors.g);
     vec3 ray_b = VolumeTransmissionRay(material.normal, thickness, iors.b);
+    // Through a drop the view bends hard: each is a little lens, and a
+    // strong one — what is seen in it is the world beyond, turned upside
+    // down and shrunk. The slope points in toward the drop's middle, so a
+    // long step along it crosses over: the top of the drop shows what lies
+    // below.
+    vec3 lens = (paneAcross * drop.x + paneUp * drop.y) * drop.z * 0.07;
+    ray_r += lens;
+    ray_g += lens;
+    ray_b += lens;
     vec2 screen_uv = GetScreenUv();
     vec2 offset_r = ProjectWorldOffsetToScreenUv(ray_r) - screen_uv;
     vec2 offset_g = ProjectWorldOffsetToScreenUv(ray_g) - screen_uv;
@@ -157,8 +438,27 @@ fragment {
         max(material_params.attenuation_color, vec3(1e-4)),
         vec3(length(ray_r), length(ray_g), length(ray_b)) /
             attenuation_distance);
-    material.transmission = transmission;
-    material.transmission_color = transmitted * attenuation;
+    // A drop's rim turns the light away (total internal reflection): the
+    // dark outline that makes a bead read as water.
+    // A drop on a window is mostly light: its lens gathers the bright sky
+    // above into its lower half, upside down. Only a thin edge on the top,
+    // away from the light, goes dark (total internal reflection).
+    float lower = smoothstep(-0.3, 1.2, drop.y);
+    float rim = drop.z * smoothstep(2.4, 3.6, length(drop.xy)) *
+                (1.0 - lower);
+    vec3 up3 = frag_info.weather_cloud_up.xyz;
+    vec3 skyDir = normalize(up3 * 1.2 - paneAcross * drop.x * 0.15);
+    // The world above, upside down in the drop: its brightness, not the
+    // environment map's colour (the drop only magnifies what is there).
+    vec3 skyEnv = SampleRadianceEnv(prefiltered_radiance,
+        mat3(frag_info.environment_transform) * skyDir, 0.35) *
+        frag_info.environment_intensity;
+    vec3 skyInDrop = vec3(dot(skyEnv, vec3(0.2126, 0.7152, 0.0722)));
+    material.transmission = transmission * (1.0 - frost * 0.35) *
+                            (1.0 - flake * 0.7);
+    material.transmission_color =
+        mix(transmitted, skyInDrop, drop.z * lower * 0.35) * attenuation *
+        (1.0 - rim * 0.3);
     PrepareMaterial(material);
   }
 }
