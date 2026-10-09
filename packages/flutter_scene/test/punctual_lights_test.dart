@@ -4,6 +4,7 @@
 // scale/offset, and that the selected primary directional light is skipped.
 
 import 'dart:math' as math;
+import 'dart:typed_data';
 
 import 'package:flutter_scene/scene.dart';
 import 'package:flutter_scene/src/render/punctual_lights.dart';
@@ -94,6 +95,45 @@ void main() {
       expect(floats[7], closeTo(0.1, 1e-6));
       // Texel 3.z: the physical inverse-square exponent by default.
       expect(floats[14], closeTo(2.0, 1e-6));
+    });
+
+    test('a photometric profile rides after the lights, named by texel 3.w', () {
+      final profile = Float32List.fromList([1, 0.5, 0]);
+      final a = Node(localTransform: Matrix4.translationValues(0, 2, 0))
+        ..addComponent(
+          PointLightComponent(
+            PointLight(
+              photometry: profile,
+              photometryAxis: Vector3(0, -2, 0),
+            ),
+          ),
+        );
+      final b = Node()
+        ..addComponent(PointLightComponent(PointLight(photometry: profile)));
+      final c = Node()..addComponent(PointLightComponent(PointLight()));
+      final (params, count) = PunctualLightBuffer.packLights(
+        directionals: const [],
+        points: [
+          a.getComponent<PointLightComponent>()!,
+          b.getComponent<PointLightComponent>()!,
+          c.getComponent<PointLightComponent>()!,
+        ],
+        spots: const [],
+      );
+      expect(count, 3);
+      // Three light rows, then one shared profile of two rows.
+      expect(params.length, (3 + 2) * 32);
+      expect(params[15], 3.0, reason: 'first light names row 3');
+      expect(params[32 + 15], 3.0, reason: 'the same list is packed once');
+      expect(params[64 + 15], -1.0, reason: 'no profile');
+      // The point's axis, normalized, in texel 2.
+      expect(params[8], closeTo(0, 1e-6));
+      expect(params[9], closeTo(-1, 1e-6));
+      // Resampled to 64: first 1, middle about 0.5, last 0.
+      final p0 = 3 * 32;
+      expect(params[p0], closeTo(1, 1e-6));
+      expect(params[p0 + 63], closeTo(0, 1e-6));
+      expect(params[p0 + 32], closeTo(0.49, 0.02));
     });
 
     test('packs the falloff exponent into texel 3.z, clamped positive', () {

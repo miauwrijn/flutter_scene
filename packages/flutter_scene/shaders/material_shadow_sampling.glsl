@@ -293,6 +293,27 @@ vec4 FetchPunctualTexel(int light_index, int col) {
   return texture(punctual_lights, uv);
 }
 
+// A photometric profile's relative intensity at cosine `c` from its axis:
+// 64 samples over 0..pi in the parameters texture from row `first_row`
+// (32 to a row, four to a texel), linearly interpolated by hand — an
+// RGBA32F texture need not filter.
+float PhotometricSample(int first_row, int i) {
+  int row = first_row + i / 32;
+  int within = i - (i / 32) * 32;
+  vec4 t = FetchPunctualTexel(row, within / 4);
+  int comp = within - (within / 4) * 4;
+  return comp == 0 ? t.x : (comp == 1 ? t.y : (comp == 2 ? t.z : t.w));
+}
+
+float PhotometricProfile(int first_row, float c) {
+  float a = acos(clamp(c, -1.0, 1.0)) * (63.0 / 3.14159265);
+  int i0 = int(floor(a));
+  int i1 = min(i0 + 1, 63);
+  float f = a - float(i0);
+  return mix(PhotometricSample(first_row, i0), PhotometricSample(first_row, i1),
+             f);
+}
+
 // Reads the full texel of entry `j` in the light-index texture (`j` decomposed
 // to a texel with the width/height in punctual_dims.yz). A froxel-table entry
 // carries its records offset in .r and light count in .g; a record carries a

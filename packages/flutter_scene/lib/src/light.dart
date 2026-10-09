@@ -1,4 +1,5 @@
 import 'dart:math' as math;
+import 'dart:typed_data';
 import 'dart:ui' as ui;
 
 import 'package:flutter/foundation.dart' show internal;
@@ -570,13 +571,28 @@ class PointLight {
     this.shadowCasterFaces = ShadowCasterFaces.front,
     this.channelMask = 0xFF,
     this.shadowCasterChannelMask = 0xFF,
-  }) : color = color ?? Vector3(1.0, 1.0, 1.0);
+    this.photometry,
+    Vector3? photometryAxis,
+  }) : color = color ?? Vector3(1.0, 1.0, 1.0),
+       photometryAxis = photometryAxis ?? Vector3(0.0, -1.0, 0.0);
 
   /// Linear RGB color of the light.
   Vector3 color;
 
   /// Scalar multiplier applied to [color]; the radiance at unit distance.
   double intensity;
+
+  /// An angular intensity profile (a photometric web reduced to its polar
+  /// curve, as an IES file's averaged over azimuth): relative intensity,
+  /// peak 1, at evenly spaced angles from [photometryAxis] (0) to its
+  /// opposite (π). [intensity] scales it. Null is a uniform point light.
+  /// Resampled to 64 samples when packed; shared lists are packed once.
+  Float32List? photometry;
+
+  /// The axis [photometry]'s angles are measured from (a pendant's points
+  /// down), in the owning node's local space like [SpotLight.direction].
+  /// Need not be unit length.
+  Vector3 photometryAxis;
 
   /// World-space distance at which the light's influence smoothly reaches
   /// zero. `0` means infinite range (pure inverse-square falloff, clamped
@@ -793,8 +809,14 @@ class SpotLight {
     this.shadowCasterFaces = ShadowCasterFaces.front,
     this.channelMask = 0xFF,
     this.shadowCasterChannelMask = 0xFF,
+    this.photometry,
   }) : color = color ?? Vector3(1.0, 1.0, 1.0),
        direction = direction ?? Vector3(0.0, -1.0, 0.0);
+
+  /// An angular intensity profile around [direction] (see
+  /// [PointLight.photometry]). When set it replaces the cone: the profile
+  /// is the beam.
+  Float32List? photometry;
 
   /// Linear RGB color of the light.
   Vector3 color;

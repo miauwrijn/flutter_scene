@@ -784,12 +784,22 @@ vec4 EvaluateLighting(MaterialInputs material) {
       vec4 l3 = FetchPunctualTexel(light_row, 3);
       radiance *=
           (window * window) / max(pow(dist_sq, l3.z * 0.5), 1e-4);
+      // A photometric profile (texel 3.w: its first row, -1 = none):
+      // relative intensity by the angle from the light's axis (texel 2 —
+      // a spot's direction, a point's photometric axis), 64 samples from 0
+      // to pi. It is the beam: a spot with one skips its cone.
+      bool profiled = l3.w > -0.5;
+      if (profiled) {
+        vec3 axis = normalize(FetchPunctualTexel(light_row, 2).xyz);
+        radiance *= PhotometricProfile(
+            int(l3.w + 0.5), dot(axis, -punctual_light_vector));
+      }
       if (type > 1.5) {
         // Spot cone: a squared linear ramp on the cosine between the inner and
         // outer cone, using the precomputed scale (texel 2 w) and offset.
         vec4 l2 = FetchPunctualTexel(light_row, 2); // direction.xyz, angular scale
         float cd = dot(normalize(l2.xyz), -punctual_light_vector);
-        float cone = clamp(cd * l2.w + l3.x, 0.0, 1.0);
+        float cone = profiled ? 1.0 : clamp(cd * l2.w + l3.x, 0.0, 1.0);
         radiance *= cone * cone;
         // Spot shadow, when this spot has a slot in the shared atlas. Gate on
         // the geometric normal (the shadow is a geometric property).
