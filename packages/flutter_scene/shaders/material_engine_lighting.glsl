@@ -68,16 +68,19 @@ uniform sampler2D weather_occlusion;
 // the punctual textures with no live reference, so it declares neither.
 #if !defined(FLUTTER_SCENE_SHADOW_CATCHER) || !defined(FLUTTER_SCENE_SKIP_SHADOWS)
 // The additional analytic lights (point, spot, and directional lights past the
-// first) as an RGBA32F data texture: one light per row, eight texels wide. Read
+// first) as an RGBA32F data texture: one light per row, nine texels wide. Read
 // by computed UV (not a dynamically-indexed uniform array, which older GLSL
 // forbids in a fragment shader). frag_info.radiance_blend.z is the row count; a
 // white placeholder is bound and never read when it is zero. Column layout:
 //   0: position.xyz, type (0 directional, 1 point, 2 spot, 3 area)
 //   1: color.rgb * intensity, inverse range (0 = infinite)
 //   2: direction.xyz, spot angular scale
-//   3: spot angular offset, shadow slot (-1 = none), falloff exponent, unused
+//   3: spot angular offset, shadow slot (-1 = none), falloff exponent,
+//      source radius
 //   4-7: a shadow-casting spot's world -> clip matrix, or a shadow-casting
 //        point light's face-depth mapping and sampling parameters
+//   8: photometric profile row (-1 = none), a point light's profile axis.xyz
+// Photometric profiles follow the light rows, 64 samples over two rows.
 uniform highp sampler2D punctual_lights;
 // The per-object light-index buffer: a 2D RGBA32F texture whose texels (row
 // major, index in .r) are light rows into punctual_lights. Each object shades

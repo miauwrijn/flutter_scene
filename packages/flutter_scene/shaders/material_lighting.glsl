@@ -782,12 +782,24 @@ highp vec4 EvaluateLighting(MaterialInputs material) {
 #ifdef FLUTTER_SCENE_LIGHTING_HOOKS
       light_context.distance_attenuation = distance_attenuation;
 #endif
+      // A photometric profile (texel 8.x: its first row, -1 = none):
+      // relative intensity by the angle from the light's axis (a spot's
+      // direction, a point's photometric axis in texel 8.yzw), 64 samples
+      // from 0 to pi. It is the beam: a spot with one skips its cone.
+      highp vec4 l8 = FetchPunctualTexel(light_row, 8);
+      bool profiled = l8.x > -0.5;
+      if (profiled) {
+        highp vec3 axis =
+            type > 1.5 ? FetchPunctualTexel(light_row, 2).xyz : l8.yzw;
+        radiance *= PhotometricProfile(
+            int(l8.x + 0.5), dot(normalize(axis), -punctual_light_vector));
+      }
       if (type > 1.5) {
         // Spot cone: a squared linear ramp on the cosine between the inner and
         // outer cone, using the precomputed scale (texel 2 w) and offset.
         highp vec4 l2 = FetchPunctualTexel(light_row, 2); // direction.xyz, angular scale
         float cd = dot(normalize(l2.xyz), -punctual_light_vector);
-        float cone = clamp(cd * l2.w + l3.x, 0.0, 1.0);
+        float cone = profiled ? 1.0 : clamp(cd * l2.w + l3.x, 0.0, 1.0);
         radiance *= cone * cone;
 #ifdef FLUTTER_SCENE_LIGHTING_HOOKS
         light_context.cone_attenuation = cone * cone;

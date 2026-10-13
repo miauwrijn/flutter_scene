@@ -321,14 +321,35 @@ float SampleShadow(highp vec3 world_pos, vec3 n) {
 // fetch helpers compile out with them.
 #if !defined(FLUTTER_SCENE_SHADOW_CATCHER) || !defined(FLUTTER_SCENE_SKIP_SHADOWS)
 // Reads column `col` (0..7) of light `light_index`'s row from the
-// punctual_lights parameters texture (8 texels wide, punctual_dims.x rows
+// punctual_lights parameters texture (9 texels wide, punctual_dims.x rows
 // tall). Fetched by computed UV rather than a dynamically-indexed uniform
 // array, which stays portable across every compiled dialect.
 highp vec4 FetchPunctualTexel(int light_index, int col) {
-  // 8 texels per light row: 0.0625 = 0.5 / 8 centers the first column.
-  highp vec2 uv = vec2((float(col) + 0.5) * 0.125,
+  // 9 texels per light row (see punctual_lights.dart).
+  highp vec2 uv = vec2((float(col) + 0.5) * (1.0 / 9.0),
                  (float(light_index) + 0.5) / frag_info.punctual_dims.x);
   return textureLod(punctual_lights, uv, 0.0);
+}
+
+// A photometric profile's relative intensity at cosine `c` from its axis:
+// 64 samples over 0..pi in the parameters texture from row `first_row`
+// (32 to a row, four to a texel), linearly interpolated by hand -- an
+// RGBA32F texture need not filter.
+float PhotometricSample(int first_row, int i) {
+  int row = first_row + i / 32;
+  int within = i - (i / 32) * 32;
+  highp vec4 t = FetchPunctualTexel(row, within / 4);
+  int comp = within - (within / 4) * 4;
+  return comp == 0 ? t.x : (comp == 1 ? t.y : (comp == 2 ? t.z : t.w));
+}
+
+float PhotometricProfile(int first_row, float c) {
+  float a = acos(clamp(c, -1.0, 1.0)) * (63.0 / 3.14159265);
+  int i0 = int(floor(a));
+  int i1 = min(i0 + 1, 63);
+  float f = a - float(i0);
+  return mix(PhotometricSample(first_row, i0), PhotometricSample(first_row, i1),
+             f);
 }
 
 // Reads the full texel of entry `j` in the light-index texture (`j` decomposed
