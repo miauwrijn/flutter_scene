@@ -39,6 +39,9 @@
 #endif
 
 #include <material_shadow_sampling.glsl>
+#ifndef FLUTTER_SCENE_SHADOW_CATCHER
+#include <weather.glsl>
+#endif
 
 // Optional material lighting hooks. A `.fmat` that defines `Light()`,
 // `Ambient()`, or `Composite()` in its fragment source gets the matching
@@ -395,6 +398,10 @@ highp vec3 EvaluateAnalyticLight(MaterialInputs material, vec3 light_vector,
 // the material contract; a material's Surface() function fills `material` and
 // main() calls this.
 highp vec4 EvaluateLighting(MaterialInputs material) {
+  // Wet and snowed on first: everything below lights the weathered surface.
+#ifndef FLUTTER_SCENE_LEAN_LIGHTING
+  ApplyWeathering(material, v_position);
+#endif
   vec3 albedo = material.base_color.rgb;
   float alpha = material.base_color.a;
   vec3 normal = material.normal;
@@ -424,6 +431,13 @@ highp vec4 EvaluateLighting(MaterialInputs material) {
   if (frag_info.ssao_params.x > 1e30) {
     occlusion = texture(ssao_texture, vec2(0.0)).r;
   }
+#ifndef FLUTTER_SCENE_SHADOW_CATCHER
+  // Likewise weather_occlusion: the lean entries compile the weather out
+  // (a frame with weather draws the full tier) but the engine binds it.
+  if (frag_info.ssao_params.x > 1e30) {
+    occlusion *= texture(weather_occlusion, vec2(0.0)).b;
+  }
+#endif
 #endif
 #if !defined(FLUTTER_SCENE_SKIP_SSAO) && !defined(FLUTTER_SCENE_LEAN_LIGHTING)
   if (frag_info.ssao_params.x > 0.5) {
@@ -502,6 +516,11 @@ highp vec4 EvaluateLighting(MaterialInputs material) {
   if (frag_info.ssao_lighting.w > 0.5 && frag_info.camera_up.w < 0.5) {
     shadow = min(shadow, ssao_sample.g);
   }
+#endif
+#ifndef FLUTTER_SCENE_LEAN_LIGHTING
+  // The cloud deck's shadow, direct light only: an overcast day keeps its
+  // sky light.
+  shadow *= WeatherCloudShadow(v_position);
 #endif
   float sun_visibility = facing * shadow;
 

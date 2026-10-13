@@ -566,6 +566,7 @@ FmatMaterial _build(
     'effects_depth',
     'depth_test',
     'depth_layer',
+    'depth_offset',
     'parameters',
     'varyings',
     'attributes',
@@ -721,6 +722,25 @@ FmatMaterial _build(
       );
     }
     depthLayer = depthLayerValue.toInt();
+  }
+
+  // `depth_offset` lets `Surface()` say where its surface really is, in metres
+  // along the view ray, and the generated main() writes that as the fragment's
+  // depth. A sky has no depth to offset -- it is drawn behind everything by
+  // construction -- so the flag is a surface material's alone.
+  final depthOffsetValue = tree['depth_offset'];
+  if (depthOffsetValue != null && depthOffsetValue is! bool) {
+    throw FmatException(
+      '`depth_offset` must be a boolean.',
+      fileName: fileName,
+    );
+  }
+  final depthOffset = depthOffsetValue as bool? ?? false;
+  if (depthOffset && domain == FmatDomain.sky) {
+    throw FmatException(
+      '`depth_offset` applies to a surface material; a sky writes no depth.',
+      fileName: fileName,
+    );
   }
 
   final parameters = _buildParameters(tree['parameters'], fileName);
@@ -926,6 +946,7 @@ FmatMaterial _build(
     effectsDepth: effectsDepth,
     depthTest: depthTest,
     depthLayer: depthLayer,
+    depthOffset: depthOffset,
     parameters: parameters,
     fragmentSource: body.content,
     fragmentSourceLine: body.startLine,

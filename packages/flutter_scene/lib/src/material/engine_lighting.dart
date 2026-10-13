@@ -4,7 +4,9 @@ import 'dart:typed_data';
 import 'package:flutter/foundation.dart' show debugPrint, visibleForTesting;
 
 import 'package:flutter_scene/src/fog.dart';
+import 'package:flutter_scene/src/weather.dart';
 import 'package:flutter_scene/src/gpu/gpu.dart' as gpu;
+import 'package:vector_math/vector_math.dart' show Vector4;
 import 'package:flutter_scene/src/light.dart';
 import 'package:flutter_scene/src/material/environment.dart';
 import 'package:flutter_scene/src/material/material.dart';
@@ -26,15 +28,27 @@ import 'package:flutter_scene/src/render/uniform_slots.dart';
 /// [PhysicallyBasedMaterial] and `PreprocessedMaterial` use it so the lighting
 /// packing lives in one place.
 class EngineLightingUniforms {
-  /// The float count of the full `FragInfo` block (832 bytes / 208 floats:
+  /// The float count of the full `FragInfo` block (992 bytes / 248 floats:
   /// the mat4 `environment_transform` ends at float 155, the `ssao_params`
   /// vec4 at floats 156..159, then the `radiance_blend` vec4 at floats
   /// 160..163, `ssao_lighting` at 164..167, `model_scale` at 168..171,
   /// `dielectric_f0` at 172..175, the five irradiance-field vec4s at
-  /// 176..195, `froxel_grid` at 196..199, `view_projection` at 200..203, and
-  /// `camera_position` at 204..207). See the layout map in the
+  /// 176..195, `froxel_grid` at 196..199, `view_projection` at 200..203,
+  /// `camera_position` at 204..207, `depth_projection` at 208..211, and the
+  /// nine weather vec4s at 212..247). See the layout map in the
   /// implementation.
-  static const fragInfoFloatCount = 208;
+  static const fragInfoFloatCount = 248;
+
+  /// Index of the `depth_projection` vec4 in `FragInfo`: the frame
+  /// projection's depth row, for a material that writes its own
+  /// `gl_FragDepth` (see `WindowDepthAlongView` in
+  /// `material_scene_inputs.glsl`). All four zero means no projection was
+  /// published and such a material leaves depth alone.
+  static const depthProjectionIndex = 208;
+
+  /// Index of the first weather vec4 (`weather_cloud_u`); nine vec4s run
+  /// to the end of the block. See [SceneWeather] and `weather.glsl`.
+  static const weatherIndex = 212;
 
   /// Index of the `dielectric_f0` vec4 in `FragInfo`. [packInto] writes the
   /// standard 0.04 dielectric reflectance; a material with a non-default
@@ -75,7 +89,9 @@ class EngineLightingUniforms {
     double modelScaleX = 1.0,
     double modelScaleY = 1.0,
     double modelScaleZ = 1.0,
+    bool receivesWeather = true,
   }) {
+    _packWeather(fragInfo, lighting.weather, receivesWeather);
     // Default to fully drawn; a material with an active LOD cross-fade
     // overwrites this. Without it the zero-initialized slot would discard
     // every fragment.
@@ -277,6 +293,15 @@ class EngineLightingUniforms {
     fragInfo[205] = cameraPosition?.y ?? 0.0;
     fragInfo[206] = cameraPosition?.z ?? 0.0;
     fragInfo[207] = 0.0;
+    // depth_projection [208..211]: the raster projection's depth row, so a
+    // material that writes its own gl_FragDepth maps a view depth the same
+    // way the vertex stage's clip divide did. Left zero when the pass
+    // publishes none, which the shader reads as "leave depth alone".
+    final depthRow = lighting.depthProjection;
+    fragInfo[208] = depthRow?.x ?? 0.0;
+    fragInfo[209] = depthRow?.y ?? 0.0;
+    fragInfo[210] = depthRow?.z ?? 0.0;
+    fragInfo[211] = depthRow?.w ?? 0.0;
     // spot_shadow_params [12..15] (more of the unused SH region): the shared
     // spot-shadow parameters. x is the total non-cascade tile count (spot
     // tiles then point-shadow tiles); 0 disables both spot and point shadow
@@ -575,6 +600,55 @@ class EngineLightingUniforms {
     return false;
   }
 
+  /// The weather fields at [weatherIndex]: all zero when there is none, or
+  /// this material takes none.
+  static void _packWeather(
+    Float32List f,
+    SceneWeather? weather,
+    bool receivesWeather,
+  ) {
+    const i = weatherIndex;
+    if (weather == null || !weather.active) {
+      for (var k = i; k < i + 36; k++) {
+        f[k] = 0.0;
+      }
+      return;
+    }
+    void vec4(int at, Vector4 v) {
+      f[at] = v.x;
+      f[at + 1] = v.y;
+      f[at + 2] = v.z;
+      f[at + 3] = v.w;
+    }
+
+    vec4(i, weather.cloudU);
+    vec4(i + 4, weather.cloudV);
+    f[i + 8] = weather.up.x;
+    f[i + 9] = weather.up.y;
+    f[i + 10] = weather.up.z;
+    f[i + 11] = weather.cloudDeckHeight;
+    // The cloud shadow falls on everything the light reaches, water and
+    // glass included; only the surface weathering is opt-out.
+    f[i + 12] = weather.cloudShadowStrength.clamp(0.0, 1.0);
+    f[i + 13] = weather.cloudCover.clamp(0.0, 1.0);
+    f[i + 14] = weather.cloudSeed;
+    f[i + 15] = 0.0;
+    f[i + 16] = weather.wetness.clamp(0.0, 1.0);
+    f[i + 17] = weather.snowCover.clamp(0.0, 1.0);
+    f[i + 18] = weather.rainfall.clamp(0.0, 1.0);
+    f[i + 19] = receivesWeather ? 1.0 : 0.0;
+    vec4(i + 20, weather.occlusionS);
+    vec4(i + 24, weather.occlusionT);
+    f[i + 28] = weather.occlusionMinHeight;
+    f[i + 29] = weather.occlusionHeightSpan;
+    f[i + 30] = weather.occlusionMap != null ? 1.0 : 0.0;
+    f[i + 31] = weather.occlusionClearance;
+    f[i + 32] = weather.rainSlant.x;
+    f[i + 33] = weather.rainSlant.y;
+    f[i + 34] = weather.rainSlant.z;
+    f[i + 35] = 0.0;
+  }
+
   /// Binds the engine image-based-lighting and shadow samplers
   /// (`prefiltered_radiance`, `brdf_lut`, `shadow_map`) on [shader].
   static void bindEngineTextures(
@@ -670,6 +744,13 @@ class EngineLightingUniforms {
         sampler: _clampLinearSampler,
       );
     }
+    // What stands overhead, for the weather. Packed data, so nearest; the
+    // placeholder is never read (weather_occ_range.z is 0 then).
+    pass.bindTexture(
+      shader.getUniformSlot('weather_occlusion'),
+      Material.whitePlaceholder(lighting.weather?.occlusionMap),
+      sampler: _nearestClampSampler,
+    );
   }
 
   /// Binds the engine samplers a shadow-catcher fragment shader declares.

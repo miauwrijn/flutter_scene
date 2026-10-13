@@ -10,6 +10,7 @@ import 'package:vector_math/vector_math.dart';
 
 import 'package:flutter_scene/src/camera.dart';
 import 'package:flutter_scene/src/fog.dart';
+import 'package:flutter_scene/src/weather.dart';
 import 'package:flutter_scene/src/light.dart';
 import 'package:flutter_scene/src/material/environment.dart';
 import 'package:flutter_scene/src/render/projection_params.dart';
@@ -98,6 +99,7 @@ class ScenePass extends RenderGraphPass {
     IrradianceFieldBinding? irradianceField,
     int layerMask = kRenderLayerAll,
     Fog? fog,
+    SceneWeather? weather,
     bool captureOpaqueColor = false,
     bool displayReferredLayer = false,
     gpu.PixelFormat? displayReferredFormat,
@@ -145,6 +147,7 @@ class ScenePass extends RenderGraphPass {
        _ssaoIndirectLight = ssaoIndirectLight,
        _irradianceField = irradianceField,
        _fog = fog,
+       _weather = weather,
        _cullingPlanes = cullingPlanes,
        _includeOffscreen = includeOffscreen;
 
@@ -178,6 +181,7 @@ class ScenePass extends RenderGraphPass {
   final bool _ssaoIndirectLight;
   final IrradianceFieldBinding? _irradianceField;
   final Fog? _fog;
+  final SceneWeather? _weather;
 
   // Material scene inputs (see Material.sceneInputs): whether to capture
   // accumulated scene color, whether to hand materials the prepass linear
@@ -343,6 +347,20 @@ class ScenePass extends RenderGraphPass {
     final projection = ProjectionParams.of(camera.projection, _dimensions);
     // Froxel clustering for this view (views with uniform light channels);
     // its data texture rides the per-object index sampler slot.
+    // The raster projection's depth row, published for materials that write
+    // their own gl_FragDepth (parallax relief with a silhouette). Read off the
+    // matrix the color pass rasterizes with (reversed or infinite as the view
+    // draws) rather than rebuilt from near/far: clip.z and clip.w are linear
+    // in the planar view depth for any of these lenses, so the two rows are
+    // the whole mapping, and an orthographic projection falls out of the same
+    // expression.
+    final projectionMatrix = rasterProjectionOf(camera, _dimensions);
+    final depthProjection = Vector4(
+      projectionMatrix.entry(2, 2),
+      projectionMatrix.entry(2, 3),
+      projectionMatrix.entry(3, 2),
+      projectionMatrix.entry(3, 3),
+    );
     final froxels = _punctualLighting.internalBuffer?.buildFroxels(
       cameraPosition: camera.position,
       forward: cameraForward,
@@ -389,6 +407,7 @@ class ScenePass extends RenderGraphPass {
       ssaoIndirectLight: ssaoMap != null && _ssaoIndirectLight,
       viewportSize: _dimensions,
       fog: _fog,
+      weather: _weather != null && _weather.active ? _weather : null,
       sceneDepthLinear: _bindSceneDepth
           ? context.blackboard.get<gpu.Texture>(kLinearDepthBlackboardKey)
           : null,
@@ -401,6 +420,7 @@ class ScenePass extends RenderGraphPass {
       projectionOffsetX: projection.offsetX,
       projectionOffsetY: projection.offsetY,
       orthographic: projection.orthographic,
+      depthProjection: depthProjection,
       time: _time,
       planarReflectionsSuppressed: _suppressPlanarReflections,
     );

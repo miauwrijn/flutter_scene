@@ -161,6 +161,16 @@ const String kDebugViewsDefine = 'FLUTTER_SCENE_DEBUG_VIEWS';
 /// The bundle entry name of [entryName]'s baked-lightmap twin.
 String lightmapEntryName(String entryName) => '${entryName}Lightmap';
 
+/// Compiles the `depth_offset` field into `MaterialInputs` and the
+/// `gl_FragDepth` write into the generated `main()`, for a material that
+/// declares `depth_offset: true`.
+///
+/// Guarded rather than always present because writing depth costs the shader
+/// its early-depth rejection, and because the field would otherwise widen
+/// `MaterialInputs` for every material that never touches it.
+const String kMaterialDepthOffsetDefine =
+    'FLUTTER_SCENE_MATERIAL_DEPTH_OFFSET';
+
 /// Whether the material described by sidecar [metadata] samples the
 /// environment, and so ships a [radianceCubeEntryName] twin.
 bool sidecarSamplesEnvironment(Map<String, Object?> metadata) =>
@@ -229,6 +239,11 @@ String emitFragmentGlsl(
   if (material.shadingModel == FmatShadingModel.shadowCatcher) {
     sb.writeln('#define FLUTTER_SCENE_SHADOW_CATCHER');
   }
+  if (material.depthOffset) {
+    // Compiles the `depth_offset` field into MaterialInputs and the
+    // gl_FragDepth write into main(); see kMaterialDepthOffsetDefine.
+    sb.writeln('#define $kMaterialDepthOffsetDefine');
+  }
   if (material.engineInputs.contains('filtered_scene_color') ||
       !material.environmentLighting) {
     sb.writeln('#define FLUTTER_SCENE_SKIP_SSAO');
@@ -292,10 +307,12 @@ String emitFragmentGlsl(
   } else if (lit) {
     sb.writeln('#include <material_engine_lighting.glsl>');
     sb.writeln('#include <material_lighting.glsl>');
-  } else if (material.engineInputs.isNotEmpty) {
+  } else if (material.engineInputs.isNotEmpty || material.depthOffset) {
     // An unlit material with engine inputs takes the FragInfo block and the
     // scene-input accessors without any of the lighting samplers. The block
-    // costs no texture unit, so this stays clear of the sampler budget.
+    // costs no texture unit, so this stays clear of the sampler budget. A
+    // material that writes its own depth needs the block for the same reason:
+    // the projection's depth row rides in it.
     sb.writeln('#include <material_scene_inputs.glsl>');
   }
   sb.writeln();
@@ -426,6 +443,14 @@ String emitFragmentGlsl(
     // Coverage carries the alpha; the covered samples take the full color.
     sb.writeln('  ApplyAlphaToCoverage(material.base_color.a);');
     sb.writeln('  material.base_color.a = 1.0;');
+  }
+  if (material.depthOffset) {
+    // The surface said where it really is along the view ray; write that as
+    // the fragment depth so its relief has a silhouette. 0 writes the
+    // interpolated depth unchanged.
+    sb.writeln(
+      '  gl_FragDepth = WindowDepthAlongView(material.depth_offset);',
+    );
   }
   final keepAlive = _fragmentKeepAliveTerm(material, uniforms, samplers);
   _writeDebugViewSelect(sb);
@@ -928,6 +953,7 @@ Map<String, Object?> buildSidecar(FmatMaterial material) {
     'culling': material.culling.name,
     if (material.depthWrite) 'depth_write': true,
     if (material.effectsDepth) 'effects_depth': true,
+    if (material.depthOffset) 'depth_offset': true,
     if (material.depthTest != FmatDepthTest.lessEqual)
       'depth_test': material.depthTest.token,
     if (material.depthLayer != 0) 'depth_layer': material.depthLayer,

@@ -83,8 +83,11 @@ class ViewportBoundCamera extends Camera {
 DepthRaster depthRasterOf(Camera camera) =>
     camera is ViewportBoundCamera ? camera.raster : DepthRaster.standard;
 
-// The projection passes drawing for [camera] into a [dimensions] target
-// rasterize with.
+/// The projection passes drawing for [camera] into a [dimensions] target
+/// rasterize with (reversed or infinite as the view draws).
+Matrix4 rasterProjectionOf(Camera camera, ui.Size dimensions) =>
+    _rasterProjectionOf(camera, dimensions);
+
 Matrix4 _rasterProjectionOf(Camera camera, ui.Size dimensions) =>
     camera is ViewportBoundCamera
     ? rasterProjectionMatrix(

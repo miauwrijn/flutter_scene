@@ -286,6 +286,7 @@ class FmatMaterial {
     this.effectsDepth = false,
     this.depthTest = FmatDepthTest.lessEqual,
     this.depthLayer = 0,
+    this.depthOffset = false,
     required this.parameters,
     required this.fragmentSource,
     required this.fragmentSourceLine,
@@ -349,6 +350,18 @@ class FmatMaterial {
   /// (`depth_layer:`, default 0): which surface wins where it and another lie
   /// in one plane.
   final int depthLayer;
+  /// Whether `Surface()` writes its own fragment depth (`depth_offset: true`).
+  ///
+  /// The generated fragment gains a `depth_offset` field on [MaterialInputs]
+  /// -- metres along the view ray, away from the camera -- and a `main()` that
+  /// turns it into `gl_FragDepth`. It is what gives a parallax material's
+  /// relief a silhouette: the marched hit occludes and is occluded where it
+  /// really is, instead of where the flat polygon is.
+  ///
+  /// Opt-in, and not free: a shader that writes depth gives up early-depth
+  /// rejection for every surface drawn with it, so this is declared by the
+  /// handful of materials that need it rather than offered to all of them.
+  final bool depthOffset;
   final List<FmatParameter> parameters;
 
   /// The verbatim contents of the code block (`fragment { }` for a surface

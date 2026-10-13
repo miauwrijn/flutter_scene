@@ -192,6 +192,40 @@ uniform FragInfo {
   highp vec4 view_projection;
   // xyz: the camera's world-space position. w unused.
   highp vec4 camera_position;
+  // The projection's depth row, for a material that writes its own
+  // gl_FragDepth: window_z = (x * view_z + y) / (z * view_z + w), where
+  // view_z is the planar view depth (GetFragmentViewDepth()). Taken from
+  // the frame's own projection matrix rather than re-derived from near/far,
+  // so it is right for whatever lens the camera carries -- including an
+  // orthographic one, where z is 0 and the mapping is linear. All four zero
+  // (no projection published) means a material must leave depth alone.
+  highp vec4 depth_projection;
+  // Weather (see SceneWeather and weather.glsl). A procedural cloud deck that
+  // shadows the directional light, and surfaces wetted and snowed on where
+  // they are open to the sky.
+  // weather_cloud_u/v: the cloud-deck coordinates of a world point ON the
+  // deck, u = dot(p, xyz) + w (scale, wind drift and any axis flip folded
+  // in by the CPU). weather_cloud_up: xyz the world up axis (unit), w the
+  // deck's height along it. weather_cloud_params: x shadow strength (0 off),
+  // y cover, z seed, w unused.
+  highp vec4 weather_cloud_u;
+  highp vec4 weather_cloud_v;
+  highp vec4 weather_cloud_up;
+  highp vec4 weather_cloud_params;
+  // x wetness, y snow cover, z rainfall, w 1 when this material takes
+  // weather at all (water and glass do not).
+  highp vec4 weather_surface;
+  // The sky-occlusion height map (weather_occlusion sampler): map coords
+  // s = dot(p, occ_s.xyz) + occ_s.w, t likewise; occ_range x the lowest
+  // stored height, y the height span, z 1 when a map is bound, w the
+  // clearance a surface may sit under the stored top and still be open.
+  highp vec4 weather_occ_s;
+  highp vec4 weather_occ_t;
+  highp vec4 weather_occ_range;
+  // Wind-driven rain. xyz: how far, horizontally, a falling drop has come
+  // per unit of height it fell (toward upwind, i.e. the offset to walk back
+  // up the drop's path) — tan of the rain's slant. w unused.
+  highp vec4 weather_rain;
 }
 frag_info;
 
@@ -233,6 +267,57 @@ highp vec2 ProjectWorldOffsetToScreenUv(highp vec3 world_offset) {
 // forward axis), comparable against the opaque scene depth.
 highp float GetFragmentViewDepth() {
   return dot(-v_viewvector, frag_info.camera_forward.xyz);
+}
+
+// The window-space depth (what gl_FragCoord.z carries, and what gl_FragDepth
+// expects) of a point at planar view depth `view_z`, before any per-draw
+// depth offset.
+//
+// The raster projection's depth row is published whole, so this is the same
+// mapping the vertex stage's clip-space divide performed (reversed or not)
+// -- no near/far formula is re-derived here, and an orthographic lens works
+// without a special case.
+highp float WindowDepthAtViewDepth(highp float view_z) {
+  highp vec4 row = frag_info.depth_projection;
+  highp float w = row.z * view_z + row.w;
+  if (abs(w) < 1e-9) return gl_FragCoord.z;
+  return (row.x * view_z + row.y) / w;
+}
+
+// The depth to write for a fragment displaced `distance` metres along the view
+// ray, away from the camera -- what a parallax material's marched hit wants,
+// so its relief occludes and is occluded like the geometry it stands for.
+//
+// Falls back to the interpolated depth when no projection is published (all
+// four components zero), which is what a pass that never publishes one gets.
+float WindowDepthAlongView(float distance) {
+  // Nothing to displace (a hit on the surface itself), or no projection
+  // published: hand back the interpolated depth EXACTLY, rather than a
+  // recomputed value that would z-fight against every other pass by a few
+  // ulps.
+  if (distance <= 0.0 ||
+      dot(frag_info.depth_projection, frag_info.depth_projection) <= 0.0) {
+    return gl_FragCoord.z;
+  }
+  // The displaced point is `distance` further along the view ray: the line to
+  // the eye under perspective, the camera axis under an orthographic lens
+  // (whose rays are parallel), and its planar depth is what the projection
+  // maps. Clamped to the near side of the eye: a hit behind the camera has no
+  // depth worth writing.
+  highp vec3 to_fragment = -v_viewvector;
+  highp float length_to_fragment = length(to_fragment);
+  highp vec3 ray = frag_info.view_projection.z > 0.5 ||
+                           length_to_fragment <= 1e-6
+                       ? frag_info.camera_forward.xyz
+                       : to_fragment / length_to_fragment;
+  highp float view_z =
+      dot(to_fragment + ray * distance, frag_info.camera_forward.xyz);
+  // The vertex stage may have pushed this draw's depth (a depth layer, a
+  // slope-scaled tie-break); the interpolated depth carries that push and the
+  // projection row does not, so carry it over to the displaced depth too.
+  highp float push =
+      gl_FragCoord.z - WindowDepthAtViewDepth(GetFragmentViewDepth());
+  return clamp(WindowDepthAtViewDepth(max(view_z, 1e-4)) + push, 0.0, 1.0);
 }
 
 #ifdef FLUTTER_SCENE_SCENE_COLOR

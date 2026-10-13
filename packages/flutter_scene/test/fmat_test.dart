@@ -101,6 +101,65 @@ fragment { void Surface(inout MaterialInputs material) {} }
       expect(buildSidecar(m)['depth_write'], isTrue);
     });
 
+    test('depth_offset compiles the field and the gl_FragDepth write', () {
+      final m = parseFmat('''
+material {
+  name: "Relief",
+  shading_model: lit,
+  depth_offset: true,
+}
+fragment {
+  void Surface(inout MaterialInputs material) {
+    material.depth_offset = 0.05;
+    PrepareMaterial(material);
+  }
+}
+''');
+      expect(m.depthOffset, isTrue);
+      expect(buildSidecar(m)['depth_offset'], isTrue);
+      final glsl = emitFragmentGlsl(m);
+      expect(glsl, contains('#define $kMaterialDepthOffsetDefine'));
+      expect(
+        glsl,
+        contains('gl_FragDepth = WindowDepthAlongView(material.depth_offset)'),
+      );
+    });
+
+    test('a material without depth_offset writes no depth', () {
+      final glsl = emitFragmentGlsl(parseFmat(_validLit));
+      expect(glsl, isNot(contains('gl_FragDepth')));
+      expect(glsl, isNot(contains(kMaterialDepthOffsetDefine)));
+    });
+
+    test('an unlit depth_offset material still takes the scene inputs', () {
+      // The projection's depth row rides in FragInfo, which an unlit material
+      // only includes when something asks for it.
+      final glsl = emitFragmentGlsl(parseFmat('''
+material { name: "UnlitRelief", shading_model: unlit, depth_offset: true }
+fragment {
+  void Surface(inout MaterialInputs material) {
+    material.depth_offset = 1.0;
+  }
+}
+'''));
+      expect(glsl, contains('#include <material_scene_inputs.glsl>'));
+      expect(glsl, contains('gl_FragDepth'));
+    });
+
+    test('depth_offset is rejected on a sky', () {
+      expect(
+        () => parseFmat('''
+material { name: "Dome", depth_offset: true }
+sky {
+  vec3 Sky(vec3 direction) {
+    return vec3(0.5);
+  }
+}
+'''),
+        throwsA(isA<FmatException>()),
+      );
+    });
+
     test('parses depth_test into the AST and the sidecar', () {
       final m = parseFmat('''
 material {
