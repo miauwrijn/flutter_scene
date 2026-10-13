@@ -226,7 +226,8 @@ void main() {
     const box = 20.0;
     final texel = box / 1024;
     final base = shadowReceiverMargin(light, box, 0.1);
-    expect(base, closeTo(0.02 + 0.8 + 0.1 + 2 * texel, 1e-9));
+    // The normal bias grown at most threefold; the softness no longer lifts.
+    expect(base, closeTo(0.06 + 0.1 + 2 * texel, 1e-9));
     light.shadowFilter = DirectionalShadowFilter.pcss;
     expect(
       shadowReceiverMargin(light, box, 0.1) - base,

@@ -10,20 +10,28 @@
 #ifndef FLUTTER_SCENE_SKIP_SHADOWS
 // One rotated Poisson-disk PCF tap into a cascade's atlas tile.
 // Samples the caster depth for the soft-shadow blocker search, with the
-// same tile mapping as ShadowTap and no comparison.
+// same tile mapping as ShadowTap and no comparison. Returned relative to the
+// receiver's plane (see ShadowTap), so it compares against the kernel
+// centre's depth.
 highp float ShadowTapDepth(vec2 p, float ca, float sa, highp float radius,
                            highp vec2 uv,
-                           int cascade, highp float inv_count) {
+                           int cascade, highp float inv_count,
+                           highp vec2 slope) {
   highp vec2 offset = vec2(p.x * ca - p.y * sa, p.x * sa + p.y * ca) * radius;
   highp vec2 cuv = clamp(uv + offset, vec2(frag_info.shadow_texel_size),
                    vec2(1.0 - frag_info.shadow_texel_size));
   highp vec2 atlas_uv = vec2((float(cascade) + cuv.x) * inv_count, cuv.y);
   atlas_uv.y = 1.0 - atlas_uv.y;
-  return textureLod(shadow_map, atlas_uv, 0.0).r;
+  return textureLod(shadow_map, atlas_uv, 0.0).r - dot(slope, offset);
 }
 
+// `slope` is the receiver plane's depth change per unit of tile UV (see
+// ReceiverPlaneSlope): each tap compares against the receiver's own surface
+// under it, not the kernel centre's depth, so a wide kernel on a tilted
+// receiver does not shadow itself.
 float ShadowTap(vec2 p, float ca, float sa, highp float radius, highp vec2 uv,
-                int cascade, highp float inv_count, highp float receiver_depth) {
+                int cascade, highp float inv_count, highp float receiver_depth,
+                highp vec2 slope) {
   highp vec2 offset = vec2(p.x * ca - p.y * sa, p.x * sa + p.y * ca) * radius;
   // Keep samples a texel inside this cascade's tile. This also protects the
   // boundary if a custom backend applies filtering to the atlas.
@@ -36,15 +44,17 @@ float ShadowTap(vec2 p, float ca, float sa, highp float radius, highp vec2 uv,
   // top-down storage (not a backend Y-flip workaround), so it is unconditional.
   atlas_uv.y = 1.0 - atlas_uv.y;
   highp float caster_depth = textureLod(shadow_map, atlas_uv, 0.0).r;
-  return receiver_depth <= caster_depth ? 1.0 : 0.0;
+  return receiver_depth + dot(slope, offset) <= caster_depth ? 1.0 : 0.0;
 }
 
 // 2x2 bilinear percentage-closer filtering for one tap. Evaluates four adjacent
 // shadow texels and continuously interpolates the depth tests across fractional
 // texels, producing smooth analog penumbras without noise rotation or stepping.
 float ShadowTapBilinear(vec2 p, highp float radius, highp vec2 uv, int cascade,
-                        highp float inv_count, highp float receiver_depth) {
+                        highp float inv_count, highp float receiver_depth,
+                        highp vec2 slope) {
   highp vec2 offset = p * radius;
+  receiver_depth += dot(slope, offset);
   highp vec2 cuv = clamp(uv + offset, vec2(frag_info.shadow_texel_size),
                    vec2(1.0 - frag_info.shadow_texel_size));
   highp vec2 tile_tex =
@@ -69,17 +79,34 @@ float ShadowTapBilinear(vec2 p, highp float radius, highp vec2 uv, int cascade,
   return mix(mix(s00, s10, f.x), mix(s01, s11, f.x), f.y);
 }
 
-// Applies the directional shadow receiver's normal-offset bias. A soft PCF
-// kernel on a surface tilted relative to the light straddles a depth gradient,
-// so lift the receiver far enough that the whole kernel clears the surface.
-// The offset depends only on world-space geometry, so every cascade agrees.
+// Applies the directional shadow receiver's normal-offset bias: the light's
+// normal bias, grown a little toward grazing light. The offset depends only on
+// world-space geometry, so every cascade agrees.
+//
+// It used to add `shadow_softness * slope` (slope up to 8) so a soft kernel on
+// a tilted receiver cleared its own surface. That lifted the lookup by up to
+// eight penumbra radii -- 0.6 m for a 0.08 m sun, metres under cloud -- past
+// a sofa seat, an eave or a slab edge, and the point read as lit: light
+// through solid things at low sun angles. The kernel now follows the
+// receiver's plane instead (ReceiverPlaneSlope), which needs no lift.
 highp vec3 BiasDirectionalShadowPosition(highp vec3 world_pos, vec3 n) {
   vec3 light_toward = -normalize(frag_info.directional_light_direction.xyz);
   float ndotl = max(dot(n, light_toward), 0.15);
-  float slope = min(sqrt(max(1.0 - ndotl * ndotl, 0.0)) / (ndotl * ndotl), 8.0);
-  highp float normal_offset =
-      frag_info.shadow_normal_bias + frag_info.shadow_softness * slope;
+  float slope = min(sqrt(max(1.0 - ndotl * ndotl, 0.0)) / ndotl, 2.0);
+  highp float normal_offset = frag_info.shadow_normal_bias * (1.0 + slope);
   return world_pos + n * normal_offset;
+}
+
+// The receiver plane's depth change per unit of a cascade's tile UV, from the
+// world normal `n` and the cascade's world -> light-clip matrix. The tile's UV
+// spans `box` world units and its clip depth `7 * box` (see SampleCascade), so
+// the box cancels. Grazing light is clamped (|n.dir| >= 0.15) like the bias.
+highp vec2 ReceiverPlaneSlope(highp mat4 m, vec3 n) {
+  highp vec3 right = normalize(vec3(m[0][0], m[1][0], m[2][0]));
+  highp vec3 up = normalize(vec3(m[0][1], m[1][1], m[2][1]));
+  highp vec3 dir = normalize(vec3(m[0][2], m[1][2], m[2][2]));
+  highp float facing = max(-dot(n, dir), 0.15);
+  return vec2(dot(n, right), dot(n, up)) / (7.0 * facing);
 }
 
 vec2 PoissonShadowTap(int i) {
@@ -112,7 +139,8 @@ vec2 FixedShadowTap(int i) {
 
 // Samples one cascade's tile of the shadow atlas strip. `proj` is the
 // normal-biased receiver projected into the cascade (NDC xy, depth z).
-float SampleCascade(int cascade, int count, highp vec3 proj, highp float box) {
+float SampleCascade(int cascade, int count, highp vec3 proj, highp float box,
+                    highp vec2 slope) {
   highp vec2 uv = proj.xy * 0.5 + 0.5;
   // The depth bias is world-space; convert it to this cascade's clip-z (its
   // orthographic depth range is 7 * box: the toward-sun reach + forward margin
@@ -120,6 +148,11 @@ float SampleCascade(int cascade, int count, highp vec3 proj, highp float box) {
   // that makes box) so a caster crosses the shadow threshold at the same world
   // height in every cascade, with no discontinuity where cascades meet.
   highp float receiver_depth = proj.z - frag_info.shadow_bias / (7.0 * box);
+  // The map holds each texel's depth at its centre, up to half a texel (plus
+  // bilinear and rounding slop) from where the receiver's plane is read: a
+  // texel and a half of the plane's slope keeps a tilted receiver off its own
+  // texels.
+  receiver_depth -= 1.5 * frag_info.shadow_texel_size * length(slope);
 
   // The atlas also holds spot-shadow tiles after the cascades, so normalize the
   // atlas-x by the total tile count. Spot count 0 leaves this at 1 / cascades.
@@ -159,7 +192,7 @@ float SampleCascade(int cascade, int count, highp vec3 proj, highp float box) {
     float blocker_count = 0.0;
     for (int i = 0; i < 9; i++) {
       highp float caster = ShadowTapDepth(PoissonShadowTap(i), ca, sa, search_radius,
-                                    uv, cascade, inv_count);
+                                    uv, cascade, inv_count, slope);
       float hit = step(caster, receiver_depth);
       blocker_sum += caster * hit;
       blocker_count += hit;
@@ -184,15 +217,15 @@ float SampleCascade(int cascade, int count, highp vec3 proj, highp float box) {
   if (filter_index < 1.5 || filter_index > 2.5) {
     float probe =
         ShadowTap(vec2(0.0), ca, sa, radius, uv, cascade, inv_count,
-                  receiver_depth) +
+                  receiver_depth, slope) +
         ShadowTap(vec2(-1.0, -1.0), ca, sa, radius, uv, cascade, inv_count,
-                  receiver_depth) +
+                  receiver_depth, slope) +
         ShadowTap(vec2(1.0, -1.0), ca, sa, radius, uv, cascade, inv_count,
-                  receiver_depth) +
+                  receiver_depth, slope) +
         ShadowTap(vec2(-1.0, 1.0), ca, sa, radius, uv, cascade, inv_count,
-                  receiver_depth) +
+                  receiver_depth, slope) +
         ShadowTap(vec2(1.0, 1.0), ca, sa, radius, uv, cascade, inv_count,
-                  receiver_depth);
+                  receiver_depth, slope);
     settled = probe < 0.5 || probe > 4.5;
     shadow = probe * 0.2;
   }
@@ -203,13 +236,13 @@ float SampleCascade(int cascade, int count, highp vec3 proj, highp float box) {
     // 16-sample budget), producing continuous analog filtering with zero
     // noise rotation or stepped banding.
     float lit = ShadowTapBilinear(vec2(-0.7071, -0.7071), radius, uv, cascade,
-                                  inv_count, receiver_depth) +
+                                  inv_count, receiver_depth, slope) +
                 ShadowTapBilinear(vec2(0.7071, -0.7071), radius, uv, cascade,
-                                  inv_count, receiver_depth) +
+                                  inv_count, receiver_depth, slope) +
                 ShadowTapBilinear(vec2(-0.7071, 0.7071), radius, uv, cascade,
-                                  inv_count, receiver_depth) +
+                                  inv_count, receiver_depth, slope) +
                 ShadowTapBilinear(vec2(0.7071, 0.7071), radius, uv, cascade,
-                                  inv_count, receiver_depth);
+                                  inv_count, receiver_depth, slope);
     shadow = lit * 0.25;
   } else {
     int sample_count = fixed_filter > 0.5 ? 17 : 16;
@@ -218,7 +251,7 @@ float SampleCascade(int cascade, int count, highp vec3 proj, highp float box) {
       if (i >= sample_count) break;
       vec2 tap = mix(PoissonShadowTap(i), FixedShadowTap(i), fixed_filter);
       lit += ShadowTap(tap, ca, sa, radius, uv, cascade, inv_count,
-                       receiver_depth);
+                       receiver_depth, slope);
     }
     shadow = lit / float(sample_count);
   }
@@ -270,7 +303,8 @@ float CascadeBlendWeight(highp vec2 uv, highp float margin, highp float band) {
       float take = min(CascadeBlendWeight(uv, margin, band),                 \
                        1.0 - weight);                                        \
       if (take > 0.0) {                                                      \
-        shadow_sum += take * SampleCascade(IDX, count, proj, box);           \
+        shadow_sum += take * SampleCascade(IDX, count, proj, box,            \
+                                           ReceiverPlaneSlope(cascade_matrix, n)); \
         weight += take;                                                      \
       }                                                                      \
     }                                                                        \
