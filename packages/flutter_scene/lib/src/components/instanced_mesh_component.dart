@@ -1,4 +1,5 @@
 import 'package:flutter/foundation.dart';
+import 'package:flutter_scene/src/node.dart';
 import 'package:flutter_scene/src/components/component.dart';
 import 'package:flutter_scene/src/light.dart' show ShadowCastingMode;
 import 'package:flutter_scene/src/instanced_mesh.dart';
@@ -27,10 +28,13 @@ class InstancedMeshComponent extends Component {
   void onMount() {
     final renderScene = node.internalRenderScene;
     if (renderScene == null) return;
-    final item = RenderItem(
-      geometry: instancedMesh.geometry,
-      material: instancedMesh.material,
-    )..sourceNode = node;
+    final item =
+        RenderItem(
+            geometry: instancedMesh.geometry,
+            material: instancedMesh.material,
+          )
+          ..sourceNode = node
+          ..drawSource = instancedMesh;
     _renderItem = item;
     renderScene.add(item);
   }
@@ -54,6 +58,9 @@ class InstancedMeshComponent extends Component {
   void refreshRenderItem() {
     final item = _renderItem;
     if (item == null) return;
+    item.debugView = Node.debugViewOverrideCount == 0
+        ? null
+        : node.effectiveDebugView;
     // A material can declare itself draw-less for the frame (the shadow
     // catcher at zero intensity); its item then joins no pass at all.
     final visible = !item.material.drawsNothing;
@@ -77,6 +84,7 @@ class InstancedMeshComponent extends Component {
     final frustumCulledChanged = item.frustumCulled != frustumCulled;
     item.frustumCulled = frustumCulled;
     item.layers = node.layers;
+    item.renderOrder = node.renderOrder;
     final worldTransform = node.globalTransform;
     final boundsChangedByInput =
         worldTransformVersion != _worldTransformVersion ||

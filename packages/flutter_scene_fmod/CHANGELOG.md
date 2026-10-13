@@ -1,3 +1,8 @@
+## 0.1.3
+
+* Widen the `flutter_scene` constraint to `^0.24.0`.
+* Require `fmod` 0.1.1, which allows `code_assets` 2.x.
+
 ## 0.1.2
 
 * Widen the `flutter_scene` constraint to `^0.23.0`. No API changes.

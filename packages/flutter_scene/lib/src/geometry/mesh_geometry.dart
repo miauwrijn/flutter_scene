@@ -198,6 +198,7 @@ class MeshGeometry extends UnskinnedGeometry {
       retainCpuData = false {
     primitiveType = source.primitiveType;
     setVertexStreams(source.vertexStreams, source.boundVertexCount);
+    shareCustomAttributesOf(source);
     _liveVertexCount = source.vertexCount;
     setLocalBounds(source.localBounds, source.localBoundingSphere);
     _indexed = true;
@@ -580,27 +581,38 @@ class MeshGeometry extends UnskinnedGeometry {
       );
     }
     ByteData? indexBytes;
+    TypedData? indexUpload;
     var indexType = gpu.IndexType.int16;
     _indexed = indices != null;
     if (indices != null) {
       final packed = InterleavedLayoutAdapter.packIndices(indices);
       indexBytes = ByteData.sublistView(packed.bytes);
+      // The same bytes again, as the integer list they already are, so the
+      // upload keeps their element type; see Geometry._uploadStreams.
+      indexUpload = InterleavedLayoutAdapter.indexUploadView(
+        packed.bytes,
+        is32Bit: packed.is32Bit,
+      );
       indexType = packed.is32Bit ? gpu.IndexType.int32 : gpu.IndexType.int16;
       if (retainCpuData) _packedIndexBytes = packed.bytes;
       _packedIndices32Bit = packed.is32Bit;
     }
+    // The caller's own arrays, so an attribute it left out binds a shared
+    // default stream instead of a per-mesh copy of the default. The retained
+    // copies above already hold the defaults for readback.
     uploadUnskinnedAttributes(
-      positions: retainCpuData ? _cpuPositions : positions,
+      positions: positions,
       vertexCount: vertexCount,
-      normals: retainCpuData ? _cpuNormals : normals,
-      texCoords: retainCpuData ? _cpuTexCoords : texCoords,
-      texCoords1: retainCpuData ? _cpuTexCoords1 : texCoords1,
-      colors: retainCpuData ? _cpuColors : colors,
-      tangents: retainCpuData ? _cpuTangents : tangents,
-      indices: indexBytes,
+      normals: normals,
+      texCoords: texCoords,
+      texCoords1: texCoords1,
+      colors: colors,
+      tangents: tangents,
+      indices: indexUpload,
       indexType: indexType,
       bufferArena: bufferArena,
-      retainCpuData: retainCpuData,
+      retainCpuData: false,
+      shareAbsentStreams: true,
     );
     // Raycast off this geometry's own attribute arrays instead of the
     // transient upload copies, so no extra position/texcoord copy lingers.

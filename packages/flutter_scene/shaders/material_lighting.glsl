@@ -9,6 +9,16 @@
 // (as `frag_info`), the world-space varyings `v_position` and `v_viewvector`,
 // the `prefiltered_radiance`, `brdf_lut`, and `shadow_map` samplers, the
 // MaterialInputs struct (material_inputs.glsl), and pbr.glsl + texture.glsl.
+//
+// FLUTTER_SCENE_LEAN_LIGHTING compiles out the features a scene can leave off
+// (irradiance field, rect area lights, environment cross-fade, parallax
+// box reflections, screen-space occlusion and its bent-cone specular term,
+// point-light shadows). Even unused, they size the register allocation, and
+// on mobile GPUs the full program spills. The engine selects the lean entries
+// only when every compiled-out feature is off for the draw (see
+// Lighting.allowsLeanShading). Every sampler and block stays declared, through
+// never-taken reads where the code that used it is gone, so both tiers keep
+// one binding interface.
 
 // Distance fog (the FogInfo block + ApplyFog), applied to the final lit color.
 #include <fog.glsl>
@@ -22,7 +32,7 @@
 // Diffuse-irradiance spherical harmonics, fetched from rows 0 and 1 of the
 // irradiance_field texture.
 #include <diffuse_sh.glsl>
-#ifndef FLUTTER_SCENE_LIGHTMAP
+#if !defined(FLUTTER_SCENE_LIGHTMAP) && !defined(FLUTTER_SCENE_CUSTOM_AMBIENT)
 // The world-space irradiance field's atlas addressing and its receiver.
 #include <irradiance_field.glsl>
 #include <irradiance_receiver.glsl>
@@ -33,6 +43,79 @@
 #include <weather.glsl>
 #endif
 
+// Optional material lighting hooks. A `.fmat` that defines `Light()`,
+// `Ambient()`, or `Composite()` in its fragment source gets the matching
+// FLUTTER_SCENE_HOOK_* define, and EvaluateLighting calls the material's
+// function through the prototype below (the definition follows later in the
+// generated source). Materials without hooks compile exactly as before.
+#if defined(FLUTTER_SCENE_HOOK_LIGHT) || defined(FLUTTER_SCENE_HOOK_AMBIENT) || \
+    defined(FLUTTER_SCENE_HOOK_COMPOSITE)
+#define FLUTTER_SCENE_LIGHTING_HOOKS
+#endif
+
+#ifdef FLUTTER_SCENE_LIGHTING_HOOKS
+// One analytic light as seen from the shaded point. `radiance` is what the
+// default BRDF receives: `color` times every attenuation term and the shadow.
+struct LightContext {
+  highp vec3 light_vector;  // Surface to light, unit length.
+  highp vec3 radiance;
+  highp vec3 color;         // Color times intensity, unattenuated.
+  highp vec3 position;      // World position (directional: unused).
+  highp vec3 direction;     // Travel direction (directional and spot).
+  float distance_attenuation;
+  float cone_attenuation;
+  float shadow;
+  float type;               // 0 directional, 1 point, 2 spot.
+  // The light's row in the punctual light table and its shadow slot (-1 when
+  // it casts none), so a hook can sample the shadow atlas itself. The
+  // directional light reports row -1.
+  float light_row;
+  float shadow_slot;
+  vec3 normal;              // Shading normal.
+  vec3 view;                // Surface to camera, unit length.
+};
+
+// A light's contribution split into lobes, so Composite() can weigh them.
+struct LightTerms {
+  highp vec3 diffuse;
+  highp vec3 specular;
+};
+
+// The image-based lighting inputs before the split-sum BRDF is applied.
+// Ambient() may rescale or add to the incoming light and replace occlusion.
+struct AmbientContext {
+  highp vec3 irradiance;  // Diffuse irradiance (environment SH, intensity).
+  highp vec3 radiance;    // Prefiltered specular radiance along reflection.
+  vec3 diffuse_occlusion;
+  float specular_occlusion;
+  vec3 normal;
+  vec3 reflection;
+  float n_dot_v;
+  float roughness;
+};
+
+// Every lobe of the lit result, before alpha premultiplication and fog.
+struct LightingResult {
+  highp vec3 direct_diffuse;
+  highp vec3 direct_specular;
+  highp vec3 indirect_diffuse;
+  highp vec3 indirect_specular;
+  highp vec3 emissive;
+  float alpha;
+};
+
+#ifdef FLUTTER_SCENE_HOOK_LIGHT
+LightTerms Light(MaterialInputs material, LightContext light);
+#endif
+#ifdef FLUTTER_SCENE_HOOK_AMBIENT
+void Ambient(MaterialInputs material, inout AmbientContext ambient);
+#endif
+#ifdef FLUTTER_SCENE_HOOK_COMPOSITE
+// Returns linear HDR premultiplied by alpha; engine fog is applied after.
+highp vec4 Composite(MaterialInputs material, LightingResult result);
+#endif
+#endif
+
 // Parallax-corrected reflection for a local environment probe: intersects
 // the reflected ray with the probe's box proxy and re-aims the lookup from
 // the capture point (the box center) at the hit, so reflections track the
@@ -40,19 +123,19 @@
 // Lagarde and Zanuttini 2012, "Local Image-based Lighting With
 // Parallax-corrected Cubemap" (SIGGRAPH). Returns [r] unchanged when no
 // proxy is active.
-vec3 ParallaxCorrectReflection(vec3 world_pos, vec3 r) {
+vec3 ParallaxCorrectReflection(highp vec3 world_pos, vec3 r) {
   vec3 corrected = r;
   if (frag_info.probe_box.w > 0.5) {
-    vec3 center = frag_info.probe_box.xyz;
-    vec3 half_ext = frag_info.probe_extents.xyz;
+    highp vec3 center = frag_info.probe_box.xyz;
+    highp vec3 half_ext = frag_info.probe_extents.xyz;
     // Nudge zero components so the slab division stays finite.
-    vec3 safe_r = r + (step(vec3(0.0), r) * 2.0 - 1.0) * 1e-6;
-    vec3 inv_r = vec3(1.0) / safe_r;
-    vec3 t_a = (center + half_ext - world_pos) * inv_r;
-    vec3 t_b = (center - half_ext - world_pos) * inv_r;
-    vec3 t_max = max(t_a, t_b);
-    float t = min(min(t_max.x, t_max.y), t_max.z);
-    vec3 hit = world_pos + r * max(t, 0.0);
+    highp vec3 safe_r = r + (step(vec3(0.0), r) * 2.0 - 1.0) * 1e-6;
+    highp vec3 inv_r = vec3(1.0) / safe_r;
+    highp vec3 t_a = (center + half_ext - world_pos) * inv_r;
+    highp vec3 t_b = (center - half_ext - world_pos) * inv_r;
+    highp vec3 t_max = max(t_a, t_b);
+    highp float t = min(min(t_max.x, t_max.y), t_max.z);
+    highp vec3 hit = world_pos + r * max(t, 0.0);
     corrected = normalize(hit - center);
   }
   return corrected;
@@ -95,8 +178,8 @@ float LtcClippedSphere(vec3 f) {
 // Integrates the transformed clamped-cosine over the rect [c0..c3] (counter
 // clockwise seen from the lit side) as seen from point [p] with normal [n]
 // and view direction [v].
-float LtcIntegrate(vec3 n, vec3 v, vec3 p, mat3 inv_m, vec3 c0, vec3 c1,
-                   vec3 c2, vec3 c3) {
+float LtcIntegrate(vec3 n, vec3 v, highp vec3 p, mat3 inv_m, highp vec3 c0,
+                   highp vec3 c1, highp vec3 c2, highp vec3 c3) {
   vec3 t1 = normalize(v - n * dot(v, n));
   vec3 t2 = -cross(n, t1);
   mat3 to_cosine = inv_m * transpose(mat3(t1, t2, n));
@@ -173,7 +256,7 @@ float SpecularAARoughness(vec3 normal, float roughness) {
 // One light's independent dielectric clearcoat lobe. The complete underlying
 // material is attenuated by the view Fresnel only after every contribution has
 // been accumulated.
-vec3 EvaluateClearcoatLight(vec3 light_vector, vec3 radiance,
+highp vec3 EvaluateClearcoatLight(vec3 light_vector, highp vec3 radiance,
                             vec3 coat_normal, vec3 camera_normal,
                             float coat_roughness) {
   float n_dot_l = max(dot(coat_normal, light_vector), 0.0);
@@ -199,16 +282,22 @@ vec3 EvaluateClearcoatLight(vec3 light_vector, vec3 radiance,
 // premultiplied by intensity and any distance/cone attenuation. Returns the
 // linear direct term; the caller multiplies in any shadow visibility. Shared by
 // the directional light and every punctual light so the BRDF lives in one place.
-vec3 EvaluateAnalyticLight(MaterialInputs material, vec3 light_vector,
-                           vec3 radiance, vec3 normal,
-                           vec3 camera_normal, vec3 albedo, float metallic,
-                           float roughness, vec3 reflectance, float n_dot_v,
-                           float specular_scale, vec3 anisotropic_tangent,
-                           vec3 anisotropic_bitangent) {
+// Returns the diffuse lobe (with sheen's partner, transmitted diffuse) and
+// writes the specular lobe (with sheen) to `specular_out`.
+highp vec3 EvaluateAnalyticLightTerms(MaterialInputs material, vec3 light_vector,
+                                      highp vec3 radiance, vec3 normal,
+                                      vec3 camera_normal, vec3 albedo,
+                                      float metallic, float roughness,
+                                      vec3 reflectance, float n_dot_v,
+                                      float specular_scale,
+                                      vec3 anisotropic_tangent,
+                                      vec3 anisotropic_bitangent,
+                                      out highp vec3 specular_out) {
+  specular_out = vec3(0.0);
   float signed_n_dot_l = dot(normal, light_vector);
   float n_dot_l = max(signed_n_dot_l, 0.0);
 #ifdef FLUTTER_SCENE_PHYSICAL_MATERIAL
-  vec3 transmitted_diffuse = material.diffuse_transmission_color *
+  highp vec3 transmitted_diffuse = material.diffuse_transmission_color *
                              (1.0 / kPi) * radiance *
                              max(-signed_n_dot_l, 0.0) *
                              material.diffuse_transmission;
@@ -231,8 +320,9 @@ vec3 EvaluateAnalyticLight(MaterialInputs material, vec3 light_vector,
   vec3 specular_fresnel = reflectance;
   if (h_len_sq > 1e-8) {
     vec3 half_vector = h * inversesqrt(h_len_sq);
-    float distribution = DistributionGGX(normal, half_vector, roughness);
-    float visibility =
+    highp float distribution =
+        DistributionGGX(normal, half_vector, roughness);
+    highp float visibility =
         VisibilitySmithGGXCorrelated(n_dot_v_safe, n_dot_l, roughness);
 #ifdef FLUTTER_SCENE_PHYSICAL_MATERIAL
     float anisotropy = clamp(material.anisotropy, 0.0, 1.0);
@@ -253,7 +343,10 @@ vec3 EvaluateAnalyticLight(MaterialInputs material, vec3 light_vector,
     specular_fresnel =
         FresnelSchlick(max(dot(half_vector, camera_normal), 0.0), reflectance);
     // `visibility` already folds in 1 / (4 * NoL * NoV).
-    specular = distribution * visibility * specular_fresnel * specular_scale;
+    // The product overflows half precision at sharp peaks, and the Inf
+    // turns into NaN against any zero channel of the radiance.
+    specular = min(distribution * visibility, kMediumpFloatMax) *
+               specular_fresnel * specular_scale;
   }
   vec3 diffuse =
       (vec3(1.0) - specular_fresnel) * (1.0 - metallic) * albedo * (1.0 / kPi);
@@ -264,7 +357,8 @@ vec3 EvaluateAnalyticLight(MaterialInputs material, vec3 light_vector,
       material.diffuse_transmission + specular_transmission, 0.0, 1.0);
   diffuse *= 1.0 - total_transmission;
 #endif
-  vec3 result = (diffuse + specular) * radiance * n_dot_l;
+  highp vec3 result = diffuse * radiance * n_dot_l;
+  specular_out = specular * radiance * n_dot_l;
 #ifdef FLUTTER_SCENE_PHYSICAL_MATERIAL
   if (dot(material.sheen_color, material.sheen_color) > 0.0) {
     vec3 sheen_half = normalize(light_vector + camera_normal);
@@ -274,21 +368,40 @@ vec3 EvaluateAnalyticLight(MaterialInputs material, vec3 light_vector,
     float sheen_visibility = VisibilitySheen(
         n_dot_l, max(n_dot_v, 1e-4),
         max(material.sheen_roughness, kMinRoughness));
-    result += material.sheen_color * sheen_distribution * sheen_visibility *
-              radiance * n_dot_l;
+    specular_out += material.sheen_color * sheen_distribution *
+                    sheen_visibility * radiance * n_dot_l;
   }
   result += transmitted_diffuse;
 #endif
   return result;
 }
 
+// EvaluateAnalyticLightTerms with the lobes summed.
+highp vec3 EvaluateAnalyticLight(MaterialInputs material, vec3 light_vector,
+                                 highp vec3 radiance, vec3 normal,
+                                 vec3 camera_normal, vec3 albedo,
+                                 float metallic, float roughness,
+                                 vec3 reflectance, float n_dot_v,
+                                 float specular_scale,
+                                 vec3 anisotropic_tangent,
+                                 vec3 anisotropic_bitangent) {
+  highp vec3 specular;
+  highp vec3 diffuse = EvaluateAnalyticLightTerms(
+      material, light_vector, radiance, normal, camera_normal, albedo,
+      metallic, roughness, reflectance, n_dot_v, specular_scale,
+      anisotropic_tangent, anisotropic_bitangent, specular);
+  return diffuse + specular;
+}
+
 // Lights a surface described by `material` and returns the final fragment
 // color (linear HDR, premultiplied by alpha). This is the engine-owned half of
 // the material contract; a material's Surface() function fills `material` and
 // main() calls this.
-vec4 EvaluateLighting(MaterialInputs material) {
+highp vec4 EvaluateLighting(MaterialInputs material) {
   // Wet and snowed on first: everything below lights the weathered surface.
+#ifndef FLUTTER_SCENE_LEAN_LIGHTING
   ApplyWeathering(material, v_position);
+#endif
   vec3 albedo = material.base_color.rgb;
   float alpha = material.base_color.a;
   vec3 normal = material.normal;
@@ -299,10 +412,10 @@ vec4 EvaluateLighting(MaterialInputs material) {
   vec3 coat_normal = normalize(material.clearcoat_normal);
   float coat_roughness = SpecularAARoughness(
       coat_normal, material.clearcoat_roughness);
-  float coat_n_dot_v = clamp(abs(dot(coat_normal, normalize(v_viewvector))),
+  float coat_n_dot_v = clamp(abs(dot(coat_normal, GetViewDirection())),
                              0.0, 0.99);
-  vec3 coat_direct = vec3(0.0);
-  vec3 coat_ibl = vec3(0.0);
+  highp vec3 coat_direct = vec3(0.0);
+  highp vec3 coat_ibl = vec3(0.0);
 #endif
 
   // Diffuse occlusion: the material's (baked) occlusion modulated by the
@@ -313,9 +426,22 @@ vec4 EvaluateLighting(MaterialInputs material) {
   vec3 ao_bent_normal = vec3(0.0);
   float ao_bent_valid = 0.0;
   vec4 ssao_sample = vec4(1.0);
-#ifndef FLUTTER_SCENE_SKIP_SSAO
+#ifdef FLUTTER_SCENE_LEAN_LIGHTING
+  // Keeps ssao_texture declared (the engine binds it); never taken.
+  if (frag_info.ssao_params.x > 1e30) {
+    occlusion = texture(ssao_texture, vec2(0.0)).r;
+  }
+#ifdef FLUTTER_SCENE_WEATHER_OCCLUSION
+  // Likewise weather_occlusion: the lean entries compile the weather out
+  // (a frame with weather draws the full tier) but the engine binds it.
+  if (frag_info.ssao_params.x > 1e30) {
+    occlusion *= texture(weather_occlusion, vec2(0.0)).b;
+  }
+#endif
+#endif
+#if !defined(FLUTTER_SCENE_SKIP_SSAO) && !defined(FLUTTER_SCENE_LEAN_LIGHTING)
   if (frag_info.ssao_params.x > 0.5) {
-    vec2 screen_uv = gl_FragCoord.xy * frag_info.ssao_params.zw;
+    highp vec2 screen_uv = gl_FragCoord.xy * frag_info.ssao_params.zw;
     // TODO(flutter_scene): the occlusion target is stored top-down like the
     // other render-to-texture targets, which matches gl_FragCoord here. If a
     // backend reports gl_FragCoord with a flipped origin, this sample needs
@@ -347,7 +473,58 @@ vec4 EvaluateLighting(MaterialInputs material) {
   }
 #endif
 
-  vec3 camera_normal = normalize(v_viewvector);
+  // The sun's visibility comes first: its shadow lookup is the largest block
+  // in the shader, and here little else is live, so it does not force the
+  // later terms out of registers.
+  float geometric_n_dot_l = 0.0;
+  vec3 light_vector = vec3(0.0);
+  // FLUTTER_SCENE_NO_DIRECTIONAL_LIGHT (`directional_light: false`) compiles
+  // the directional light out: the material shades as if the scene had none.
+#ifndef FLUTTER_SCENE_NO_DIRECTIONAL_LIGHT
+  if (frag_info.has_directional_light > 0.5) {
+    light_vector = -normalize(frag_info.directional_light_direction.xyz);
+    geometric_n_dot_l = dot(GetWorldNormal(), light_vector);
+  }
+#endif
+  // Whether the surface faces the sun is a geometric property, so gate the
+  // shadow terms on the geometric normal. Using the perturbed normal lets a
+  // normal map's relief push n_dot_l across the terminator on a nearly sun-
+  // facing face (worst near a low sun), spuriously darkening the shadow-ambient
+  // term on bumpy top faces.
+  float facing = clamp(geometric_n_dot_l / 0.15, 0.0, 1.0);
+
+  // Sun-shadow visibility (1 lit .. 0 shadowed). The shadow map is only
+  // meaningful for sun-facing surfaces; a back face receives no sun by
+  // definition, so it is treated as fully shadowed (facing = 0) without a
+  // shadow-map lookup, whose normal-offset bias assumes a sun-facing receiver
+  // and would otherwise stripe the back face with acne.
+  float shadow = 1.0;
+#if !defined(FLUTTER_SCENE_SKIP_SHADOWS) && \
+    !defined(FLUTTER_SCENE_NO_DIRECTIONAL_LIGHT)
+  shadow =
+      (frag_info.has_directional_light > 0.5 && frag_info.casts_shadow > 0.5 &&
+       facing > 0.0)
+          ? SampleShadow(v_position, GetWorldNormal())
+          : 1.0;
+#endif
+#if !defined(FLUTTER_SCENE_SKIP_SSAO) && \
+    !defined(FLUTTER_SCENE_LEAN_LIGHTING) && \
+    !defined(FLUTTER_SCENE_NO_DIRECTIONAL_LIGHT)
+  // Screen-space contact shadow for the sun, marched by the occlusion pass.
+  // Applies whether or not a shadow map is active, grounding small contacts
+  // that shadow-map resolution and bias miss.
+  if (frag_info.ssao_lighting.w > 0.5 && frag_info.camera_up.w < 0.5) {
+    shadow = min(shadow, ssao_sample.g);
+  }
+#endif
+#ifndef FLUTTER_SCENE_LEAN_LIGHTING
+  // The cloud deck's shadow, direct light only: an overcast day keeps its
+  // sky light.
+  shadow *= WeatherCloudShadow(v_position);
+#endif
+  float sun_visibility = facing * shadow;
+
+  vec3 camera_normal = GetViewDirection();
 
   vec3 anisotropic_tangent = vec3(1.0, 0.0, 0.0);
   vec3 anisotropic_bitangent = vec3(0.0, 1.0, 0.0);
@@ -438,252 +615,16 @@ vec4 EvaluateLighting(MaterialInputs material) {
       mix(reflection_normal, bent_normal, roughness * roughness));
 #endif
 
-  // Roughness-dependent Fresnel reflectance for the indirect specular lobe.
-  vec3 k_S = FresnelSchlickRoughness(n_dot_v_energy, reflectance, roughness);
-
-  // The IBL environment can be rotated; transform the lookup directions.
-  // Irradiance samples along the bent normal when the occlusion chain
-  // carries one: the SH lookup then ignores directions the screen-space
-  // march found blocked. Geometric, so normal-map detail is dropped there,
-  // which the smooth SH barely resolves anyway.
-  mat3 environment_transform = mat3(frag_info.environment_transform);
-  vec3 env_normal = environment_transform *
-                    (ao_bent_valid > 0.5 ? ao_bent_normal : normal);
-  vec3 env_reflection =
-      environment_transform *
-      ParallaxCorrectReflection(v_position, reflection_normal);
-#ifdef FLUTTER_SCENE_LIGHTMAP
-  // The bake already carries this surface's indirect diffuse, so it replaces
-  // the SH ambient rather than adding to it. A bake has no direction, so the
-  // back side reads the same value.
-  vec3 irradiance = BakedDiffuseRadiance();
-#ifdef FLUTTER_SCENE_PHYSICAL_MATERIAL
-  vec3 transmitted_irradiance = irradiance;
+  highp vec3 direct = vec3(0.0);
+#ifdef FLUTTER_SCENE_LIGHTING_HOOKS
+  // The hooked path accumulates each light's lobes separately for Composite().
+  highp vec3 direct_diffuse = vec3(0.0);
+  highp vec3 direct_specular = vec3(0.0);
+  LightContext light_context;
+  light_context.normal = normal;
+  light_context.view = camera_normal;
+  light_context.position = vec3(0.0);
 #endif
-#else
-  vec3 irradiance = max(EvaluateDiffuseSH(irradiance_field, env_normal, 0),
-                        vec3(0.0));
-#ifdef FLUTTER_SCENE_PHYSICAL_MATERIAL
-  vec3 transmitted_irradiance = max(
-      EvaluateDiffuseSH(irradiance_field, -env_normal, 0), vec3(0.0));
-#endif
-#endif
-  vec3 prefiltered_color =
-      SampleRadianceEnv(prefiltered_radiance,
-                        env_reflection, roughness);
-  // Cross-fade a secondary environment in (area transitions) when active. Both
-  // share the bound layout, so the same samplers' _b pair is read.
-  float env_blend = frag_info.radiance_blend.x;
-  if (env_blend > 0.0) {
-#ifndef FLUTTER_SCENE_LIGHTMAP
-    vec3 irradiance_b = max(EvaluateDiffuseSH(irradiance_field, env_normal, 1),
-                            vec3(0.0));
-#endif
-    // env_reflection is box-corrected for the primary probe; the secondary
-    // reuses it, so a probe->environment crossfade samples the secondary with
-    // the probe's parallax vector. Transient and weight-blended, so
-    // effectively invisible. TODO(probe-crossfade-parallax): box-correct the
-    // secondary against its own volume.
-    vec3 prefiltered_b =
-        SampleRadianceEnv(prefiltered_radiance_b,
-                          env_reflection, roughness);
-    // A baked diffuse ambient belongs to the surface, not to either
-    // environment, so only the specular lobe cross-fades here.
-#ifndef FLUTTER_SCENE_LIGHTMAP
-    irradiance = mix(irradiance, irradiance_b, env_blend);
-#ifdef FLUTTER_SCENE_PHYSICAL_MATERIAL
-    vec3 transmitted_irradiance_b = max(
-        EvaluateDiffuseSH(irradiance_field, -env_normal, 1), vec3(0.0));
-    transmitted_irradiance = mix(
-        transmitted_irradiance, transmitted_irradiance_b, env_blend);
-#endif
-#endif
-    prefiltered_color = mix(prefiltered_color, prefiltered_b, env_blend);
-  }
-  // environment_intensity scales the image-based lighting; a bake carries its
-  // own lightmap_intensity instead.
-#ifndef FLUTTER_SCENE_LIGHTMAP
-  irradiance *= frag_info.environment_intensity;
-#ifdef FLUTTER_SCENE_PHYSICAL_MATERIAL
-  transmitted_irradiance *= frag_info.environment_intensity;
-#endif
-#endif
-  prefiltered_color *= frag_info.environment_intensity;
-
-#ifndef FLUTTER_SCENE_LIGHTMAP
-  // The world-space irradiance field replaces the environment's diffuse term
-  // inside its volume, so bounce light persists for surfaces off screen and
-  // colored bleed reads correctly, and fades back to it across the outermost
-  // cell. The field's own empty content is the environment, so an unfilled
-  // field is exactly the image above and the transition is continuous.
-  //
-  // The lookup direction is the camera-invariant shading normal, never the
-  // screen-derived bent normal: the visibility select is a hard boundary, so
-  // a camera-dependent normal makes it flicker like z-fighting. The field's
-  // stored radiance already carries the environment intensity, so it is not
-  // scaled again here.
-  float gi_coverage = IrradianceFieldCoverage(v_position);
-  if (gi_coverage > 0.0) {
-    vec3 gi = SampleIrradianceField(v_position, normal, camera_normal);
-    irradiance = mix(irradiance, gi, gi_coverage);
-#ifdef FLUTTER_SCENE_PHYSICAL_MATERIAL
-    // TODO(gi-transmission): the transmitted direction repeats the whole
-    // eight-tap cage. The weights only depend on the normal through the wrap
-    // term, so one pass could return both lobes.
-    vec3 gi_back = SampleIrradianceField(v_position, -normal, camera_normal);
-    transmitted_irradiance = mix(transmitted_irradiance, gi_back, gi_coverage);
-#endif
-  }
-#endif
-
-  // Split-sum DFG terms (Karis '13) from the RGBA16F environment-BRDF LUT
-  // (scale in R, bias in G), indexed by (n_dot_v, roughness) with roughness up
-  // the V axis; sampled slightly inside [0, 1] to avoid edge-tap artifacts.
-  vec2 f_ab = texture(
-                  brdf_lut,
-                  DfgLutUv(clamp(vec2(n_dot_v_energy, roughness), 0.0, 0.99)))
-                  .rg;
-
-  // Single- and multiple-scattering energy compensation (Fdez-Aguera 2019;
-  // see https://bruop.github.io/ibl/). Without the multiscatter term, rough
-  // metals lose noticeable energy.
-  vec3 FssEss = k_S * f_ab.x + f_ab.y;
-  float Ems = 1.0 - (f_ab.x + f_ab.y);
-  vec3 F_avg = reflectance + (1.0 - reflectance) / 21.0;
-  vec3 FmsEms = Ems * FssEss * F_avg / (1.0 - F_avg * Ems);
-  vec3 diffuse_color = albedo * (1.0 - metallic);
-#ifdef FLUTTER_SCENE_PHYSICAL_MATERIAL
-  float specular_transmission =
-      clamp(material.transmission, 0.0, 1.0) * (1.0 - metallic);
-  float total_transmission = clamp(
-      material.diffuse_transmission + specular_transmission, 0.0, 1.0);
-  diffuse_color *= 1.0 - total_transmission;
-#endif
-  vec3 k_D = diffuse_color * (1.0 - FssEss + FmsEms);
-
-  vec3 indirect_specular = FssEss * prefiltered_color * material.specular;
-  vec3 indirect_diffuse = (FmsEms + k_D) * irradiance;
-  // Occluding indirect specular with the diffuse factor over-darkens glossy
-  // reflections, so derive a dedicated specular occlusion when it is
-  // enabled; otherwise the specular lobe uses the same occlusion (the
-  // historical behavior).
-  float specular_occlusion;
-  if (frag_info.ssao_params.y > 1.5 && ao_bent_valid > 0.5) {
-    specular_occlusion = ComputeBentConeOcclusion(
-        ao_bent_normal, reflect(-camera_normal, normal), occlusion, roughness);
-  } else if (frag_info.ssao_params.y > 0.5) {
-    specular_occlusion = ComputeSpecularOcclusion(n_dot_v, occlusion,
-                                                  roughness);
-  } else {
-    specular_occlusion = occlusion;
-  }
-  // Sun direction and how squarely this surface faces it. `facing` ramps from
-  // 0 (at or past the terminator) to 1 (sun-facing) over a small band, so the
-  // sun's influence falls off smoothly rather than at a hard line.
-  float geometric_n_dot_l = 0.0;
-  vec3 light_vector = vec3(0.0);
-  if (frag_info.has_directional_light > 0.5) {
-    light_vector = -normalize(frag_info.directional_light_direction.xyz);
-    geometric_n_dot_l = dot(GetWorldNormal(), light_vector);
-  }
-  // Whether the surface faces the sun is a geometric property, so gate the
-  // shadow terms on the geometric normal. Using the perturbed normal lets a
-  // normal map's relief push n_dot_l across the terminator on a nearly sun-
-  // facing face (worst near a low sun), spuriously darkening the shadow-ambient
-  // term on bumpy top faces.
-  float facing = clamp(geometric_n_dot_l / 0.15, 0.0, 1.0);
-
-  // Sun-shadow visibility (1 lit .. 0 shadowed). The shadow map is only
-  // meaningful for sun-facing surfaces; a back face receives no sun by
-  // definition, so it is treated as fully shadowed (facing = 0) without a
-  // shadow-map lookup, whose normal-offset bias assumes a sun-facing receiver
-  // and would otherwise stripe the back face with acne.
-  float shadow = 1.0;
-#ifndef FLUTTER_SCENE_SKIP_SHADOWS
-  shadow =
-      (frag_info.has_directional_light > 0.5 && frag_info.casts_shadow > 0.5 &&
-       facing > 0.0)
-          ? SampleShadow(v_position, GetWorldNormal())
-          : 1.0;
-#endif
-#ifndef FLUTTER_SCENE_SKIP_SSAO
-  // Screen-space contact shadow for the sun, marched by the occlusion pass.
-  // Applies whether or not a shadow map is active, grounding small contacts
-  // that shadow-map resolution and bias miss.
-  if (frag_info.ssao_lighting.w > 0.5 && frag_info.camera_up.w < 0.5) {
-    shadow = min(shadow, ssao_sample.g);
-  }
-#endif
-  // The cloud deck's shadow, direct light only: an overcast day keeps its
-  // sky light.
-  shadow *= WeatherCloudShadow(v_position);
-  float sun_visibility = facing * shadow;
-
-  // When shadow_ambient_strength (radiance_blend.y) is non-zero, the sun's
-  // occlusion also darkens the IBL ambient: a sky-baked environment already
-  // contains the sun's energy, so the ambient alone otherwise reads as fully
-  // lit inside shadows.
-  float ambient_shadow = mix(1.0, sun_visibility, frag_info.radiance_blend.y);
-
-  vec3 ambient =
-      (indirect_diffuse * diffuse_occlusion +
-       indirect_specular * specular_occlusion) *
-      ambient_shadow;
-#ifndef FLUTTER_SCENE_SKIP_SSAO
-  // Screen-space bounce: the occlusion pass's gathered radiance lights the
-  // diffuse lobe. Its own bitfield already resolved visibility, so only the
-  // baked occlusion map applies.
-  if (frag_info.camera_up.w > 0.5) {
-    ambient += ssao_sample.rgb * diffuse_color * material.occlusion;
-  }
-#endif
-#ifdef FLUTTER_SCENE_PHYSICAL_MATERIAL
-  ambient += material.diffuse_transmission_color * (1.0 - metallic) *
-             material.diffuse_transmission *
-             transmitted_irradiance * occlusion * ambient_shadow;
-  if (material.clearcoat > 0.0) {
-    vec3 coat_reflection = reflect(-camera_normal, coat_normal);
-    vec3 coat_prefiltered = SampleRadianceEnv(prefiltered_radiance,
-        environment_transform * coat_reflection, coat_roughness);
-    if (env_blend > 0.0) {
-      vec3 coat_prefiltered_b = SampleRadianceEnv(prefiltered_radiance_b,
-          environment_transform * coat_reflection, coat_roughness);
-      coat_prefiltered = mix(coat_prefiltered, coat_prefiltered_b, env_blend);
-    }
-    vec2 coat_ab = texture(
-        brdf_lut,
-        DfgLutUv(vec2(coat_n_dot_v, min(coat_roughness, 0.99)))).rg;
-    coat_ibl = coat_prefiltered *
-               (vec3(0.04) * coat_ab.x + coat_ab.y) *
-               frag_info.environment_intensity;
-  }
-  // TODO(sheen-ibl): replace this diffuse-scaled ambient term with a
-  // preintegrated Charlie environment lobe and directional-albedo compensation.
-  ambient += material.sheen_color * irradiance *
-             (0.25 + 0.75 * (1.0 - n_dot_v_energy)) *
-             (1.0 - 0.5 * material.sheen_roughness) * occlusion *
-             ambient_shadow;
-#endif
-
-  // Analytic directional light (Cook-Torrance, layered on top of the IBL
-  // ambient term). The shadowed first directional light shades here; its shadow
-  // visibility multiplies the whole term.
-  vec3 direct = vec3(0.0);
-  if (frag_info.has_directional_light > 0.5) {
-    direct = EvaluateAnalyticLight(material, light_vector,
-                                   frag_info.directional_light_color.rgb, normal,
-                                   camera_normal, albedo, metallic, roughness,
-                                   reflectance, n_dot_v, material.specular,
-                                   anisotropic_tangent,
-                                   anisotropic_bitangent) *
-             sun_visibility;
-#ifdef FLUTTER_SCENE_PHYSICAL_MATERIAL
-    coat_direct += EvaluateClearcoatLight(
-        light_vector, frag_info.directional_light_color.rgb, coat_normal,
-        camera_normal, coat_roughness) * sun_visibility;
-#endif
-  }
-
   // Additional analytic lights (point, spot, and directional lights past the
   // first). The scene may hold any number of lights; per-object culling (or
   // the froxel lookup below) gives this fragment a contiguous slice of the
@@ -698,6 +639,10 @@ vec4 EvaluateLighting(MaterialInputs material) {
   // its froxel instead of the per-draw uniforms (PunctualLightSlice in
   // material_shadow_sampling.glsl), so no draw carries light state and the
   // loop budget applies per froxel, not per object.
+  //
+  // The loop runs before the image-based and sun terms so none of their
+  // values stay live across it. Otherwise small register files spill them on
+  // every fragment, including ones no punctual light reaches.
   vec2 punctual_slice = PunctualLightSlice();
   int punctual_offset = int(punctual_slice.x + 0.5);
   int punctual_count = int(punctual_slice.y + 0.5);
@@ -708,26 +653,37 @@ vec4 EvaluateLighting(MaterialInputs material) {
   for (int i = 0; i < punctual_count; i++) {
     // Resolve this slot to a light row through the per-object index buffer.
     int light_row = int(FetchPunctualIndex(punctual_offset + i) + 0.5);
-    vec4 l0 = FetchPunctualTexel(light_row, 0); // position.xyz, type
-    vec4 l1 = FetchPunctualTexel(light_row, 1); // color.rgb, inverse range
+    highp vec4 l0 = FetchPunctualTexel(light_row, 0); // position.xyz, type
+    highp vec4 l1 = FetchPunctualTexel(light_row, 1); // color.rgb, inverse range
     float type = l0.w;
-    vec3 radiance = l1.rgb;
+    highp vec3 radiance = l1.rgb;
+    // A sized point or spot light (radius in texel 3.w) widens the specular
+    // lobe by its apparent half-angle, so a glossy surface reflects a bulb
+    // rather than a point of unbounded radiance.
+    float light_roughness = roughness;
+#ifndef FLUTTER_SCENE_LEAN_LIGHTING
     if (type > 2.5) {
+#ifdef FLUTTER_SCENE_CUSTOM_AMBIENT
+      // TODO(custom-ambient-area-lights): the LTC tables ride brdf_lut, which
+      // a custom-ambient material does not declare, so rect area lights are
+      // skipped. Give the LTC tables their own binding to light these too.
+      continue;
+#else
       // Rect area light. Texel 2 carries the world right axis and width,
       // texel 3 the up axis and height; the light emits along
       // cross(right, up). The LTC form factor bakes in the cosine lobe and
       // inverse-square falloff, so only the range window applies here.
-      vec4 a2 = FetchPunctualTexel(light_row, 2);
-      vec4 a3 = FetchPunctualTexel(light_row, 3);
-      vec3 half_w = a2.xyz * (a2.w * 0.5);
-      vec3 half_h = a3.xyz * (a3.w * 0.5);
-      vec3 c0 = l0.xyz - half_w - half_h;
-      vec3 c1 = l0.xyz + half_w - half_h;
-      vec3 c2 = l0.xyz + half_w + half_h;
-      vec3 c3 = l0.xyz - half_w + half_h;
-      vec3 to_center = l0.xyz - v_position;
-      float dist_sq = dot(to_center, to_center);
-      float factor = dist_sq * l1.w * l1.w;
+      highp vec4 a2 = FetchPunctualTexel(light_row, 2);
+      highp vec4 a3 = FetchPunctualTexel(light_row, 3);
+      highp vec3 half_w = a2.xyz * (a2.w * 0.5);
+      highp vec3 half_h = a3.xyz * (a3.w * 0.5);
+      highp vec3 c0 = l0.xyz - half_w - half_h;
+      highp vec3 c1 = l0.xyz + half_w - half_h;
+      highp vec3 c2 = l0.xyz + half_w + half_h;
+      highp vec3 c3 = l0.xyz - half_w + half_h;
+      highp vec3 to_center = l0.xyz - v_position;
+      highp float dist_sq = dot(to_center, to_center);
+      highp float factor = dist_sq * l1.w * l1.w;
       float window = clamp(1.0 - factor * factor, 0.0, 1.0);
       float facing =
           step(0.0, dot(cross(c1 - c0, c3 - c0), v_position - c0));
@@ -763,57 +719,146 @@ vec4 EvaluateLighting(MaterialInputs material) {
                        (0.04 * ct2.x + 0.96 * ct2.y);
       }
 #endif
-    } else {
+#endif
+    } else
+#endif  // FLUTTER_SCENE_LEAN_LIGHTING
+    {
     vec3 punctual_light_vector;
+#ifdef FLUTTER_SCENE_LIGHTING_HOOKS
+    light_context.color = radiance;
+    light_context.position = l0.xyz;
+    light_context.type = type;
+    light_context.light_row = float(light_row);
+    light_context.shadow_slot = -1.0;
+    light_context.distance_attenuation = 1.0;
+    light_context.cone_attenuation = 1.0;
+    light_context.shadow = 1.0;
+    light_context.direction = vec3(0.0);
+#endif
     if (type < 0.5) {
       // Directional: the travel direction is in texel 2; no attenuation.
       punctual_light_vector = -normalize(FetchPunctualTexel(light_row, 2).xyz);
+#ifdef FLUTTER_SCENE_LIGHTING_HOOKS
+      light_context.direction = -punctual_light_vector;
+#endif
     } else {
-      vec3 to_light = l0.xyz - v_position;
-      float dist_sq = dot(to_light, to_light);
+      highp vec3 to_light = l0.xyz - v_position;
+      highp float dist_sq = dot(to_light, to_light);
       punctual_light_vector = to_light * inversesqrt(max(dist_sq, 1e-8));
       // Windowed distance falloff: with an inverse range of 0 (infinite
       // range) the window is 1. The falloff exponent (texel 3.z) is 2 for
       // the physical inverse square; lower exponents reach further without
       // brightening the near field (an artistic control), and pow(dist_sq,
       // e/2) = dist^e.
-      float inv_range = l1.w;
-      float factor = dist_sq * inv_range * inv_range;
+      highp float inv_range = l1.w;
+      highp float factor = dist_sq * inv_range * inv_range;
       float window = clamp(1.0 - factor * factor, 0.0, 1.0);
+#ifndef FLUTTER_SCENE_LIGHTING_HOOKS
+      // The slice is culled per object or froxel, so it can hold lights that
+      // stop short of this fragment. They add nothing, so skip their fetches
+      // and shading. Hooks still see every light in the slice.
+      if (window <= 0.0) {
+        continue;
+      }
+#endif
       // spot offset, shadow slot, falloff exponent
-      vec4 l3 = FetchPunctualTexel(light_row, 3);
-      radiance *=
-          (window * window) / max(pow(dist_sq, l3.z * 0.5), 1e-4);
+      highp vec4 l3 = FetchPunctualTexel(light_row, 3);
+#ifdef FLUTTER_SCENE_LIGHTING_HOOKS
+      light_context.shadow_slot = l3.y;
+#endif
+      // The source radius floors the distance, so a surface inside the
+      // bulb is not lit beyond its surface.
+      highp float source_radius = l3.w;
+      highp float distance_attenuation =
+          (window * window) /
+          max(pow(max(dist_sq, source_radius * source_radius), l3.z * 0.5),
+              1e-4);
+      if (source_radius > 0.0) {
+        float widened = roughness * roughness +
+                        source_radius * 0.5 * inversesqrt(max(dist_sq, 1e-8));
+        light_roughness = sqrt(min(widened, 1.0));
+      }
+      radiance *= distance_attenuation;
+#ifdef FLUTTER_SCENE_LIGHTING_HOOKS
+      light_context.distance_attenuation = distance_attenuation;
+#endif
+      // A photometric profile (texel 8.x: its first row, -1 = none):
+      // relative intensity by the angle from the light's axis (a spot's
+      // direction, a point's photometric axis in texel 8.yzw), 64 samples
+      // from 0 to pi. It is the beam: a spot with one skips its cone.
+      highp vec4 l8 = FetchPunctualTexel(light_row, 8);
+      bool profiled = l8.x > -0.5;
+      if (profiled) {
+        highp vec3 axis =
+            type > 1.5 ? FetchPunctualTexel(light_row, 2).xyz : l8.yzw;
+        radiance *= PhotometricProfile(
+            int(l8.x + 0.5), dot(normalize(axis), -punctual_light_vector));
+      }
       if (type > 1.5) {
         // Spot cone: a squared linear ramp on the cosine between the inner and
         // outer cone, using the precomputed scale (texel 2 w) and offset.
-        vec4 l2 = FetchPunctualTexel(light_row, 2); // direction.xyz, angular scale
+        highp vec4 l2 = FetchPunctualTexel(light_row, 2); // direction.xyz, angular scale
         float cd = dot(normalize(l2.xyz), -punctual_light_vector);
-        float cone = clamp(cd * l2.w + l3.x, 0.0, 1.0);
+        float cone = profiled ? 1.0 : clamp(cd * l2.w + l3.x, 0.0, 1.0);
         radiance *= cone * cone;
+#ifdef FLUTTER_SCENE_LIGHTING_HOOKS
+        light_context.cone_attenuation = cone * cone;
+        light_context.direction = normalize(l2.xyz);
+#else
+        if (cone <= 0.0) {
+          continue;
+        }
+#endif
         // Spot shadow, when this spot has a slot in the shared atlas. Gate on
         // the geometric normal (the shadow is a geometric property).
 #ifndef FLUTTER_SCENE_SKIP_SHADOWS
-        if (l3.y > -0.5 && frag_info.spot_shadow_params.x > 0.5) {
-          radiance *= SampleSpotShadow(
+        if (cone > 0.0 && l3.y > -0.5 &&
+            frag_info.spot_shadow_params.x > 0.5) {
+          float spot_shadow = SampleSpotShadow(
               light_row, int(l3.y + 0.5), v_position, GetWorldNormal());
+          radiance *= spot_shadow;
+#ifdef FLUTTER_SCENE_LIGHTING_HOOKS
+          light_context.shadow = spot_shadow;
+#endif
         }
 #endif
       }
-#ifndef FLUTTER_SCENE_SKIP_SHADOWS
+#if !defined(FLUTTER_SCENE_SKIP_SHADOWS) && !defined(FLUTTER_SCENE_LEAN_LIGHTING)
       else if (type > 0.5 && l3.y > -0.5 &&
                frag_info.spot_shadow_params.x > 0.5) {
         // Point shadow, when this light's cube faces ride the shared atlas
         // (l3.y is its first tile after the cascades).
-        radiance *= SamplePointShadow(
+        float point_shadow = SamplePointShadow(
             light_row, l3.y, v_position, GetWorldNormal());
+        radiance *= point_shadow;
+#ifdef FLUTTER_SCENE_LIGHTING_HOOKS
+        light_context.shadow = point_shadow;
+#endif
       }
 #endif
     }
+#ifdef FLUTTER_SCENE_LIGHTING_HOOKS
+    light_context.light_vector = punctual_light_vector;
+    light_context.radiance = radiance;
+#ifdef FLUTTER_SCENE_HOOK_LIGHT
+    LightTerms punctual_terms = Light(material, light_context);
+    direct_diffuse += punctual_terms.diffuse;
+    direct_specular += punctual_terms.specular;
+#else
+    highp vec3 punctual_specular;
+    direct_diffuse += EvaluateAnalyticLightTerms(
+        material, punctual_light_vector, radiance, normal, camera_normal,
+        albedo, metallic, light_roughness, reflectance, n_dot_v,
+        material.specular, anisotropic_tangent, anisotropic_bitangent,
+        punctual_specular);
+    direct_specular += punctual_specular;
+#endif
+#else
     direct += EvaluateAnalyticLight(
         material, punctual_light_vector, radiance, normal, camera_normal,
-        albedo, metallic, roughness, reflectance, n_dot_v, material.specular,
-        anisotropic_tangent, anisotropic_bitangent);
+        albedo, metallic, light_roughness, reflectance, n_dot_v,
+        material.specular, anisotropic_tangent, anisotropic_bitangent);
+#endif
 #ifdef FLUTTER_SCENE_PHYSICAL_MATERIAL
     coat_direct += EvaluateClearcoatLight(
         punctual_light_vector, radiance, coat_normal, camera_normal,
@@ -822,7 +867,327 @@ vec4 EvaluateLighting(MaterialInputs material) {
     }
   }
 
-  vec3 emissive = material.emissive;
+
+  // Roughness-dependent Fresnel reflectance for the indirect specular lobe.
+  vec3 k_S = FresnelSchlickRoughness(n_dot_v_energy, reflectance, roughness);
+
+  // The IBL environment can be rotated; transform the lookup directions.
+  // Irradiance samples along the bent normal when the occlusion chain
+  // carries one: the SH lookup then ignores directions the screen-space
+  // march found blocked. Geometric, so normal-map detail is dropped there,
+  // which the smooth SH barely resolves anyway.
+  mat3 environment_transform = mat3(frag_info.environment_transform);
+  vec3 env_normal = environment_transform *
+                    (ao_bent_valid > 0.5 ? ao_bent_normal : normal);
+#ifdef FLUTTER_SCENE_LEAN_LIGHTING
+  vec3 env_reflection = environment_transform * reflection_normal;
+#else
+  vec3 env_reflection =
+      environment_transform *
+      ParallaxCorrectReflection(v_position, reflection_normal);
+#endif
+#ifdef FLUTTER_SCENE_CUSTOM_AMBIENT
+  // The material supplies all of its indirect light (Composite()), so the
+  // engine environment is neither declared nor sampled.
+  highp vec3 irradiance = vec3(0.0);
+  highp vec3 prefiltered_color = vec3(0.0);
+  float env_blend = 0.0;
+#ifdef FLUTTER_SCENE_PHYSICAL_MATERIAL
+  highp vec3 transmitted_irradiance = vec3(0.0);
+#endif
+#else
+#ifdef FLUTTER_SCENE_LIGHTMAP
+  // The bake already carries this surface's indirect diffuse, so it replaces
+  // the SH ambient rather than adding to it. A bake has no direction, so the
+  // back side reads the same value.
+  highp vec3 irradiance = BakedDiffuseRadiance();
+#ifdef FLUTTER_SCENE_PHYSICAL_MATERIAL
+  highp vec3 transmitted_irradiance = irradiance;
+#endif
+#else
+  highp vec3 irradiance = max(EvaluateDiffuseSH(irradiance_field, env_normal, 0),
+                        vec3(0.0));
+#ifdef FLUTTER_SCENE_PHYSICAL_MATERIAL
+  highp vec3 transmitted_irradiance = max(
+      EvaluateDiffuseSH(irradiance_field, -env_normal, 0), vec3(0.0));
+#endif
+#endif
+  highp vec3 prefiltered_color =
+      SampleRadianceEnv(prefiltered_radiance,
+                        env_reflection, roughness);
+  // Cross-fade a secondary environment in (area transitions) when active. Both
+  // share the bound layout, so the same samplers' _b pair is read.
+#ifdef FLUTTER_SCENE_LEAN_LIGHTING
+  const float env_blend = 0.0;
+  // Keeps prefiltered_radiance_b bound to its own slot; never taken.
+  if (frag_info.radiance_blend.x > 1e30) {
+    prefiltered_color += SampleRadianceEnv(prefiltered_radiance_b,
+                                           env_reflection, roughness);
+  }
+#else
+  float env_blend = frag_info.radiance_blend.x;
+  if (env_blend > 0.0) {
+#ifndef FLUTTER_SCENE_LIGHTMAP
+    highp vec3 irradiance_b = max(EvaluateDiffuseSH(irradiance_field, env_normal, 1),
+                            vec3(0.0));
+#endif
+    // env_reflection is box-corrected for the primary probe; the secondary
+    // reuses it, so a probe->environment crossfade samples the secondary with
+    // the probe's parallax vector. Transient and weight-blended, so
+    // effectively invisible. TODO(probe-crossfade-parallax): box-correct the
+    // secondary against its own volume.
+    highp vec3 prefiltered_b =
+        SampleRadianceEnv(prefiltered_radiance_b,
+                          env_reflection, roughness);
+    // A baked diffuse ambient belongs to the surface, not to either
+    // environment, so only the specular lobe cross-fades here.
+#ifndef FLUTTER_SCENE_LIGHTMAP
+    irradiance = mix(irradiance, irradiance_b, env_blend);
+#ifdef FLUTTER_SCENE_PHYSICAL_MATERIAL
+    highp vec3 transmitted_irradiance_b = max(
+        EvaluateDiffuseSH(irradiance_field, -env_normal, 1), vec3(0.0));
+    transmitted_irradiance = mix(
+        transmitted_irradiance, transmitted_irradiance_b, env_blend);
+#endif
+#endif
+    prefiltered_color = mix(prefiltered_color, prefiltered_b, env_blend);
+  }
+#endif  // FLUTTER_SCENE_LEAN_LIGHTING
+  // environment_intensity scales the image-based lighting; a bake carries its
+  // own lightmap_intensity instead.
+#ifndef FLUTTER_SCENE_LIGHTMAP
+  irradiance *= frag_info.environment_intensity;
+#ifdef FLUTTER_SCENE_PHYSICAL_MATERIAL
+  transmitted_irradiance *= frag_info.environment_intensity;
+#endif
+#endif
+  prefiltered_color *= frag_info.environment_intensity;
+
+#ifndef FLUTTER_SCENE_LIGHTMAP
+  // The world-space irradiance field replaces the environment's diffuse term
+  // inside its volume, so bounce light persists for surfaces off screen and
+  // colored bleed reads correctly, and fades back to it across the outermost
+  // cell. The field's own empty content is the environment, so an unfilled
+  // field is exactly the image above and the transition is continuous.
+  //
+  // The lookup direction is the camera-invariant shading normal, never the
+  // screen-derived bent normal: the visibility select is a hard boundary, so
+  // a camera-dependent normal makes it flicker like z-fighting. The field's
+  // stored radiance already carries the environment intensity, so it is not
+  // scaled again here.
+#ifndef FLUTTER_SCENE_LEAN_LIGHTING
+  float gi_coverage = IrradianceFieldCoverage(v_position);
+  if (gi_coverage > 0.0) {
+    highp vec3 gi = SampleIrradianceField(v_position, normal, camera_normal);
+    irradiance = mix(irradiance, gi, gi_coverage);
+#ifdef FLUTTER_SCENE_PHYSICAL_MATERIAL
+    // TODO(gi-transmission): the transmitted direction repeats the whole
+    // eight-tap cage. The weights only depend on the normal through the wrap
+    // term, so one pass could return both lobes.
+    highp vec3 gi_back = SampleIrradianceField(v_position, -normal, camera_normal);
+    transmitted_irradiance = mix(transmitted_irradiance, gi_back, gi_coverage);
+#endif
+  }
+#endif  // FLUTTER_SCENE_LEAN_LIGHTING
+#endif
+#endif  // FLUTTER_SCENE_CUSTOM_AMBIENT
+
+#ifdef FLUTTER_SCENE_HOOK_AMBIENT
+  AmbientContext ambient_context;
+  ambient_context.irradiance = irradiance;
+  ambient_context.radiance = prefiltered_color;
+  ambient_context.diffuse_occlusion = diffuse_occlusion;
+  ambient_context.specular_occlusion = -1.0;
+  ambient_context.normal = normal;
+  ambient_context.reflection = env_reflection;
+  ambient_context.n_dot_v = n_dot_v_energy;
+  ambient_context.roughness = roughness;
+  Ambient(material, ambient_context);
+  irradiance = ambient_context.irradiance;
+  prefiltered_color = ambient_context.radiance;
+  diffuse_occlusion = ambient_context.diffuse_occlusion;
+#endif
+
+  // Split-sum DFG terms (Karis '13) from the RGBA16F environment-BRDF LUT
+  // (scale in R, bias in G), indexed by (n_dot_v, roughness) with roughness up
+  // the V axis; sampled slightly inside [0, 1] to avoid edge-tap artifacts.
+#ifdef FLUTTER_SCENE_CUSTOM_AMBIENT
+  vec2 f_ab = vec2(0.0);
+#else
+  vec2 f_ab = texture(
+                  brdf_lut,
+                  DfgLutUv(clamp(vec2(n_dot_v_energy, roughness), 0.0, 0.99)))
+                  .rg;
+#endif
+
+  // Single- and multiple-scattering energy compensation (Fdez-Aguera 2019;
+  // see https://bruop.github.io/ibl/). Without the multiscatter term, rough
+  // metals lose noticeable energy.
+  vec3 FssEss = k_S * f_ab.x + f_ab.y;
+  float Ems = 1.0 - (f_ab.x + f_ab.y);
+  vec3 F_avg = reflectance + (1.0 - reflectance) / 21.0;
+  vec3 FmsEms = Ems * FssEss * F_avg / (1.0 - F_avg * Ems);
+  vec3 diffuse_color = albedo * (1.0 - metallic);
+#ifdef FLUTTER_SCENE_PHYSICAL_MATERIAL
+  float specular_transmission =
+      clamp(material.transmission, 0.0, 1.0) * (1.0 - metallic);
+  float total_transmission = clamp(
+      material.diffuse_transmission + specular_transmission, 0.0, 1.0);
+  diffuse_color *= 1.0 - total_transmission;
+#endif
+  vec3 k_D = diffuse_color * (1.0 - FssEss - FmsEms);
+
+  highp vec3 indirect_specular = FssEss * prefiltered_color * material.specular;
+  highp vec3 indirect_diffuse = (FmsEms + k_D) * irradiance;
+  // Occluding indirect specular with the diffuse factor over-darkens glossy
+  // reflections, so derive a dedicated specular occlusion when it is
+  // enabled; otherwise the specular lobe uses the same occlusion (the
+  // historical behavior).
+  float specular_occlusion;
+#ifndef FLUTTER_SCENE_LEAN_LIGHTING
+  if (frag_info.ssao_params.y > 1.5 && ao_bent_valid > 0.5) {
+    specular_occlusion = ComputeBentConeOcclusion(
+        ao_bent_normal, reflect(-camera_normal, normal), occlusion, roughness);
+  } else
+#endif
+  if (frag_info.ssao_params.y > 0.5) {
+    specular_occlusion = ComputeSpecularOcclusion(n_dot_v, occlusion,
+                                                  roughness);
+  } else {
+    specular_occlusion = occlusion;
+  }
+#ifdef FLUTTER_SCENE_HOOK_AMBIENT
+  // A non-negative value from Ambient() replaces the engine's choice.
+  if (ambient_context.specular_occlusion >= 0.0) {
+    specular_occlusion = ambient_context.specular_occlusion;
+  }
+#endif
+  // Sun direction and how squarely this surface faces it. `facing` ramps from
+  // 0 (at or past the terminator) to 1 (sun-facing) over a small band, so the
+  // sun's influence falls off smoothly rather than at a hard line.
+
+  // When shadow_ambient_strength (radiance_blend.y) is non-zero, the sun's
+  // occlusion also darkens the IBL ambient: a sky-baked environment already
+  // contains the sun's energy, so the ambient alone otherwise reads as fully
+  // lit inside shadows.
+  float ambient_shadow = mix(1.0, sun_visibility, frag_info.radiance_blend.y);
+
+  highp vec3 ambient =
+      (indirect_diffuse * diffuse_occlusion +
+       indirect_specular * specular_occlusion) *
+      ambient_shadow;
+#if !defined(FLUTTER_SCENE_SKIP_SSAO) && !defined(FLUTTER_SCENE_LEAN_LIGHTING)
+  // Screen-space bounce: the occlusion pass's gathered radiance lights the
+  // diffuse lobe. Its own bitfield already resolved visibility, so only the
+  // baked occlusion map applies.
+  if (frag_info.camera_up.w > 0.5) {
+    ambient += ssao_sample.rgb * diffuse_color * material.occlusion;
+  }
+#endif
+#ifdef FLUTTER_SCENE_PHYSICAL_MATERIAL
+  ambient += material.diffuse_transmission_color * (1.0 - metallic) *
+             material.diffuse_transmission *
+             transmitted_irradiance * occlusion * ambient_shadow;
+#ifndef FLUTTER_SCENE_CUSTOM_AMBIENT
+  if (material.clearcoat > 0.0) {
+    vec3 coat_reflection = reflect(-camera_normal, coat_normal);
+    highp vec3 coat_prefiltered = SampleRadianceEnv(prefiltered_radiance,
+        environment_transform * coat_reflection, coat_roughness);
+    if (env_blend > 0.0) {
+      highp vec3 coat_prefiltered_b = SampleRadianceEnv(prefiltered_radiance_b,
+          environment_transform * coat_reflection, coat_roughness);
+      coat_prefiltered = mix(coat_prefiltered, coat_prefiltered_b, env_blend);
+    }
+    vec2 coat_ab = texture(
+        brdf_lut,
+        DfgLutUv(vec2(coat_n_dot_v, min(coat_roughness, 0.99)))).rg;
+    coat_ibl = coat_prefiltered *
+               (vec3(0.04) * coat_ab.x + coat_ab.y) *
+               frag_info.environment_intensity;
+  }
+#endif
+  // TODO(sheen-ibl): replace this diffuse-scaled ambient term with a
+  // preintegrated Charlie environment lobe and directional-albedo compensation.
+  ambient += material.sheen_color * irradiance *
+             (0.25 + 0.75 * (1.0 - n_dot_v_energy)) *
+             (1.0 - 0.5 * material.sheen_roughness) * occlusion *
+             ambient_shadow;
+#endif
+
+  // Analytic directional light (Cook-Torrance, layered on top of the IBL
+  // ambient term). The shadowed first directional light shades here; its shadow
+  // visibility multiplies the whole term.
+#ifndef FLUTTER_SCENE_NO_DIRECTIONAL_LIGHT
+  if (frag_info.has_directional_light > 0.5) {
+#ifdef FLUTTER_SCENE_LIGHTING_HOOKS
+    light_context.light_vector = light_vector;
+    light_context.color = frag_info.directional_light_color.rgb;
+    light_context.radiance = light_context.color * sun_visibility;
+    light_context.direction = -light_vector;
+    light_context.distance_attenuation = 1.0;
+    light_context.cone_attenuation = facing;
+    light_context.shadow = shadow;
+    light_context.type = 0.0;
+    light_context.light_row = -1.0;
+    light_context.shadow_slot = -1.0;
+#ifdef FLUTTER_SCENE_HOOK_LIGHT
+    LightTerms sun_terms = Light(material, light_context);
+    direct_diffuse += sun_terms.diffuse;
+    direct_specular += sun_terms.specular;
+#else
+    // No Light() hook: the default BRDF, still split into its lobes.
+    highp vec3 sun_specular;
+    direct_diffuse += EvaluateAnalyticLightTerms(material, light_vector,
+        light_context.radiance, normal, camera_normal, albedo, metallic,
+        roughness, reflectance, n_dot_v, material.specular,
+        anisotropic_tangent, anisotropic_bitangent, sun_specular);
+    direct_specular += sun_specular;
+#endif
+#else
+    direct += EvaluateAnalyticLight(material, light_vector,
+                                   frag_info.directional_light_color.rgb, normal,
+                                   camera_normal, albedo, metallic, roughness,
+                                   reflectance, n_dot_v, material.specular,
+                                   anisotropic_tangent,
+                                   anisotropic_bitangent) *
+             sun_visibility;
+#endif
+#ifdef FLUTTER_SCENE_PHYSICAL_MATERIAL
+    coat_direct += EvaluateClearcoatLight(
+        light_vector, frag_info.directional_light_color.rgb, coat_normal,
+        camera_normal, coat_roughness) * sun_visibility;
+#endif
+  }
+#endif
+
+
+  highp vec3 emissive = material.emissive;
+
+#ifdef FLUTTER_SCENE_LIGHTING_HOOKS
+  // Area lights still accumulate into `direct`; they count as diffuse here.
+  direct_diffuse += direct;
+  float hooked_direct_occlusion = mix(
+      1.0, occlusion, clamp(frag_info.ssao_lighting.x, 0.0, 1.0));
+  LightingResult lighting_result;
+  lighting_result.direct_diffuse = direct_diffuse * hooked_direct_occlusion;
+  lighting_result.direct_specular = direct_specular * hooked_direct_occlusion;
+  lighting_result.indirect_diffuse =
+      indirect_diffuse * diffuse_occlusion * ambient_shadow;
+  lighting_result.indirect_specular =
+      indirect_specular * specular_occlusion * ambient_shadow;
+  lighting_result.emissive = emissive;
+  lighting_result.alpha = alpha;
+#ifdef FLUTTER_SCENE_HOOK_COMPOSITE
+  highp vec4 composite = Composite(material, lighting_result);
+#else
+  highp vec4 composite =
+      vec4(lighting_result.direct_diffuse + lighting_result.direct_specular +
+               lighting_result.indirect_diffuse +
+               lighting_result.indirect_specular + emissive,
+           1.0) *
+      alpha;
+#endif
+#endif
 
   // Linear HDR, premultiplied by alpha. Exposure, the tone-mapping
   // operator, and display encoding are applied later by the tone-mapping
@@ -830,9 +1195,9 @@ vec4 EvaluateLighting(MaterialInputs material) {
   // floating-point scene-color target.
   float direct_occlusion = mix(
       1.0, occlusion, clamp(frag_info.ssao_lighting.x, 0.0, 1.0));
-  vec3 out_color = ambient + direct * direct_occlusion + emissive;
+  highp vec3 out_color = ambient + direct * direct_occlusion + emissive;
 #ifdef FLUTTER_SCENE_PHYSICAL_MATERIAL
-  vec3 transmitted_light = material.transmission_color * albedo *
+  highp vec3 transmitted_light = material.transmission_color * albedo *
                            (vec3(1.0) - clamp(FssEss, 0.0, 1.0));
   out_color += transmitted_light * specular_transmission;
   float coat_fresnel = FresnelSchlick(
@@ -847,13 +1212,17 @@ vec4 EvaluateLighting(MaterialInputs material) {
   // scaled by environment_intensity) so far geometry dissolves into the sky
   // behind it, matching the unfogged skybox at the horizon. Only sampled when
   // fog and its sky-color influence are on, so it is free otherwise.
-  vec3 sky_fog_color = fog.color.rgb;
+  // The target is half float; anything larger is stored as Inf, which the
+  // reflection, depth of field and bloom passes turn into NaN or max blobs.
+  out_color = min(out_color, vec3(kMediumpFloatMax));
+  highp vec3 sky_fog_color = fog.color.rgb;
+#if !defined(FLUTTER_SCENE_CUSTOM_AMBIENT)
   if (fog.params0.y > 0.5 && fog.params0.w > 0.0) {
     // Sample the sharpest prefiltered level: the fog color should match the
     // crisp skybox as closely as the environment resolution allows, so avoid
     // extra roughness blur on top of the bake.
     const float kSkyFogRoughness = 0.0;
-    vec3 sky_dir = environment_transform * normalize(-v_viewvector);
+    vec3 sky_dir = environment_transform * -GetViewDirection();
     sky_fog_color = SampleRadianceEnv(prefiltered_radiance, sky_dir,
         kSkyFogRoughness);
     if (env_blend > 0.0) {
@@ -865,5 +1234,15 @@ vec4 EvaluateLighting(MaterialInputs material) {
     }
     sky_fog_color *= frag_info.environment_intensity;
   }
+#endif
+#ifdef FLUTTER_SCENE_LIGHTING_HOOKS
+  // TODO(lighting-hooks): the hooked path drops the physical clearcoat,
+  // transmission, sheen, and screen-space bounce terms. Fold them into
+  // LightingResult if a physical material ever needs hooks.
+  return ApplyFog(composite, sky_fog_color);
+#else
+  // Fog stays in the lean entries: it runs after the lighting, when little is
+  // still live, so it barely adds to the register allocation.
   return ApplyFog(vec4(out_color, 1.0) * alpha, sky_fog_color);
+#endif
 }

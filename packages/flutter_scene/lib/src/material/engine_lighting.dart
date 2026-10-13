@@ -15,6 +15,7 @@ import 'package:flutter_scene/src/material/physically_based_material.dart'
 import 'package:flutter_scene/src/render/custom_render_pass.dart';
 import 'package:flutter_scene/src/render/frame_transients.dart';
 import 'package:flutter_scene/src/render/irradiance_field.dart';
+import 'package:flutter_scene/src/render/uniform_slots.dart';
 
 /// Packs the engine lighting half of the shared `FragInfo` uniform block and
 /// binds the image-based-lighting and shadow samplers.
@@ -27,25 +28,27 @@ import 'package:flutter_scene/src/render/irradiance_field.dart';
 /// [PhysicallyBasedMaterial] and `PreprocessedMaterial` use it so the lighting
 /// packing lives in one place.
 class EngineLightingUniforms {
-  /// The float count of the full `FragInfo` block (816 bytes / 204 floats:
+  /// The float count of the full `FragInfo` block (992 bytes / 248 floats:
   /// the mat4 `environment_transform` ends at float 155, the `ssao_params`
   /// vec4 at floats 156..159, then the `radiance_blend` vec4 at floats
   /// 160..163, `ssao_lighting` at 164..167, `model_scale` at 168..171,
   /// `dielectric_f0` at 172..175, the five irradiance-field vec4s at
-  /// 176..195, `froxel_grid` at 196..199, and `depth_projection` at
-  /// 200..203). See the layout map in the implementation.
-  static const fragInfoFloatCount = 240;
-
-  /// Index of the first weather vec4 (`weather_cloud_u`); nine vec4s run
-  /// to the end of the block. See [SceneWeather] and `weather.glsl`.
-  static const weatherIndex = 204;
+  /// 176..195, `froxel_grid` at 196..199, `view_projection` at 200..203,
+  /// `camera_position` at 204..207, `depth_projection` at 208..211, and the
+  /// nine weather vec4s at 212..247). See the layout map in the
+  /// implementation.
+  static const fragInfoFloatCount = 248;
 
   /// Index of the `depth_projection` vec4 in `FragInfo`: the frame
   /// projection's depth row, for a material that writes its own
   /// `gl_FragDepth` (see `WindowDepthAlongView` in
   /// `material_scene_inputs.glsl`). All four zero means no projection was
   /// published and such a material leaves depth alone.
-  static const depthProjectionIndex = 200;
+  static const depthProjectionIndex = 208;
+
+  /// Index of the first weather vec4 (`weather_cloud_u`); nine vec4s run
+  /// to the end of the block. See [SceneWeather] and `weather.glsl`.
+  static const weatherIndex = 212;
 
   /// Index of the `dielectric_f0` vec4 in `FragInfo`. [packInto] writes the
   /// standard 0.04 dielectric reflectance; a material with a non-default
@@ -219,6 +222,10 @@ class EngineLightingUniforms {
     fragInfo[dielectricF0Index] = defaultDielectricF0;
     fragInfo[dielectricF0Index + 1] = defaultDielectricF0;
     fragInfo[dielectricF0Index + 2] = defaultDielectricF0;
+    // dielectric_f0.w: the view depth where directional shadows end.
+    fragInfo[dielectricF0Index + 3] = cascades.isEmpty
+        ? 0.0
+        : cascades.last.splitDistance;
     // The irradiance field at [176..195]. A zero intensity in gi_grid.w
     // disables the whole receiver, so a scene without the field pays nothing
     // beyond these writes.
@@ -273,15 +280,28 @@ class EngineLightingUniforms {
     fragInfo[197] = froxels?.ny.toDouble() ?? 0.0;
     fragInfo[198] = froxels?.nz.toDouble() ?? 0.0;
     fragInfo[199] = froxels?.zScale ?? 0.0;
-    // depth_projection [200..203]: the projection's depth row, so a material
-    // that writes its own gl_FragDepth maps a view depth the same way the
-    // vertex stage's clip divide did. Left zero when the pass publishes none,
-    // which the shader reads as "leave depth alone".
+    // view_projection [200..203]: the projection's NDC axis offset, whether it
+    // is orthographic (the extents in scene_inputs.w and camera_forward.w are
+    // then half sizes), and the froxel depth-slice offset.
+    fragInfo[200] = lighting.projectionOffsetX;
+    fragInfo[201] = lighting.projectionOffsetY;
+    fragInfo[202] = lighting.orthographic ? 1.0 : 0.0;
+    fragInfo[203] = froxels?.depthOffset ?? 0.0;
+    // camera_position [204..207]: the eye, for projecting world positions.
+    final cameraPosition = lighting.cameraPosition;
+    fragInfo[204] = cameraPosition?.x ?? 0.0;
+    fragInfo[205] = cameraPosition?.y ?? 0.0;
+    fragInfo[206] = cameraPosition?.z ?? 0.0;
+    fragInfo[207] = 0.0;
+    // depth_projection [208..211]: the raster projection's depth row, so a
+    // material that writes its own gl_FragDepth maps a view depth the same
+    // way the vertex stage's clip divide did. Left zero when the pass
+    // publishes none, which the shader reads as "leave depth alone".
     final depthRow = lighting.depthProjection;
-    fragInfo[200] = depthRow?.x ?? 0.0;
-    fragInfo[201] = depthRow?.y ?? 0.0;
-    fragInfo[202] = depthRow?.z ?? 0.0;
-    fragInfo[203] = depthRow?.w ?? 0.0;
+    fragInfo[208] = depthRow?.x ?? 0.0;
+    fragInfo[209] = depthRow?.y ?? 0.0;
+    fragInfo[210] = depthRow?.z ?? 0.0;
+    fragInfo[211] = depthRow?.w ?? 0.0;
     // spot_shadow_params [12..15] (more of the unused SH region): the shared
     // spot-shadow parameters. x is the total non-cascade tile count (spot
     // tiles then point-shadow tiles); 0 disables both spot and point shadow
@@ -299,10 +319,10 @@ class EngineLightingUniforms {
     fragInfo[16] = lighting.opaqueSceneColor != null ? 1.0 : 0.0;
     fragInfo[17] = lighting.sceneDepthLinear != null ? 1.0 : 0.0;
     fragInfo[18] = lighting.time;
-    // scene_inputs.w / camera_forward.w: the projection's half-fov
-    // tangents, for materials that project world positions to screen UV
-    // (screen-space reflection marches). Zero when non-perspective.
-    fragInfo[19] = lighting.tanHalfFovX;
+    // scene_inputs.w / camera_forward.w: the projection's view-space extent
+    // per unit of NDC (half-fov tangents, or half sizes when orthographic),
+    // for materials that project world positions to screen UV.
+    fragInfo[19] = lighting.projectionScaleX;
     // camera_forward [20..23]: the camera's world-space forward direction,
     // for a fragment's planar view depth (dot(-v_viewvector, forward)).
     final forward = lighting.cameraForward;
@@ -311,7 +331,7 @@ class EngineLightingUniforms {
       fragInfo[21] = forward.y;
       fragInfo[22] = forward.z;
     }
-    fragInfo[23] = lighting.tanHalfFovY;
+    fragInfo[23] = lighting.projectionScaleY;
     // camera_right/camera_up [24..31]: the remaining camera basis axes used
     // to project a world-space refraction exit back into scene-color UV. The
     // right axis' w slot [27] carries the sun's angular radius for the
@@ -338,6 +358,36 @@ class EngineLightingUniforms {
       fragInfo[34] = filtered.width > 0 ? 1.0 / filtered.width : 0.0;
       fragInfo[35] = filtered.height > 0 ? 1.0 / filtered.height : 0.0;
     }
+  }
+
+  /// Binds the `ViewInfo` block `material_varyings.glsl` declares for
+  /// `GetViewDirection`, which needs the camera axis under an orthographic
+  /// camera. Does nothing when [shader] never reads it (the block is then
+  /// optimized away and reflects no size).
+  static void bindViewInfo(
+    gpu.RenderPass pass,
+    gpu.Shader shader,
+    TransientWriter transientsBuffer,
+    Lighting lighting,
+  ) {
+    if (_memoPassIs(pass) && identical(_viewInfoMemo[shader], lighting)) {
+      return;
+    }
+    final slot = shader.cachedUniformSlot('ViewInfo');
+    if (slot.sizeInBytes == null) return;
+    _viewInfoMemo[shader] = lighting;
+    final forward = lighting.cameraForward;
+    final info = Float32List(4);
+    if (forward != null) {
+      info[0] = forward.x;
+      info[1] = forward.y;
+      info[2] = forward.z;
+    }
+    info[3] = lighting.orthographic && forward != null ? 1.0 : 0.0;
+    pass.bindUniform(
+      slot,
+      transientsBuffer.emplace(ByteData.sublistView(info)),
+    );
   }
 
   /// Packs the `FogInfo` block (6 vec4s / 24 floats, see `shaders/fog.glsl`)
@@ -393,7 +443,7 @@ class EngineLightingUniforms {
     }
     // buffer[1] left 0 (disabled) when there is no active fog.
     pass.bindUniform(
-      shader.getUniformSlot('FogInfo'),
+      shader.cachedUniformSlot('FogInfo'),
       transientsBuffer.emplace(ByteData.sublistView(buffer)),
     );
   }
@@ -489,12 +539,12 @@ class EngineLightingUniforms {
         return true;
       }());
       pass.bindTexture(
-        shader.getUniformSlot('prefiltered_radiance'),
+        shader.cachedUniformSlot('prefiltered_radiance'),
         Material.getBlackPlaceholderTexture(),
         sampler: _radianceSampler(false),
       );
       pass.bindUniform(
-        shader.getUniformSlot('RadianceLayoutInfo'),
+        shader.cachedUniformSlot('RadianceLayoutInfo'),
         _layoutAtlas,
       );
       return;
@@ -504,7 +554,7 @@ class EngineLightingUniforms {
     // band atlas has a single level, where the mip filter is inert, and both
     // repeat horizontally (longitude wraps) and clamp vertically.
     pass.bindTexture(
-      shader.getUniformSlot('prefiltered_radiance'),
+      shader.cachedUniformSlot('prefiltered_radiance'),
       env.prefilteredRadiance,
       sampler: cubeLayout ? _cubeSampler : _radianceSampler(mipLayout),
     );
@@ -514,7 +564,7 @@ class EngineLightingUniforms {
     // and binding one anyway is rejected.
     if (!cubeLayout) {
       pass.bindUniform(
-        shader.getUniformSlot('RadianceLayoutInfo'),
+        shader.cachedUniformSlot('RadianceLayoutInfo'),
         mipLayout ? _layoutMip : _layoutAtlas,
       );
     }
@@ -530,6 +580,7 @@ class EngineLightingUniforms {
   static gpu.RenderPass? _memoPass;
   static final Map<gpu.Shader, (Lighting, EnvironmentMap)> _texturesMemo = {};
   static final Map<gpu.Shader, Lighting> _fogMemo = {};
+  static final Map<gpu.Shader, Lighting> _viewInfoMemo = {};
 
   /// Forgets all memoized bindings; the encoder calls this whenever it clears
   /// the render pass's bindings.
@@ -537,6 +588,7 @@ class EngineLightingUniforms {
     _memoPass = null;
     _texturesMemo.clear();
     _fogMemo.clear();
+    _viewInfoMemo.clear();
   }
 
   static bool _memoPassIs(gpu.RenderPass pass) {
@@ -544,6 +596,7 @@ class EngineLightingUniforms {
     _memoPass = pass;
     _texturesMemo.clear();
     _fogMemo.clear();
+    _viewInfoMemo.clear();
     return false;
   }
 
@@ -606,6 +659,7 @@ class EngineLightingUniforms {
     bool bindSsao = true,
     bool bindShadows = true,
     bool bindDiffuseSh = true,
+    bool bindEnvironment = true,
     bool? cubeShader,
   }) {
     if (_memoPassIs(pass)) {
@@ -617,15 +671,17 @@ class EngineLightingUniforms {
       }
     }
     _texturesMemo[shader] = (lighting, env);
-    bindPrefilteredRadiance(pass, shader, env, cubeShader: cubeShader);
-    pass.bindTexture(
-      shader.getUniformSlot('brdf_lut'),
-      Material.getBrdfLutTexture(),
-      sampler: _clampLinearSampler,
-    );
+    if (bindEnvironment) {
+      bindPrefilteredRadiance(pass, shader, env, cubeShader: cubeShader);
+      pass.bindTexture(
+        shader.cachedUniformSlot('brdf_lut'),
+        Material.getBrdfLutTexture(),
+        sampler: _clampLinearSampler,
+      );
+    }
     if (bindShadows) {
       pass.bindTexture(
-        shader.getUniformSlot('shadow_map'),
+        shader.cachedUniformSlot('shadow_map'),
         Material.whitePlaceholder(lighting.shadowMap),
         // The atlas is fp32. GLES devices may support rendering/sampling float
         // textures without GL_OES_texture_float_linear, making linear filtering
@@ -641,10 +697,10 @@ class EngineLightingUniforms {
     // texture is bound and both shader row coordinates land on its single
     // row. Sampled in EvaluateDiffuseSH. A baked-lightmap variant reads its
     // diffuse ambient from the lightmap and declares no such sampler.
-    if (bindDiffuseSh) {
+    if (bindDiffuseSh && bindEnvironment) {
       final field = lighting.irradianceField;
       pass.bindTexture(
-        shader.getUniformSlot('irradiance_field'),
+        shader.cachedUniformSlot('irradiance_field'),
         field?.atlas ?? lighting.diffuseShTexture ?? env.diffuseShTexture,
         sampler: field != null ? _clampLinearSampler : _nearestClampSampler,
       );
@@ -653,25 +709,27 @@ class EngineLightingUniforms {
     // When no cross-fade is active the primary is bound here too (a valid
     // no-op, since frag_info.radiance_blend.x is 0 and the shader never
     // reads it).
-    bindSecondaryRadiance(
-      pass,
-      shader,
-      lighting.environmentMapB ?? env,
-      primary: env,
-      cubeShader: cubeShader,
-    );
+    if (bindEnvironment) {
+      bindSecondaryRadiance(
+        pass,
+        shader,
+        lighting.environmentMapB ?? env,
+        primary: env,
+        cubeShader: cubeShader,
+      );
+    }
     // Punctual light parameters (all scene lights) and the per-object light
     // index buffer, both RGBA32F data textures, point-sampled (each texel is
     // packed data). White placeholders are bound when there are no lights or no
     // reached items; the shader never reads them because the per-object count is
     // 0.
     pass.bindTexture(
-      shader.getUniformSlot('punctual_lights'),
+      shader.cachedUniformSlot('punctual_lights'),
       Material.whitePlaceholder(lighting.punctualParamsTexture),
       sampler: _nearestClampSampler,
     );
     pass.bindTexture(
-      shader.getUniformSlot('punctual_index'),
+      shader.cachedUniformSlot('punctual_index'),
       Material.whitePlaceholder(lighting.punctualIndexTexture),
       sampler: _nearestClampSampler,
     );
@@ -681,18 +739,21 @@ class EngineLightingUniforms {
     // ssao_params.x regardless.
     if (bindSsao) {
       pass.bindTexture(
-        shader.getUniformSlot('ssao_texture'),
+        shader.cachedUniformSlot('ssao_texture'),
         Material.whitePlaceholder(lighting.ssaoMap),
         sampler: _clampLinearSampler,
       );
     }
     // What stands overhead, for the weather. Packed data, so nearest; the
-    // placeholder is never read (weather_occ_range.z is 0 then).
-    pass.bindTexture(
-      shader.getUniformSlot('weather_occlusion'),
-      Material.whitePlaceholder(lighting.weather?.occlusionMap),
-      sampler: _nearestClampSampler,
-    );
+    // placeholder is never read (weather_occ_range.z is 0 then). A material
+    // without the engine's environment lighting declares no such sampler.
+    if (bindEnvironment) {
+      pass.bindTexture(
+        shader.cachedUniformSlot('weather_occlusion'),
+        Material.whitePlaceholder(lighting.weather?.occlusionMap),
+        sampler: _nearestClampSampler,
+      );
+    }
   }
 
   /// Binds the engine samplers a shadow-catcher fragment shader declares.
@@ -712,29 +773,30 @@ class EngineLightingUniforms {
     if (shadowMap != null) {
       // fp32 atlas; PCF is explicit in the shader, so nearest is portable.
       pass.bindTexture(
-        shader.getUniformSlot('shadow_map'),
+        shader.cachedUniformSlot('shadow_map'),
         shadowMap,
         sampler: _nearestSampler,
       );
       pass.bindTexture(
-        shader.getUniformSlot('punctual_lights'),
+        shader.cachedUniformSlot('punctual_lights'),
         Material.whitePlaceholder(lighting.punctualParamsTexture),
         sampler: _nearestClampSampler,
       );
       pass.bindTexture(
-        shader.getUniformSlot('punctual_index'),
+        shader.cachedUniformSlot('punctual_index'),
         Material.whitePlaceholder(lighting.punctualIndexTexture),
         sampler: _nearestClampSampler,
       );
     }
     pass.bindTexture(
-      shader.getUniformSlot('ssao_texture'),
+      shader.cachedUniformSlot('ssao_texture'),
       Material.whitePlaceholder(lighting.ssaoMap),
       sampler: _clampLinearSampler,
     );
   }
 
   static final Float32List _lightmapInfoScratch = Float32List(12);
+  static final Float32List _sceneInputInfoScratch = Float32List(24);
 
   /// Packs the `LightmapInfo` std140 block (three vec4s) into [target]. See
   /// `shaders/lightmap.glsl` for the field layout.
@@ -779,7 +841,7 @@ class EngineLightingUniforms {
     gpu.SamplerOptions? sampler,
   }) {
     pass.bindTexture(
-      shader.getUniformSlot('lightmap_texture'),
+      shader.cachedUniformSlot('lightmap_texture'),
       texture ?? Material.getBlackPlaceholderTexture(),
       sampler: sampler ?? _clampLinearSampler,
     );
@@ -791,8 +853,8 @@ class EngineLightingUniforms {
       rgbm: rgbm,
     );
     pass.bindUniform(
-      shader.getUniformSlot('LightmapInfo'),
-      transientsBuffer.emplace(ByteData.sublistView(_lightmapInfoScratch)),
+      shader.cachedUniformSlot('LightmapInfo'),
+      transientsBuffer.emplace(scratchBytesOf(_lightmapInfoScratch)),
     );
   }
 
@@ -809,21 +871,21 @@ class EngineLightingUniforms {
   ) {
     if (sceneInputs.contains(RenderInput.opaqueSceneColor)) {
       pass.bindTexture(
-        shader.getUniformSlot('scene_opaque_color'),
+        shader.cachedUniformSlot('scene_opaque_color'),
         Material.whitePlaceholder(lighting.opaqueSceneColor),
         sampler: _clampLinearSampler,
       );
     }
     if (sceneInputs.contains(RenderInput.filteredSceneColor)) {
       pass.bindTexture(
-        shader.getUniformSlot('scene_filtered_color'),
+        shader.cachedUniformSlot('scene_filtered_color'),
         Material.whitePlaceholder(lighting.filteredSceneColor),
         sampler: _clampLinearSampler,
       );
     }
     if (sceneInputs.contains(RenderInput.depth)) {
       pass.bindTexture(
-        shader.getUniformSlot('scene_depth'),
+        shader.cachedUniformSlot('scene_depth'),
         Material.whitePlaceholder(lighting.sceneDepthLinear),
         sampler: _nearestClampSampler,
       );
@@ -847,10 +909,10 @@ class EngineLightingUniforms {
     Lighting lighting,
     TransientWriter transientsBuffer,
   ) {
-    final slot = shader.getUniformSlot('SceneInputInfo');
+    final slot = shader.cachedUniformSlot('SceneInputInfo');
     if (slot.sizeInBytes == null) return;
 
-    final info = Float32List(20);
+    final info = _sceneInputInfoScratch..fillRange(0, 24, 0.0);
     info[0] = lighting.opaqueSceneColor != null ? 1.0 : 0.0;
     info[1] = lighting.sceneDepthLinear != null ? 1.0 : 0.0;
     info[2] = lighting.filteredSceneColor != null ? 1.0 : 0.0;
@@ -865,24 +927,24 @@ class EngineLightingUniforms {
       info[9] = forward.y;
       info[10] = forward.z;
     }
-    info[11] = lighting.tanHalfFovY;
+    info[11] = lighting.projectionScaleY;
     final right = lighting.cameraRight;
     if (right != null) {
       info[12] = right.x;
       info[13] = right.y;
       info[14] = right.z;
     }
-    info[15] = lighting.tanHalfFovX;
+    info[15] = lighting.projectionScaleX;
     final up = lighting.cameraUp;
     if (up != null) {
       info[16] = up.x;
       info[17] = up.y;
       info[18] = up.z;
     }
-    pass.bindUniform(
-      slot,
-      transientsBuffer.emplace(ByteData.sublistView(info)),
-    );
+    info[20] = lighting.projectionOffsetX;
+    info[21] = lighting.projectionOffsetY;
+    info[22] = lighting.orthographic ? 1.0 : 0.0;
+    pass.bindUniform(slot, transientsBuffer.emplace(scratchBytesOf(info)));
   }
 
   /// Binds the secondary cross-fade environment's prefiltered radiance to the
@@ -905,7 +967,7 @@ class EngineLightingUniforms {
   }) {
     if (cubeShader != null && cubeShader != primary.usesCubeRadianceLayout) {
       pass.bindTexture(
-        shader.getUniformSlot('prefiltered_radiance_b'),
+        shader.cachedUniformSlot('prefiltered_radiance_b'),
         Material.getBlackPlaceholderTexture(),
         sampler: _radianceSampler(false),
       );
@@ -925,7 +987,7 @@ class EngineLightingUniforms {
       return true;
     }());
     pass.bindTexture(
-      shader.getUniformSlot('prefiltered_radiance_b'),
+      shader.cachedUniformSlot('prefiltered_radiance_b'),
       source.prefilteredRadiance,
       sampler: source.usesCubeRadianceLayout
           ? _cubeSampler

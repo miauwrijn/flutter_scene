@@ -2,7 +2,7 @@ import 'dart:async';
 import 'dart:math';
 
 import 'package:flutter/gestures.dart';
-import 'package:flutter/material.dart';
+import 'package:material_ui/material_ui.dart';
 import 'package:flutter/services.dart';
 // The editor's own OrbitCameraController (a viewport widget) predates the
 // engine's; hide the engine one here to keep using the local widget.
@@ -16,6 +16,7 @@ import '../render_graph/debug_shaders.dart' show loadEditorDebugShaders;
 import '../shell/editor_theme.dart';
 import 'component_gizmos.dart';
 import 'debug_visualize.dart';
+import '../shell/editor_ui_handle.dart';
 import 'free_look_camera.dart';
 import 'orbit_camera.dart';
 import 'orientation_gizmo.dart';
@@ -48,6 +49,7 @@ class ViewportPanel extends StatefulWidget {
     required this.controller,
     this.repaintBoundaryKey,
     this.cameraHandle,
+    this.uiHandle,
     this.gizmoPreferences,
   });
 
@@ -60,6 +62,9 @@ class ViewportPanel extends StatefulWidget {
   /// Optional remote control this viewport attaches its camera to (the MCP
   /// camera tools).
   final ViewportCameraHandle? cameraHandle;
+
+  /// Lets commands read and switch this viewport's transform tool.
+  final EditorUiHandle? uiHandle;
 
   /// Shared component-gizmo visibility preferences; null uses a private
   /// per-viewport default (everything visible).
@@ -132,7 +137,8 @@ class _ViewportPanelState extends State<ViewportPanel> {
     // Repaint overlays while a drag in any viewport previews a transform.
     _ctrl.previewEpoch.addListener(_onControllerChanged);
     _gizmoPrefs.addListener(_onControllerChanged);
-    widget.cameraHandle?.attach(_camera, _bumpView);
+    widget.uiHandle?.attachTool(_readToolMode, _writeToolMode);
+    widget.cameraHandle?.attach(_camera, _cameraMoved);
   }
 
   @override
@@ -154,13 +160,16 @@ class _ViewportPanelState extends State<ViewportPanel> {
     }
     if (oldWidget.cameraHandle != widget.cameraHandle) {
       oldWidget.cameraHandle?.detach(_camera);
-      widget.cameraHandle?.attach(_camera, _bumpView);
+      widget.cameraHandle?.attach(_camera, _cameraMoved);
+      // Attaching may have applied a pose held for this viewport.
+      _bumpView();
     }
   }
 
   @override
   void dispose() {
     widget.cameraHandle?.detach(_camera);
+    widget.uiHandle?.detachTool(_readToolMode);
     _ctrl.removeListener(_onControllerChanged);
     _ctrl.previewEpoch.removeListener(_onControllerChanged);
     _gizmoPrefs.removeListener(_onControllerChanged);
@@ -183,6 +192,13 @@ class _ViewportPanelState extends State<ViewportPanel> {
 
   void _bumpView() => _viewEpoch.value++;
 
+  /// The camera saves with the document, so navigating it is a change, even
+  /// though it never becomes an undo step.
+  void _cameraMoved() {
+    _ctrl.session.markDirty();
+    _bumpView();
+  }
+
   void _onTick(Duration elapsed, double deltaSeconds) {
     if (deltaSeconds > 0) {
       final inst = 1.0 / deltaSeconds;
@@ -195,7 +211,7 @@ class _ViewportPanelState extends State<ViewportPanel> {
     if (shadows != _shadowOverflow.value) _shadowOverflow.value = shadows;
     if (_freeLookActive && _freeLook.move(deltaSeconds)) {
       _syncOrbitToFreeLook();
-      _bumpView();
+      _cameraMoved();
     }
   }
 
@@ -349,6 +365,7 @@ class _ViewportPanelState extends State<ViewportPanel> {
     _pendingSelection = null;
     _freeLook.syncTo(_camera.camera);
     _camera.orthographic = false;
+    _cameraMoved();
     setState(() => _freeLookActive = true);
     unawaited(
       _freeLookPointer.start(
@@ -364,7 +381,7 @@ class _ViewportPanelState extends State<ViewportPanel> {
     if (!_freeLookActive || delta == Offset.zero) return;
     _freeLook.look(delta);
     _syncOrbitToFreeLook();
-    _bumpView();
+    _cameraMoved();
   }
 
   void _syncOrbitToFreeLook() {
@@ -604,6 +621,17 @@ class _ViewportPanelState extends State<ViewportPanel> {
       );
     }
     if (batch.isNotEmpty) unawaited(_ctrl.setNodeTransformsBatch(batch));
+  }
+
+  String _readToolMode() => _gizmo.mode.name;
+
+  void _writeToolMode(String mode) {
+    for (final candidate in GizmoMode.values) {
+      if (candidate.name == mode) {
+        _setMode(candidate);
+        return;
+      }
+    }
   }
 
   void _setMode(GizmoMode mode) {
@@ -948,14 +976,10 @@ class _ViewportPanelState extends State<ViewportPanel> {
     final toggle = keys.isMetaPressed || keys.isControlPressed;
     void apply(LocalId? id) {
       if (id == null) {
-        if (!toggle) _ctrl.selection.clear();
+        if (!toggle) _ctrl.clearSelection();
         return;
       }
-      if (toggle) {
-        _ctrl.selection.toggle(id);
-      } else {
-        _ctrl.selection.selectOnly(id);
-      }
+      _ctrl.select([id], mode: toggle ? 'toggle' : 'replace');
     }
 
     // Component gizmos win over the scene raycast: a gizmo is often a
@@ -1055,7 +1079,7 @@ class _ViewportPanelState extends State<ViewportPanel> {
                                 _draggingGizmo ||
                                 _modal != null ||
                                 _freeLookActive,
-                            onChanged: _bumpView,
+                            onChanged: _cameraMoved,
                             child: Listener(
                               behavior: HitTestBehavior.opaque,
                               onPointerDown: (e) => _onPointerDown(e, size),
@@ -1643,30 +1667,77 @@ class _DebugOutputButton extends StatefulWidget {
 class _DebugOutputButtonState extends State<_DebugOutputButton> {
   @override
   Widget build(BuildContext context) {
-    final pass = debugVisualizePassFor(widget.controller.scene);
-    final active = pass.mode.resolve != null;
-    return PopupMenuButton<ViewportDebugMode>(
+    final scene = widget.controller.scene;
+    final pass = debugVisualizePassFor(scene);
+    final bufferActive = pass.mode.resolve != null;
+    final surfaceActive = scene.debug.view.isActive;
+    final active = bufferActive || surfaceActive;
+    return PopupMenuButton<VoidCallback>(
       tooltip: 'Debug output',
       padding: EdgeInsets.zero,
-      onSelected: (mode) async {
-        // The remap shader loads lazily on the first non-passthrough use.
-        if (mode.resolve != null) await loadEditorDebugShaders();
-        pass.mode = mode;
+      onSelected: (action) async {
+        await Future<void>.sync(action);
         if (mounted) setState(() {});
         widget.onChanged();
       },
       itemBuilder: (_) => [
+        PopupMenuItem<VoidCallback>(
+          enabled: false,
+          height: editorMenuItemHeight,
+          child: const Text('Buffers', style: TextStyle(fontSize: 11)),
+        ),
         for (final mode in viewportDebugModes)
-          PopupMenuItem<ViewportDebugMode>(
-            value: mode,
-            height: editorMenuItemHeight,
-            child: Row(
-              children: [
-                editorMenuCheckmark(pass.mode.id == mode.id),
-                const SizedBox(width: 4),
-                Text(mode.label),
-              ],
+          _checkedItem(
+            label: mode.label,
+            checked: !surfaceActive && pass.mode.id == mode.id,
+            action: () async {
+              // The remap shader loads lazily on the first non-passthrough
+              // use. A buffer view and a surface view are exclusive.
+              if (mode.resolve != null) await loadEditorDebugShaders();
+              scene.debug.view = DebugView.none;
+              pass.mode = mode;
+            },
+          ),
+        const PopupMenuDivider(),
+        PopupMenuItem<VoidCallback>(
+          enabled: false,
+          height: editorMenuItemHeight,
+          child: const Text('Surface', style: TextStyle(fontSize: 11)),
+        ),
+        for (final group in SurfaceDebugGroup.values)
+          if (group != SurfaceDebugGroup.none)
+            PopupMenuItem<VoidCallback>(
+              value: () {},
+              height: editorMenuItemHeight,
+              child: _SurfaceViewGroupMenu(
+                group: group,
+                scene: scene,
+                onSelected: (entry) {
+                  pass.mode = viewportDebugModes.first;
+                  scene.debug.view = entry.view;
+                  if (mounted) setState(() {});
+                  widget.onChanged();
+                },
+              ),
             ),
+        const PopupMenuDivider(),
+        _checkedItem(
+          label: 'Split against lit',
+          checked: scene.debug.split != null,
+          action: () =>
+              scene.debug.split = scene.debug.split == null ? 0.5 : null,
+        ),
+        for (final (label, overlay) in const [
+          ('Wireframe overlay', DebugOverlay.wireframe),
+          ('Depth conflicts (z-fighting)', DebugOverlay.depthConflicts),
+        ])
+          _checkedItem(
+            label: label,
+            checked: scene.debug.overlays.contains(overlay),
+            action: () {
+              final overlays = scene.debug.overlays;
+              if (!overlays.remove(overlay)) overlays.add(overlay);
+            },
           ),
       ],
       child: Container(
@@ -1686,6 +1757,85 @@ class _DebugOutputButtonState extends State<_DebugOutputButton> {
       ),
     );
   }
+
+  PopupMenuItem<VoidCallback> _checkedItem({
+    required String label,
+    required bool checked,
+    required VoidCallback action,
+  }) {
+    return PopupMenuItem<VoidCallback>(
+      value: action,
+      height: editorMenuItemHeight,
+      child: Row(
+        children: [
+          editorMenuCheckmark(checked),
+          const SizedBox(width: 4),
+          Text(label),
+        ],
+      ),
+    );
+  }
+}
+
+/// One surface-view group as a submenu row: the group name, opening the
+/// registry's entries for that group.
+class _SurfaceViewGroupMenu extends StatelessWidget {
+  const _SurfaceViewGroupMenu({
+    required this.group,
+    required this.scene,
+    required this.onSelected,
+  });
+
+  final SurfaceDebugGroup group;
+  final Scene scene;
+  final ValueChanged<DebugViewEntry> onSelected;
+
+  @override
+  Widget build(BuildContext context) {
+    final entries = DebugViewRegistry.entries
+        .where((entry) => entry.group == group)
+        .toList();
+    final activeId = scene.debug.viewId;
+    final groupActive = entries.any((entry) => entry.id == activeId);
+    return PopupMenuButton<DebugViewEntry>(
+      tooltip: '',
+      padding: EdgeInsets.zero,
+      onSelected: onSelected,
+      itemBuilder: (_) => [
+        for (final entry in entries)
+          PopupMenuItem<DebugViewEntry>(
+            value: entry,
+            height: editorMenuItemHeight,
+            child: Row(
+              children: [
+                editorMenuCheckmark(entry.id == activeId),
+                const SizedBox(width: 4),
+                Text(entry.label),
+              ],
+            ),
+          ),
+      ],
+      child: Row(
+        children: [
+          editorMenuCheckmark(groupActive),
+          const SizedBox(width: 4),
+          Text(_groupLabel(group)),
+          const Spacer(),
+          const Icon(Icons.chevron_right, size: 14),
+        ],
+      ),
+    );
+  }
+
+  static String _groupLabel(SurfaceDebugGroup group) => switch (group) {
+    SurfaceDebugGroup.none => 'Off',
+    SurfaceDebugGroup.geometry => 'Geometry',
+    SurfaceDebugGroup.surface => 'Surface',
+    SurfaceDebugGroup.physical => 'Physical',
+    SurfaceDebugGroup.identity => 'Identity',
+    SurfaceDebugGroup.validation => 'Validation',
+    SurfaceDebugGroup.custom => 'Custom',
+  };
 }
 
 /// Per-viewport settings, popped from the gear button in the corner.

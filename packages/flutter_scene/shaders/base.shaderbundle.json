@@ -67,6 +67,38 @@
     "type": "fragment",
     "file": "shaders/flutter_scene_standard_lightmap_no_shadow_cube.frag"
   },
+  "StandardLeanFragment": {
+    "type": "fragment",
+    "file": "shaders/flutter_scene_standard_lean.frag"
+  },
+  "StandardLeanCubeFragment": {
+    "type": "fragment",
+    "file": "shaders/flutter_scene_standard_lean_cube.frag"
+  },
+  "StandardLeanNoShadowFragment": {
+    "type": "fragment",
+    "file": "shaders/flutter_scene_standard_lean_no_shadow.frag"
+  },
+  "StandardLeanNoShadowCubeFragment": {
+    "type": "fragment",
+    "file": "shaders/flutter_scene_standard_lean_no_shadow_cube.frag"
+  },
+  "StandardLightmapLeanFragment": {
+    "type": "fragment",
+    "file": "shaders/flutter_scene_standard_lean_lightmap.frag"
+  },
+  "StandardLightmapLeanCubeFragment": {
+    "type": "fragment",
+    "file": "shaders/flutter_scene_standard_lean_lightmap_cube.frag"
+  },
+  "StandardLightmapLeanNoShadowFragment": {
+    "type": "fragment",
+    "file": "shaders/flutter_scene_standard_lean_lightmap_no_shadow.frag"
+  },
+  "StandardLightmapLeanNoShadowCubeFragment": {
+    "type": "fragment",
+    "file": "shaders/flutter_scene_standard_lean_lightmap_no_shadow_cube.frag"
+  },
   "DepthOnlyFragment": {
     "type": "fragment",
     "file": "shaders/flutter_scene_depth_only.frag"
@@ -74,6 +106,10 @@
   "DepthOnlyMaskedFragment": {
     "type": "fragment",
     "file": "shaders/flutter_scene_depth_only_masked.frag"
+  },
+  "CoverageFragment": {
+    "type": "fragment",
+    "file": "shaders/flutter_scene_coverage.frag"
   },
   "ShadowCopyFragment": {
     "type": "fragment",
@@ -115,6 +151,10 @@
     "type": "fragment",
     "file": "shaders/flutter_scene_mask.frag"
   },
+  "MaskMaskedFragment": {
+    "type": "fragment",
+    "file": "shaders/flutter_scene_mask_masked.frag"
+  },
   "MaskAlbedoFragment": {
     "type": "fragment",
     "file": "shaders/flutter_scene_mask_albedo.frag"
@@ -123,9 +163,17 @@
     "type": "fragment",
     "file": "shaders/flutter_scene_mask_normal.frag"
   },
+  "DebugSurfaceFragment": {
+    "type": "fragment",
+    "file": "shaders/flutter_scene_debug_surface.frag"
+  },
   "OutlineFragment": {
     "type": "fragment",
     "file": "shaders/flutter_scene_outline.frag"
+  },
+  "DepthConflictOverlayFragment": {
+    "type": "fragment",
+    "file": "shaders/flutter_scene_depth_conflict_overlay.frag"
   },
   "GodRaysFragment": {
     "type": "fragment",
@@ -310,5 +358,9 @@
   "TaaFragment": {
     "type": "fragment",
     "file": "shaders/flutter_scene_taa.frag"
+  },
+  "DisplayReferredCompositeFragment": {
+    "type": "fragment",
+    "file": "shaders/flutter_scene_display_referred_composite.frag"
   }
 }

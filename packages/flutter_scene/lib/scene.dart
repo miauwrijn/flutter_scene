@@ -126,6 +126,8 @@ export 'src/ambient_occlusion.dart'
         AmbientOcclusionSettings,
         SpecularAmbientOcclusionMode;
 export 'src/auto_exposure.dart' show AutoExposureSettings;
+export 'src/coplanar_overlaps.dart' show CoplanarOverlap;
+export 'src/depth_conflicts.dart' show DepthConflict, DepthConflictReport;
 export 'src/depth_of_field.dart' show DepthOfField, DepthOfFieldQuality;
 export 'src/fog.dart' show Fog, FogMode;
 export 'src/weather.dart' show SceneWeather;
@@ -138,6 +140,8 @@ export 'src/global_illumination.dart'
 export 'src/render/irradiance_bake.dart'
     show IrradianceFieldBake, IrradianceFieldBakeStepper;
 export 'src/render/smaa_pass.dart' show SmaaSettings;
+export 'src/render/render_quality.dart'
+    show RenderQualitySettings, RenderQualityTier;
 export 'src/render/temporal_anti_aliasing.dart'
     show TemporalAntiAliasingSettings;
 export 'src/god_rays.dart' show GodRaysSettings;
@@ -152,7 +156,19 @@ export 'src/asset_helpers.dart'
         imageFromAsset,
         imageFromBytes;
 export 'src/camera.dart'
-    show Camera, CameraProjection, PerspectiveCamera, PerspectiveProjection;
+    show
+        Camera,
+        CameraProjection,
+        OrthographicCamera,
+        OrthographicContain,
+        OrthographicCover,
+        OrthographicHeight,
+        OrthographicProjection,
+        OrthographicSize,
+        OrthographicStretch,
+        OrthographicWidth,
+        PerspectiveCamera,
+        PerspectiveProjection;
 export 'src/camera_controllers/camera_controller.dart' show CameraController;
 export 'src/camera_controllers/fly_camera_controller.dart'
     show FlyCameraController;
@@ -247,12 +263,54 @@ export 'src/light.dart'
 export 'src/render/custom_render_pass.dart'
     show CustomRenderPass, RenderInput, RenderPassContext, RenderStage;
 export 'src/render/frame_transients.dart' show TransientWriter;
+export 'src/render/shadow_pass.dart' show SpotShadowInfo;
+export 'src/render/draw_recorder.dart'
+    show BatchBreakReason, DrawPhase, DrawSkipReason;
 export 'src/render/render_graph_capture.dart'
     show
+        CapturedDraw,
         CapturedPass,
         CapturedResource,
+        CapturedSkip,
+        CapturedUniformBlock,
         RenderGraphCaptureRequest,
         RenderGraphCaptureResult;
+export 'src/render/debug_view.dart'
+    show
+        DebugOverlay,
+        DebugRangePolicy,
+        DebugView,
+        DebugViewEntry,
+        DebugViewRegistry,
+        SceneDebugSettings,
+        SurfaceDebugChannel,
+        SurfaceDebugGroup;
+export 'src/render/render_stats.dart'
+    show
+        RenderCounters,
+        RenderFrameStats,
+        RenderPassStats,
+        RenderStats,
+        RenderViewStats;
+export 'src/shader_reflection/shader_diagnostics.dart'
+    show ShaderCompileDiagnostic, parseShaderCompileErrors, shaderSourceWindow;
+export 'src/shader_reflection/shader_reflection.dart'
+    show
+        ShaderBackend,
+        ShaderBackendInfo,
+        ShaderBundleInfo,
+        ShaderInfo,
+        ShaderInputInfo,
+        ShaderReflection,
+        ShaderScalarType,
+        ShaderSource,
+        ShaderStageKind,
+        ShaderTextureInfo,
+        ShaderUniformBlockInfo,
+        ShaderUniformFieldInfo,
+        ShaderUniformValue,
+        decodeUniformBlock,
+        matchUniformBlocks;
 export 'src/render/object_filter.dart' show MaskContent, NodeFilter;
 export 'src/render/render_layers.dart'
     show kRenderLayerAll, kRenderLayerDefault;
@@ -262,6 +320,9 @@ export 'src/render_texture.dart'
 export 'src/render_view.dart' show RenderView;
 export 'src/math_extensions.dart' show QuaternionSlerp, Vector3Lerp;
 export 'src/mesh.dart' show Mesh, MeshPrimitive;
+export 'src/render/planar_reflection.dart' show PlanarReflectionCamera;
+export 'src/mesh_draw.dart'
+    show MeshDrawContext, MeshDrawPass, MeshDrawSelection, MeshDrawSelector;
 export 'src/decal.dart' show DecalNode;
 export 'src/node.dart' show Node;
 export 'src/sprite.dart' show Sprite;
@@ -271,6 +332,8 @@ export 'src/texture/external_texture.dart'
     show ExternalTexture, ExternalTextureSampling, ExternalTextureUpdate;
 export 'src/texture/texture2d.dart'
     show Texture2D, TextureSource, TextureSampling, GpuTextureSource;
+export 'src/memory_pressure.dart'
+    show releaseTransientRenderTargets, releaseRenderTargetsOnMemoryPressure;
 export 'src/memory_report.dart'
     show MemoryCategory, MemoryReport, takeMemoryReport;
 export 'src/texture/texture_registry.dart'
@@ -309,6 +372,8 @@ export 'src/raycast.dart' show SceneRaycastHit, raycastNode, raycastNodeAll;
 export 'src/resource_group.dart' show ResourceGroup;
 export 'src/scene_pointer.dart' show ScenePointer;
 export 'src/scene.dart' show AntiAliasingMode, Scene, SceneGraph;
+export 'src/scene_tick_listener.dart' show SceneTickListener;
+export 'src/scene_encoder.dart' show maxSceneColorCaptureBatches;
 export 'src/widget_texture.dart'
     show WidgetTexture, WidgetTextureController, WidgetUpdatePolicy;
 export 'src/shaders.dart' show baseShaderLibrary, loadBaseShaderLibrary;

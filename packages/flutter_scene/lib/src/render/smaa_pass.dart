@@ -1,6 +1,7 @@
 import 'dart:typed_data';
 import 'dart:ui' as ui;
 
+import 'package:flutter/foundation.dart' show debugPrint;
 import 'package:flutter/services.dart' show rootBundle;
 import 'package:flutter_scene/src/gpu/gpu.dart' as gpu;
 import 'package:flutter_scene/src/gpu/render_pass_compat.dart';
@@ -10,6 +11,7 @@ import 'package:flutter_scene/src/render/resolve_pass.dart';
 import 'package:flutter_scene/src/scene_encoder.dart' show resolvePipeline;
 import 'package:flutter_scene/src/shaders.dart';
 import 'package:vector_math/vector_math.dart' show Vector4;
+import 'package:flutter_scene/src/render/uniform_slots.dart';
 
 /// Quality settings for SMAA anti-aliasing. Active when
 /// `Scene.antiAliasingMode` is `AntiAliasingMode.smaa`. The defaults mirror
@@ -112,12 +114,44 @@ class SmaaPass extends RenderGraphPass {
   static bool get isInitialized =>
       _areaTexture != null && _searchTexture != null;
 
-  /// Loads the precomputed SMAA area and search textures. Called by
-  /// `Scene.initializeStaticResources`, which rendering is gated on.
-  static Future<void> initializeStaticResources() async {
-    if (isInitialized) {
-      return;
-    }
+  /// Loads the precomputed SMAA area and search textures. They load the first
+  /// time a scene resolves to SMAA (or through `Scene.preload`), not with
+  /// `Scene.initializeStaticResources`; a frame that asks before they land
+  /// renders without SMAA.
+  static Future<void> initializeStaticResources() {
+    if (isInitialized) return Future<void>.value();
+    _failed = false;
+    return _load ??= _loadTables().whenComplete(() => _load = null);
+  }
+
+  static Future<void>? _load;
+  static Future<void>? _requested;
+
+  // Set when a requested load fails, so frames that keep asking do not reload
+  // and re-report it. An explicit [initializeStaticResources] clears it.
+  static bool _failed = false;
+
+  /// Starts the tables loading, once, and returns the in-flight load (null
+  /// once they are in, or after a failure). Safe to call from a frame. The
+  /// returned future never fails; a failure is reported and leaves
+  /// [isInitialized] false, which keeps the pass out of the graph.
+  static Future<void>? request() {
+    if (isInitialized || _failed) return null;
+    return _requested ??= initializeStaticResources()
+        .then<void>(
+          (_) {},
+          onError: (Object error) {
+            _failed = true;
+            debugPrint('flutter_scene: could not load the SMAA tables: $error');
+          },
+        )
+        .whenComplete(() => _requested = null);
+  }
+
+  static Future<void> _loadTables() async {
+    // The upload below is synchronous, and a lazy request can arrive before
+    // the backend has its device.
+    await gpu.initializeGpuBackend();
     final area = await rootBundle.load(
       'packages/flutter_scene/assets/smaa_area.bin',
     );
@@ -212,11 +246,14 @@ class SmaaPass extends RenderGraphPass {
       renderPass.bindPipeline(resolvePipeline(_vertexShader, _edgesShader));
       bindVertexBufferCompat(renderPass, _quadView, 6);
       renderPass.bindTexture(
-        _edgesShader.getUniformSlot('scene_color'),
+        _edgesShader.cachedUniformSlot('scene_color'),
         input,
         sampler: _linearClamp,
       );
-      renderPass.bindUniform(_edgesShader.getUniformSlot('SmaaInfo'), infoView);
+      renderPass.bindUniform(
+        _edgesShader.cachedUniformSlot('SmaaInfo'),
+        infoView,
+      );
       drawCompat(renderPass, 6);
       rendererSubmissions.submit(commandBuffer);
     }
@@ -244,22 +281,22 @@ class SmaaPass extends RenderGraphPass {
       renderPass.bindPipeline(resolvePipeline(_vertexShader, _weightsShader));
       bindVertexBufferCompat(renderPass, _quadView, 6);
       renderPass.bindTexture(
-        _weightsShader.getUniformSlot('edges_texture'),
+        _weightsShader.cachedUniformSlot('edges_texture'),
         edges,
         sampler: _linearClamp,
       );
       renderPass.bindTexture(
-        _weightsShader.getUniformSlot('area_texture'),
+        _weightsShader.cachedUniformSlot('area_texture'),
         _areaTexture!,
         sampler: _linearClamp,
       );
       renderPass.bindTexture(
-        _weightsShader.getUniformSlot('search_texture'),
+        _weightsShader.cachedUniformSlot('search_texture'),
         _searchTexture!,
         sampler: _nearestClamp,
       );
       renderPass.bindUniform(
-        _weightsShader.getUniformSlot('SmaaInfo'),
+        _weightsShader.cachedUniformSlot('SmaaInfo'),
         infoView,
       );
       drawCompat(renderPass, 6);
@@ -275,16 +312,19 @@ class SmaaPass extends RenderGraphPass {
       renderPass.bindPipeline(resolvePipeline(_vertexShader, _blendShader));
       bindVertexBufferCompat(renderPass, _quadView, 6);
       renderPass.bindTexture(
-        _blendShader.getUniformSlot('scene_color'),
+        _blendShader.cachedUniformSlot('scene_color'),
         input,
         sampler: _linearClamp,
       );
       renderPass.bindTexture(
-        _blendShader.getUniformSlot('blend_texture'),
+        _blendShader.cachedUniformSlot('blend_texture'),
         weights,
         sampler: _linearClamp,
       );
-      renderPass.bindUniform(_blendShader.getUniformSlot('SmaaInfo'), infoView);
+      renderPass.bindUniform(
+        _blendShader.cachedUniformSlot('SmaaInfo'),
+        infoView,
+      );
       drawCompat(renderPass, 6);
       rendererSubmissions.submit(commandBuffer);
     }

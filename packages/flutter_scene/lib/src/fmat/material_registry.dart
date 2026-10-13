@@ -9,10 +9,13 @@ import 'package:flutter_scene/src/fmat/fmat_emitter.dart'
         sidecarSamplesEnvironment;
 import 'package:flutter_scene/src/gpu/gpu.dart' as gpu;
 import 'package:flutter_scene/src/hot_reload/hot_reload_coordinator.dart';
+import 'package:flutter_scene/src/generated_assets/generated_asset_fetch.dart';
 import 'package:flutter_scene/src/generated_assets/generated_asset_lookup.dart';
 import 'package:flutter_scene/src/generated_assets/generated_assets.dart';
 import 'package:flutter_scene/src/material/preprocessed_material.dart';
 import 'package:flutter_scene/src/material/preprocessed_sky.dart';
+import 'package:flutter_scene/src/material/shader_interface.dart'
+    show markEngineShaderLibrary;
 
 const String _indexAssetSuffix = '.index.json';
 const String _indexAssetPrefix = '/flutter_scene/fmat/';
@@ -122,7 +125,9 @@ final class FmatMaterialRegistry {
     for (final key in indexKeys) {
       // Evict so a hot reload re-reads a regenerated index.
       if (kDebugMode) assetBundle.evict(key);
-      final json = jsonDecode(await assetBundle.loadString(key));
+      final json = jsonDecode(
+        await loadGeneratedAssetString(key, bundle: assetBundle),
+      );
       final index = FmatMaterialBundleIndex.fromJson(
         (json as Map).cast<String, Object?>(),
         assetKey: key,
@@ -257,6 +262,10 @@ final class FmatMaterialRegistry {
       shaderLibrary,
       index.shaderBundleAssetKey,
     );
+    material.setDepthSurfaceShadersFromMetadata(
+      metadata,
+      (entry) => shaderLibrary[entry],
+    );
     _fmatSourcePaths[material] = sourcePath;
     // Track for in-place hot reload: a `.fmat` edit refreshes this material
     // from its regenerated sidecar without rebuilding the scene. Debug-only.
@@ -370,11 +379,14 @@ final class FmatMaterialRegistry {
     if (library == null) {
       throw StateError('Could not load shader bundle asset "$assetKey".');
     }
+    markEngineShaderLibrary(library);
     return library;
   }
 
   Future<Map<String, Object?>> _loadSidecar(String assetKey) async {
-    final json = jsonDecode(await _bundle.loadString(assetKey));
+    final json = jsonDecode(
+      await loadGeneratedAssetString(assetKey, bundle: _bundle),
+    );
     return (json as Map).cast<String, Object?>();
   }
 }

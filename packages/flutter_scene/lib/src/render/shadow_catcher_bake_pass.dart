@@ -2,6 +2,7 @@ import 'dart:math' as math;
 import 'dart:typed_data';
 import 'dart:ui' as ui;
 
+import 'package:flutter_scene/src/material/engine_lighting.dart';
 import 'package:flutter_scene/src/gpu/gpu.dart' as gpu;
 import 'package:vector_math/vector_math.dart';
 
@@ -9,6 +10,7 @@ import 'package:flutter_scene/src/gpu/render_pass_compat.dart';
 import 'package:flutter_scene/src/light.dart';
 import 'package:flutter_scene/src/material/environment.dart';
 import 'package:flutter_scene/src/material/shadow_catcher_material.dart';
+import 'package:flutter_scene/src/render/debug_view.dart';
 import 'package:flutter_scene/src/render/frame_transients.dart';
 import 'package:flutter_scene/src/render/instance_packing.dart';
 import 'package:flutter_scene/src/render/punctual_lights.dart';
@@ -17,6 +19,7 @@ import 'package:flutter_scene/src/render/render_scene.dart';
 import 'package:flutter_scene/src/render/shadow_pass.dart';
 import 'package:flutter_scene/src/scene_encoder.dart' show resolvePipeline;
 import 'package:flutter_scene/src/shaders.dart';
+import 'package:flutter_scene/src/render/uniform_slots.dart';
 
 /// Refreshes the footprint shadow caches of baked-mode [ShadowCatcherMaterial]
 /// items, right after the shadow atlas renders so the scene pass samples a
@@ -200,10 +203,12 @@ class ShadowCatcherBakePass extends RenderGraphPass {
         geometry.materialVertexVariant,
       );
       final fragmentShader = material.fragmentShaderForLighting(lighting);
+      final attributes = material.vertexAttributesFor(materialVertex);
+      geometry.useVertexAttributes(attributes);
       final pipeline = resolvePipeline(
         materialVertex ?? geometry.vertexShader,
         fragmentShader,
-        vertexLayout: geometry.instancedVertexLayout,
+        vertexLayout: geometry.instancedVertexLayoutFor(null, attributes),
       );
       pass.bindPipeline(pipeline);
       material
@@ -211,6 +216,19 @@ class ShadowCatcherBakePass extends RenderGraphPass {
         ..lightListCount = item.lightListCount;
       try {
         material.bindForBake(pass, context.transientsBuffer, lighting);
+        // The bake never shows a debug view, but the catcher's shader still
+        // reads the block; leave it unbound and GLES reads garbage into it.
+        DebugViewFrame.bindInactive(
+          pass,
+          context.transientsBuffer,
+          fragmentShader,
+        );
+        EngineLightingUniforms.bindViewInfo(
+          pass,
+          fragmentShader,
+          context.transientsBuffer,
+          lighting,
+        );
         // The bake projects the plane flat, so both faces are equivalent; no
         // culling keeps a flipped or bottom-viewed plane baking identically.
         pass.setCullMode(gpu.CullMode.none);
@@ -289,7 +307,7 @@ class ShadowCatcherBakePass extends RenderGraphPass {
     pass.setCullMode(gpu.CullMode.none);
     bindVertexBufferCompat(pass, _quadView, 6);
     pass.bindTexture(
-      _blurFragmentShader.getUniformSlot('source_texture'),
+      _blurFragmentShader.cachedUniformSlot('source_texture'),
       source,
       sampler: _linearClamp,
     );
@@ -297,7 +315,7 @@ class ShadowCatcherBakePass extends RenderGraphPass {
       ..[0] = axis.x / source.width
       ..[1] = axis.y / source.height;
     pass.bindUniform(
-      _blurFragmentShader.getUniformSlot('CatcherBlurInfo'),
+      _blurFragmentShader.cachedUniformSlot('CatcherBlurInfo'),
       context.transientsBuffer.emplace(ByteData.sublistView(info)),
     );
     drawCompat(pass, 6);

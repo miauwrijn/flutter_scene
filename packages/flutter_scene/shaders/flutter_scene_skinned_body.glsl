@@ -13,6 +13,10 @@ uniform FrameInfo {
   float enable_skinning;
   float joint_texture_size;
   float depth_bias;
+  // The draw's depth-layer offset (xy) and its slope-scaled layer (z) and
+  // tie-break (w) offsets; a skinned draw is never instanced, so it has no
+  // instance rank. See ApplySlopedDepthOffset.
+  vec4 depth_offset;
 }
 frame_info;
 
@@ -81,9 +85,13 @@ void main() {
 
   mat4 skin_matrix;
   if (frame_info.enable_skinning == 1) {
-    skin_matrix =
-        GetJoint(joints.x) * weights.x + GetJoint(joints.y) * weights.y +
-        GetJoint(joints.z) * weights.z + GetJoint(joints.w) * weights.w;
+    // Exports often sum to slightly under 1, and since a joint matrix carries
+    // the model's world position the deficit scales that position too (a 0.98
+    // vertex lands 60 m short at 3 km). Normalize, first joint when all zero.
+    float weight_sum = weights.x + weights.y + weights.z + weights.w;
+    vec4 w = weight_sum > 0.0 ? weights / weight_sum : vec4(1.0, 0.0, 0.0, 0.0);
+    skin_matrix = GetJoint(joints.x) * w.x + GetJoint(joints.y) * w.y +
+                  GetJoint(joints.z) * w.z + GetJoint(joints.w) * w.w;
   } else {
     skin_matrix = mat4(1); // Identity matrix.
   }
@@ -111,18 +119,28 @@ void main() {
   vertex.uv1 = texture_coords_1;
   vertex.color = color;
   vertex.camera_position = frame_info.camera_position;
+  // vertex.position is already skinned, so the object-to-world transform
+  // Vertex() sees is the node transform alone.
+  vertex.model_transform = frame_info.model_transform;
   Vertex(vertex);
 
   v_position = vertex.world_position;
   vec3 draw_position = ApplyDepthBias(
-      vertex.world_position, frame_info.camera_position, frame_info.depth_bias);
-  gl_Position = frame_info.camera_transform * vec4(draw_position, 1.0);
+      vertex.world_position, frame_info.camera_transform,
+      frame_info.camera_position, frame_info.depth_bias);
+  vec4 clip_position = frame_info.camera_transform * vec4(draw_position, 1.0);
+  gl_Position = ApplySlopedDepthOffset(
+      clip_position, vec4(frame_info.depth_offset.xy, 0.0, 0.0),
+      vec4(frame_info.depth_offset.z, 0.0, frame_info.depth_offset.w, 0.0),
+      vec3(0.0), frame_info.camera_transform, draw_position,
+      frame_info.camera_position, vertex.world_normal);
   v_viewvector = frame_info.camera_position - vertex.world_position;
-  v_normal = vertex.world_normal;
+  // Unit length before interpolation (UnitOrZero, normal_transform.glsl).
+  v_normal = UnitOrZero(vertex.world_normal);
   v_texture_coords = vertex.uv;
   v_texture_coords_1 = vertex.uv1;
   v_color = vertex.color;
-  v_tangent = vertex.world_tangent;
+  v_tangent = vec4(UnitOrZero(vertex.world_tangent.xyz), vertex.world_tangent.w);
 
 #ifdef MATERIAL_INSTANCE_VARYINGS
   // Forward the material's declared per-instance attributes to the fragment

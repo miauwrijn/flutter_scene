@@ -256,6 +256,21 @@ Prefer it for anything that ships with your app. It is also how `.fmat` custom
 materials and block-compressed textures with full mip chains reach you, and
 editing any source reconverts just that source and hot reloads it.
 
+Loose images cook to the engine's own `.fstex` by default. For a smaller
+download, cook color textures to standard ETC1S KTX2 instead, several times
+smaller at some cost in quality:
+
+```dart
+buildTextures(
+  buildInput: input,
+  buildOutput: output,
+  textures: ['assets/ground.png', 'assets/ground_normal.png'],
+  encoding: const TextureEncoding.etc1s(quality: 128),
+  // Normal maps keep more detail in the default encoding.
+  encodings: {'assets/ground_normal.png': TextureEncoding.universal},
+);
+```
+
 Keep your sources in version control. The generated directory holds compiled
 output tied to the Flutter engine that built it, which is why the hook manages
 its `.gitignore` for you.
@@ -308,7 +323,7 @@ Flutter Scene is pre-1.0 and evolving quickly. Minor releases can carry breaking
 
 * glTF (`.glb` and multi-buffer `.gltf`) import at runtime, or pre-converted at build time into the engine's `.fsceneb` format through build hooks, loaded by source path. Sparse accessors, `KHR_materials_variants` with instant switching, and `KHR_texture_basisu`.
 * The `.fscene`/`.fsceneb` scene description format, human-readable as text and fast to load as binary, with prefabs and declarative components.
-* KTX2 compressed textures with full mip chains, `.fstex` texture builds, and HDR/EXR environment decoding.
+* KTX2 compressed textures with full mip chains, `.fstex` texture builds, standard ETC1S (Basis Universal) texture builds and transcoding, and HDR/EXR environment decoding.
 * Skinned meshes, morph targets, and a blended animation system with declarative per-clip playback control.
 * Hot reload for models, shaders, textures, environments, and scene documents.
 
@@ -327,6 +342,7 @@ Flutter Scene is pre-1.0 and evolving quickly. Minor releases can carry breaking
 * Physics through [`flutter_scene_rapier`](https://pub.dev/packages/flutter_scene_rapier) or [`flutter_scene_box3d`](https://pub.dev/packages/flutter_scene_box3d), both implementing the engine's shared physics contract.
 * Positional audio through [`flutter_scene_soloud`](https://pub.dev/packages/flutter_scene_soloud) or [`flutter_scene_fmod`](https://pub.dev/packages/flutter_scene_fmod).
 * Multiplayer through [`flutter_scene_net`](https://pub.dev/packages/flutter_scene_net), binding replicated state to scene nodes over [`dashwire`](https://pub.dev/packages/dashwire).
+* Rebindable input actions through [`flutter_scene_input`](https://pub.dev/packages/flutter_scene_input), covering keyboard, mouse, gamepads, and pointer lock.
 * The Flutter Scene Editor, a desktop scene-editing app with an MCP server for agent-driven editing, in development in this repository.
 
 ## Gallery
@@ -389,11 +405,18 @@ Impeller and Flutter GPU aren't available on the web, so `flutter_scene` ships a
 
 ## Sponsors
 
-Scene's development infrastructure is supported by:
+Scene's development is funded by its sponsors, listed in full at [fscene.dev/sponsors](https://fscene.dev/sponsors/). Anyone can sponsor through [GitHub Sponsors](https://github.com/sponsors/bdero), from $5 a month. Company tiers are at [fscene.dev/sponsors](https://fscene.dev/sponsors/).
 
-- [Codemagic](https://codemagic.io) - macOS CI on Apple silicon hardware
+### Silver
 
-Interested in supporting Scene's development? Reach out: x@bdero.me
+<a href="https://primio.dev"><picture><source media="(prefers-color-scheme: dark)" srcset="https://fscene.dev/sponsors/primio-on-dark.png"><img alt="Primio" src="https://fscene.dev/sponsors/primio-badge.png" height="64"></picture></a>
+
+### Infrastructure
+
+- [Codemagic](https://codemagic.io) (macOS CI on Apple silicon)
+- [Argos](https://argos-ci.com) (visual regression testing)
+
+To sponsor Scene, write to x@bdero.me.
 
 ## Repository
 
@@ -407,6 +430,7 @@ This repository is a [pub workspace](https://dart.dev/tools/pub/workspaces) cont
 | [`packages/flutter_scene_soloud`](https://github.com/bdero/flutter_scene/tree/master/packages/flutter_scene_soloud) | SoLoud audio backend. Published to pub.dev as [`flutter_scene_soloud`](https://pub.dev/packages/flutter_scene_soloud). |
 | [`packages/flutter_scene_fmod`](https://github.com/bdero/flutter_scene/tree/master/packages/flutter_scene_fmod) | FMOD Studio audio backend. Published to pub.dev as [`flutter_scene_fmod`](https://pub.dev/packages/flutter_scene_fmod). |
 | [`packages/flutter_scene_net`](https://github.com/bdero/flutter_scene/tree/master/packages/flutter_scene_net) | Multiplayer on [`dashwire`](https://pub.dev/packages/dashwire), binding replicated state to scene nodes with interpolated transforms and in-app hosting. Published to pub.dev as [`flutter_scene_net`](https://pub.dev/packages/flutter_scene_net). |
+| [`packages/flutter_scene_input`](https://github.com/bdero/flutter_scene/tree/master/packages/flutter_scene_input) | Rebindable input actions for keyboard, mouse, gamepads, and pointer lock, with contexts, rebinding, and scene drivers. Published to pub.dev as [`flutter_scene_input`](https://pub.dev/packages/flutter_scene_input). |
 | [`packages/scene`](https://github.com/bdero/flutter_scene/tree/master/packages/scene) | The engine-agnostic `.fscene` document core and the physics contract the backends implement. Published to pub.dev as [`scene`](https://pub.dev/packages/scene). |
 | [`packages/flutter_scene_codegen`](https://github.com/bdero/flutter_scene/tree/master/packages/flutter_scene_codegen) | Static extraction and code generation for annotated components. A development-time tool, not published. |
 | [`packages/flutter_scene_editor_core`](https://github.com/bdero/flutter_scene/tree/master/packages/flutter_scene_editor_core), [`packages/flutter_scene_editor`](https://github.com/bdero/flutter_scene/tree/master/packages/flutter_scene_editor), [`packages/flutter_scene_mcp`](https://github.com/bdero/flutter_scene/tree/master/packages/flutter_scene_mcp) | The Flutter Scene Editor stack (headless command core, Flutter UI, and MCP tool surface). Shipped as the desktop app under `apps/`, not as pub.dev libraries. In active development. |

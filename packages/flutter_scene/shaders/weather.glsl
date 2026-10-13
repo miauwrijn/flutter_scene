@@ -62,7 +62,11 @@ float WeatherTopAt(vec3 p) {
   vec2 st = vec2(dot(p, frag_info.weather_occ_s.xyz) + frag_info.weather_occ_s.w,
                  dot(p, frag_info.weather_occ_t.xyz) + frag_info.weather_occ_t.w);
   if (st.x < 0.0 || st.y < 0.0 || st.x > 1.0 || st.y > 1.0) return -1e9;
+#ifdef FLUTTER_SCENE_WEATHER_OCCLUSION
   vec4 e = texture(weather_occlusion, st);
+#else
+  vec4 e = vec4(0.0);  // no map in this variant: open sky
+#endif
   if (e.b < 0.5) return -1e9;
   return frag_info.weather_occ_range.x +
       (floor(e.r * 255.0 + 0.5) * 256.0 + floor(e.g * 255.0 + 0.5)) / 65535.0 *

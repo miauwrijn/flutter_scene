@@ -1,15 +1,24 @@
+import 'package:flutter_scene/src/render/depth_raster.dart';
 import 'package:flutter_scene/src/geometry/geometry.dart'
     show Geometry, bindUnskinnedFrameInfo;
+import 'package:flutter_scene/src/geometry/vertex_layout.dart'
+    show VertexLayoutDescriptor;
 import 'package:flutter_scene/src/gpu/gpu.dart' as gpu;
 import 'package:flutter_scene/src/light.dart' show ShadowCasterFaces;
+import 'package:flutter_scene/src/render/draw_recorder.dart';
 import 'package:flutter_scene/src/render/instance_batching.dart';
+import 'package:flutter_scene/src/fmat/fmat_ast.dart' show DepthSurfaceKind;
+import 'package:flutter_scene/src/mesh_draw.dart';
 import 'package:flutter_scene/src/render/instance_packing.dart';
+import 'package:flutter_scene/src/render/mesh_draw_selection.dart';
 import 'package:vector_math/vector_math.dart';
 
 import 'package:flutter_scene/src/render/render_scene.dart';
-import 'package:flutter_scene/src/scene_encoder.dart' show resolvePipeline;
+import 'package:flutter_scene/src/scene_encoder.dart'
+    show cachedRenderPipeline, drawOrRejectPipeline, tryResolvePipeline;
 import 'package:flutter_scene/src/shaders.dart';
 import 'package:flutter_scene/src/render/frame_transients.dart';
+import 'package:flutter_scene/src/material/vertex_attributes.dart';
 
 /// Which shadow casters a [ShadowEncoder] draws, keyed off
 /// `RenderItem.shadowStatic`. The shadow cache renders static casters into
@@ -55,12 +64,16 @@ class ShadowEncoder {
     ShadowCasterFaces casterFaces, {
     ShadowCasterFilter filter = ShadowCasterFilter.all,
     int casterChannelMask = 0xFF,
+    this.receiverPlanes = const [],
   }) : _filter = filter,
        _casterChannelMask = casterChannelMask {
     frustum = Frustum.matrix(_lightSpaceMatrix);
     _renderPass.setDepthWriteEnable(true);
     _renderPass.setColorBlendEnable(false);
     _renderPass.setDepthCompareOperation(gpu.CompareFunction.lessEqual);
+    // TODO(shadow-slope-bias): set a slope-scaled caster bias with
+    // RenderPass.setDepthBias once Flutter GPU has it, so grazing casters stop
+    // relying on the receiver's shadowNormalBias alone.
     // Cull the complement of the faces that should cast: rendering front faces
     // (the default) means culling back faces, and vice versa. With base CCW
     // winding (flipped per-item for mirrored casters below), back-face culling
@@ -92,6 +105,10 @@ class ShadowEncoder {
   // shader ignores it, so it is harmless for materials without a vertex stage.
   final Vector3 _cameraPosition;
 
+  // The forward handed to a surface depth fragment; a shadow pass has no
+  // view axis, and no cutout decision depends on it.
+  static final Vector3 _shadowForward = Vector3(0, -1, 0);
+
   static final gpu.Shader _depthShader =
       baseShaderLibrary['DepthOnlyFragment']!;
   static final gpu.Shader _maskedDepthShader =
@@ -108,6 +125,10 @@ class ShadowEncoder {
   /// Frustum of the light-space view-projection, used for per-item
   /// culling.
   late final Frustum frustum;
+
+  /// Extra planes rejecting casters that cannot shadow a visible receiver
+  /// (see `shadowReceiverCullingPlanes`), tested alongside [frustum].
+  final List<Plane> receiverPlanes;
 
   final Aabb3 _cullScratchAabb = Aabb3();
 
@@ -132,6 +153,8 @@ class ShadowEncoder {
     // reject before any virtual call.
     if (!shadowCasterAccepted(item, _filter, _casterChannelMask)) return;
     if (!item.material.isOpaque()) return;
+    // UI composited over the scene casts no shadow into it.
+    if (item.material.displayReferred) return;
     if (!alreadyCulled && item.frustumCulled) {
       final bounds = item.cullBounds;
       if (bounds != null) {
@@ -139,9 +162,22 @@ class ShadowEncoder {
           ..copyFrom(bounds)
           ..transform(item.worldTransform);
         if (!frustum.intersectsWithAabb3(_cullScratchAabb)) return;
+        for (final plane in receiverPlanes) {
+          if (_aabbOutsidePlane(_cullScratchAabb, plane)) return;
+        }
       }
     }
     _records.add(item);
+  }
+
+  // Matches the Bvh's plane test: outside when the corner farthest along the
+  // normal is below the plane.
+  static bool _aabbOutsidePlane(Aabb3 box, Plane plane) {
+    final n = plane.normal;
+    final x = n.x < 0 ? box.min.x : box.max.x;
+    final y = n.y < 0 ? box.min.y : box.max.y;
+    final z = n.z < 0 ? box.min.z : box.max.z;
+    return n.x * x + n.y * y + n.z * z + plane.constant < 0;
   }
 
   /// Emits the accepted casters, merging compatible spatial cells back into
@@ -173,6 +209,31 @@ class ShadowEncoder {
   }
 
   void _encode(RenderItem item, {List<InstanceDataBatch>? batches}) {
+    if (batches != null) {
+      _encodeBody(item, batches: batches);
+      return;
+    }
+    final geometry = item.geometry;
+    final selection = beginMeshDraw(
+      item,
+      geometry,
+      MeshDrawPass.shadow,
+      _cameraPosition,
+      false,
+    );
+    try {
+      if (selection.instanceCount == 0) return;
+      _encodeBody(item, instanceLimit: selection.instanceCount);
+    } finally {
+      endMeshDraw(geometry);
+    }
+  }
+
+  void _encodeBody(
+    RenderItem item, {
+    List<InstanceDataBatch>? batches,
+    int? instanceLimit,
+  }) {
     final geometry = item.geometry;
     // Skinned casters bind their joints texture through the full-vertex
     // path below; apply this item's skeleton to the (possibly shared)
@@ -184,14 +245,24 @@ class ShadowEncoder {
     // the position-only path. It also keeps the material's own culling, so the
     // faces that are visible are the faces that cast; the caster-face mode's
     // second-depth trick has no meaning for cutout sheets.
-    final masked = item.material.depthAlphaMasked;
-    final fragmentShader = masked ? _maskedDepthShader : _depthShader;
+    // A cutout `.fmat` casts through its own depth fragment, cut by its
+    // surface alpha; it culls like a masked caster.
+    // An explicitly configured mask wins over the automatic surface variant.
+    final surfaceShader = item.material.depthAlphaMasked
+        ? null
+        : item.material.depthSurfaceShader(DepthSurfaceKind.shadow);
+    final masked = surfaceShader != null || item.material.depthAlphaMasked;
+    final fragmentShader =
+        surfaceShader ?? (masked ? _maskedDepthShader : _depthShader);
     // A double-sided caster records every face regardless of the light's
     // caster-face mode or the material's culling, which is what closes the
-    // light leak through single-sided geometry.
-    final cullMode = item.shadowDoubleSided
+    // light leak through single-sided geometry. A double-sided material casts
+    // from both faces too: it has no inside for the caster-face mode to pick
+    // against, and culling one side of a card drops half of it from the map.
+    final materialCull = item.material.renderCullMode;
+    final cullMode = item.shadowDoubleSided || materialCull == gpu.CullMode.none
         ? gpu.CullMode.none
-        : (masked ? item.material.renderCullMode : _casterCullMode);
+        : (masked ? materialCull : _casterCullMode);
     if (cullMode != _currentCullMode) {
       _renderPass.setCullMode(cullMode);
       _currentCullMode = cullMode;
@@ -200,7 +271,10 @@ class ShadowEncoder {
     // skinned geometry falls back to its full vertex shader and bind.
     // A `vertex { }` material displaces geometry in the color pass, so run its
     // vertex variant here too or the shadow detaches from the visible surface.
-    final depthVertex = masked ? null : geometry.depthOnlyVertex;
+    final depthVertex =
+        masked || item.material.needsFullVertexForDepth(geometry)
+        ? null
+        : geometry.depthOnlyVertex;
     final materialVertex = item.material.materialVertexShader(
       depthVertex != null ? 'depth' : geometry.materialVertexVariant,
     );
@@ -213,61 +287,52 @@ class ShadowEncoder {
         ? item.material.instanceAttributes
         : null;
     final attributeFloats = instanceSchema?.floatCount ?? 0;
-    final pipeline = resolvePipeline(
-      activeVertex,
-      fragmentShader,
-      vertexLayout:
-          depthVertex?.layout ??
-          geometry.instancedVertexLayoutFor(instanceSchema),
-    );
+    // The full-vertex path supplies the custom attributes its vertex shader
+    // reads; the position-only path fetches none.
+    final attributes = depthVertex == null
+        ? item.material.vertexAttributesFor(materialVertex)
+        : VertexAttributeSchema.none;
+    geometry.useVertexAttributes(attributes);
+    // A caster whose pipeline cannot build skips its own draw rather than
+    // throwing out of the whole shadow pass.
+    final vertexLayout =
+        depthVertex?.layout ??
+        geometry.instancedVertexLayoutFor(instanceSchema, attributes);
+    final pipeline =
+        cachedRenderPipeline(activeVertex, fragmentShader, vertexLayout) ??
+        _resolvePipeline(activeVertex, fragmentShader, vertexLayout, geometry);
+    // A sliced warm-up builds this pipeline in a later slice.
+    if (pipeline == null) return;
     if (!identical(_boundPipeline, pipeline)) {
       _renderPass.clearBindings();
       _renderPass.bindPipeline(pipeline);
       _boundPipeline = pipeline;
     }
     _renderPass.setPrimitiveType(geometry.primitiveType);
+    activeDrawRecorder?.setContext(
+      DrawContext(
+        phase: DrawPhase.shadow,
+        item: item,
+        geometry: geometry,
+        material: item.material,
+        vertexShader: activeVertex,
+        fragmentShader: fragmentShader,
+        pipeline: pipeline,
+        batchedItems: batches?.length ?? 1,
+      ),
+    );
 
-    // Binds the vertex/index buffers and the per-frame uniform for one draw.
-    // The light-space matrix takes the place of the camera transform (the depth
-    // fragment shader ignores camera_position, but a material's Vertex() hook
-    // reads it, so the real camera position is bound).
-    void bindDraw(Matrix4 worldTransform) {
-      if (depthVertex != null) {
-        geometry.bindPositionStream(_renderPass);
-        bindUnskinnedFrameInfo(
-          _renderPass,
-          _transientsBuffer,
-          activeVertex,
-          _lightSpaceMatrix,
-          _cameraPosition,
-          depthBias: 0.0,
-        );
-      } else {
-        geometry.bind(
-          _renderPass,
-          _transientsBuffer,
-          worldTransform,
-          _lightSpaceMatrix,
-          _cameraPosition,
-          shaderOverride: materialVertex,
-          depthBias: 0.0,
-        );
-      }
-      if (materialVertex != null) {
-        item.material.bindVertexStage(
-          _renderPass,
-          materialVertex,
-          _transientsBuffer,
-        );
-      }
-      if (masked) {
-        item.material.bindDepthAlphaMask(
-          _renderPass,
-          fragmentShader,
-          _transientsBuffer,
-        );
-      }
-    }
+    // Shadow maps take no depth layers or tie-break offsets.
+    clearCurrentDrawDepthOffset();
+
+    _drawItem = item;
+    _drawGeometry = geometry;
+    _drawDepthPath = depthVertex != null;
+    _drawVertex = activeVertex;
+    _drawMaterialVertex = materialVertex;
+    _drawSurfaceShader = surfaceShader;
+    _drawMasked = masked;
+    _drawFragment = fragmentShader;
 
     // The instance-rate model transform sits in the slot after the bound
     // vertex streams: slot 1 on the position-only path, slot
@@ -276,7 +341,7 @@ class ShadowEncoder {
     final instanceSlot = depthVertex != null ? 1 : geometry.vertexStreamCount;
 
     if (batches != null) {
-      bindDraw(_identityTransform);
+      _bindDraw(_identityTransform);
       final PackedInstances packed = depthVertex == null
           ? packInstanceDataBatches(
               batches,
@@ -293,10 +358,17 @@ class ShadowEncoder {
 
     final instances = item.instanceTransforms;
     if (instances != null) {
+      final visible = limitInstanceIndices(
+        null,
+        instances.length,
+        instanceLimit,
+      );
       if (geometry.instancedVertexLayout == null) {
         // Skinned geometry has no instance-attribute path; loop.
-        for (final instanceTransform in instances) {
-          bindDraw(item.worldTransform * instanceTransform);
+        for (final instanceTransform in instances.take(
+          visible?.length ?? instances.length,
+        )) {
+          _bindDraw(item.worldTransform * instanceTransform);
           final flip =
               item.windingFlipped != (instanceTransform.determinant() < 0);
           _renderPass.setWindingOrder(
@@ -304,18 +376,44 @@ class ShadowEncoder {
                 ? gpu.WindingOrder.counterClockwise
                 : gpu.WindingOrder.clockwise,
           );
-          geometry.draw(_renderPass);
+          drawOrRejectPipeline(_renderPass, geometry, _boundPipeline);
         }
         return;
       }
-      bindDraw(item.worldTransform);
+      _bindDraw(item.worldTransform);
       final packedWorldData = item.instanceWorldData;
       final packedWinding = item.instanceWorldWindingFlipped;
+      if (depthVertex == null &&
+          packedWorldData != null &&
+          packedWinding != null &&
+          item.instanceAttributeFloats == attributeFloats) {
+        final flipped = bindRetainedInstanceData(
+          _renderPass,
+          packedWorldData,
+          packedWinding,
+          slot: instanceSlot,
+        );
+        if (flipped != null) {
+          _renderPass.setWindingOrder(
+            flipped
+                ? gpu.WindingOrder.counterClockwise
+                : gpu.WindingOrder.clockwise,
+          );
+          drawOrRejectPipeline(
+            _renderPass,
+            geometry,
+            _boundPipeline,
+            instanceCount: visible?.length ?? instances.length,
+          );
+          return;
+        }
+      }
       final cached = packedWorldData == null || packedWinding == null
           ? null
           : transientInstancePackingScratch.singleCachedBatch(
               packedWorldData: packedWorldData,
               packedWindingFlipped: packedWinding,
+              indices: visible,
               attributeFloats: item.instanceAttributeFloats,
             );
       final PackedInstances packed = depthVertex == null
@@ -326,6 +424,7 @@ class ShadowEncoder {
                     item.instanceColors!,
                     nodeWindingFlipped: item.windingFlipped,
                     instanceWindingFlipped: item.instanceWindingFlipped,
+                    indices: visible,
                     attributeData: item.instanceAttributeData,
                     attributeFloats: attributeFloats,
                     scratch: transientInstancePackingScratch,
@@ -341,6 +440,7 @@ class ShadowEncoder {
                     instances,
                     nodeWindingFlipped: item.windingFlipped,
                     instanceWindingFlipped: item.instanceWindingFlipped,
+                    indices: visible,
                     scratch: transientInstancePackingScratch,
                   )
                 : packInstanceTransformBatches(
@@ -352,7 +452,7 @@ class ShadowEncoder {
       return;
     }
 
-    bindDraw(item.worldTransform);
+    _bindDraw(item.worldTransform);
     // Skip the model-transform instance buffer for geometry that supplies its
     // own per-instance buffer (see the color encoder), or it clobbers the
     // stream slot.
@@ -380,10 +480,92 @@ class ShadowEncoder {
           ? gpu.WindingOrder.counterClockwise
           : gpu.WindingOrder.clockwise,
     );
-    geometry.draw(_renderPass);
+    drawOrRejectPipeline(_renderPass, geometry, _boundPipeline);
   }
 
   static final Matrix4 _identityTransform = Matrix4.identity();
+
+  // Per-draw state for [_bindDraw], set by the encode path. Fields rather
+  // than a local closure, which would allocate on every draw.
+  RenderItem? _drawItem;
+  Geometry? _drawGeometry;
+  bool _drawDepthPath = false;
+  gpu.Shader? _drawVertex;
+  gpu.Shader? _drawMaterialVertex;
+  gpu.Shader? _drawSurfaceShader;
+  bool _drawMasked = false;
+  gpu.Shader? _drawFragment;
+
+  // Binds the vertex/index buffers and the per-frame uniform for one draw.
+  // The light-space matrix takes the place of the camera transform (the depth
+  // fragment shader ignores camera_position, but a material's Vertex() hook
+  // reads it, so the real camera position is bound).
+  void _bindDraw(Matrix4 worldTransform) {
+    final item = _drawItem!;
+    final geometry = _drawGeometry!;
+    final activeVertex = _drawVertex!;
+    final materialVertex = _drawMaterialVertex;
+    final surfaceShader = _drawSurfaceShader;
+    final masked = _drawMasked;
+    final fragmentShader = _drawFragment!;
+    if (_drawDepthPath) {
+      geometry.bindPositionStream(_renderPass);
+      bindUnskinnedFrameInfo(
+        _renderPass,
+        _transientsBuffer,
+        activeVertex,
+        _lightSpaceMatrix,
+        _cameraPosition,
+        depthBias: 0.0,
+      );
+    } else {
+      geometry.bind(
+        _renderPass,
+        _transientsBuffer,
+        worldTransform,
+        _lightSpaceMatrix,
+        _cameraPosition,
+        shaderOverride: materialVertex,
+        depthBias: 0.0,
+      );
+    }
+    if (materialVertex != null) {
+      item.material.bindVertexStage(
+        _renderPass,
+        materialVertex,
+        _transientsBuffer,
+      );
+    }
+    if (surfaceShader != null) {
+      item.material.bindDepthSurface(
+        _renderPass,
+        fragmentShader,
+        _transientsBuffer,
+        cameraPosition: _cameraPosition,
+        cameraForward: _shadowForward,
+      );
+    } else if (masked) {
+      item.material.bindDepthAlphaMask(
+        _renderPass,
+        fragmentShader,
+        _transientsBuffer,
+      );
+    }
+  }
+
+  // The pipeline-cache miss path. Its debug closure lives here so the
+  // per-draw path does not allocate a capture context.
+  gpu.RenderPipeline? _resolvePipeline(
+    gpu.Shader vertexShader,
+    gpu.Shader fragmentShader,
+    VertexLayoutDescriptor? vertexLayout,
+    Geometry geometry,
+  ) => tryResolvePipeline(
+    vertexShader,
+    fragmentShader,
+    vertexLayout: vertexLayout,
+    debugContext: () => 'shadow caster ${geometry.runtimeType}',
+  );
 
   void _drawPacked(
     Geometry geometry,
@@ -398,7 +580,12 @@ class ShadowEncoder {
         bindInstanceTransforms(_renderPass, packed.ccw, slot: instanceSlot);
       }
       _renderPass.setWindingOrder(gpu.WindingOrder.clockwise);
-      geometry.draw(_renderPass, instanceCount: packed.ccwCount);
+      drawOrRejectPipeline(
+        _renderPass,
+        geometry,
+        _boundPipeline,
+        instanceCount: packed.ccwCount,
+      );
     }
     if (packed.cwCount > 0) {
       if (withColor) {
@@ -407,7 +594,12 @@ class ShadowEncoder {
         bindInstanceTransforms(_renderPass, packed.cw, slot: instanceSlot);
       }
       _renderPass.setWindingOrder(gpu.WindingOrder.counterClockwise);
-      geometry.draw(_renderPass, instanceCount: packed.cwCount);
+      drawOrRejectPipeline(
+        _renderPass,
+        geometry,
+        _boundPipeline,
+        instanceCount: packed.cwCount,
+      );
     }
   }
 }

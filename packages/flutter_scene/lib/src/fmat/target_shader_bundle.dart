@@ -10,6 +10,9 @@ import '../generated_assets/engine_identity.dart';
 import '../generated_assets/generated_assets.dart';
 import '../generated_assets/generated_file_names.dart';
 import '../generated_assets/generated_tree.dart';
+import '../generated_assets/tint_binary.dart' show kTintReleaseTag;
+import '../generated_assets/wgsl_sidecar.dart';
+import '../gpu/shared/sidecar_hash.dart';
 import '../gpu/web/shader_bundle_generated.dart' as fb;
 import '../importer/build_cache.dart' show buildCacheRevision;
 import 'framework_shaders.dart';
@@ -55,9 +58,6 @@ enum TargetShaderBundleAssetMode {
 /// belongs to when the app's hook builds a dependency's shaders.
 ///
 /// [pruneGeneratedTree] drops a tree copy the data-asset registration replaces.
-/// flutter_scene's own hook turns that off: one build runs it several times
-/// with different asset types, so its tree copy is the fallback for the runs
-/// that have no data assets, not a leftover.
 Future<void> buildTargetShaderBundleJson({
   required BuildInput buildInput,
   required BuildOutputBuilder buildOutput,
@@ -110,11 +110,24 @@ Future<void> buildTargetShaderBundleJson({
     glesLanguageVersion: glesLanguageVersion,
   );
   final output = File.fromUri(result.outputFile);
-  final bytes = trimShaderBundle(
-    output.readAsBytesSync(),
-    shaderBundleBackendsForBuild(buildInput),
-  );
+  final untrimmed = output.readAsBytesSync();
+  final backends = shaderBundleBackendsForBuild(buildInput);
+  final bytes = trimShaderBundle(untrimmed, backends);
   output.writeAsBytesSync(bytes);
+  // Translated before trimming, since a web build keeps no Vulkan SPIR-V.
+  final wgsl = File(wgslSidecarPathFor(output.path));
+  if (wgslSidecarsForBuild(buildInput)) {
+    final translator = await TintProcessTranslator.resolve(buildInput);
+    wgsl.writeAsStringSync(
+      await buildWgslSidecar(
+        untrimmed,
+        translator,
+        shippedBundleHash: sidecarBundleHash(bytes),
+      ),
+    );
+  } else if (wgsl.existsSync()) {
+    wgsl.deleteSync();
+  }
 
   if (!copyToGeneratedTree) return;
 
@@ -154,16 +167,40 @@ Future<void> buildTargetShaderBundleJson({
     target: target,
   );
   writeGeneratedBytes(copyUri, bytes);
-  tree
-    ..recordFile(
-      family: GeneratedAssetFamily.shaderBundle,
+  tree.recordFile(
+    family: GeneratedAssetFamily.shaderBundle,
+    id: id,
+    uri: copyUri,
+    stamp: stamp ?? fnv1aHex(bytes),
+    owner: owner,
+    target: target,
+  );
+  if (!wgsl.existsSync()) {
+    tree.drop(GeneratedAssetFamily.wgsl, id, target: target);
+  } else {
+    final wgslUri = Uri.file(wgslSidecarPathFor(copyUri.toFilePath()));
+    writeGeneratedBytes(wgslUri, wgsl.readAsBytesSync());
+    tree.recordFile(
+      family: GeneratedAssetFamily.wgsl,
       id: id,
-      uri: copyUri,
+      uri: wgslUri,
       stamp: stamp ?? fnv1aHex(bytes),
       owner: owner,
       target: target,
-    )
-    ..save();
+    );
+  }
+  tree.save();
+}
+
+/// Whether [buildInput] writes WGSL sidecars: the WebGPU opt-in is on and the
+/// target takes the GLES-only set, the one the web, their only reader, loads.
+/// Every check for an expected sidecar goes through here, so a build that
+/// never writes one does not count it missing and recompile.
+bool wgslSidecarsForBuild(BuildInput buildInput) {
+  if (!webGpuShadersRequested(buildInput)) return false;
+  final backends = shaderBundleBackendsForBuild(buildInput);
+  return backends.length == 1 &&
+      backends.contains(ShaderBundleBackend.openglEs);
 }
 
 /// Returns the backend set needed by [buildInput].
@@ -173,15 +210,17 @@ Future<void> buildTargetShaderBundleJson({
 /// resolve to GLES, so the native one must never overwrite the target build's
 /// outputs; [shaderBundleTargetKey] is what keeps them apart in the tree.
 ///
-/// That native data-only pass still compiles and ships a GLES set no native app
-/// loads, roughly 1.5 MB. It cannot be dropped here. Its hook input is
-/// byte-identical to a real web build's (both just `data_assets/data`, no code
-/// config, no target OS), and web genuinely needs the GLES set, so nothing the
-/// hook can read tells the wasteful native pass from the required web one. The
-/// invoker knows the target platform but never puts it on a data-asset-only
-/// input. `generated_target_isolation_test.dart` locks that indistinguishability.
+/// That native data-only pass still compiles a GLES set no native app loads. A
+/// tree that lists its target directories (flutter_scene's own does) puts it in
+/// the web-only directory, so a native app does not ship it, but the compile
+/// cannot be dropped here. Its hook input is byte-identical to a real web
+/// build's (both just `data_assets/data`, no code config, no target OS), and
+/// web genuinely needs the GLES set, so nothing the hook can read tells the
+/// wasteful native pass from the required web one. The invoker knows the target
+/// platform but never puts it on a data-asset-only input.
+/// `generated_target_isolation_test.dart` locks that indistinguishability.
 ///
-/// TODO(hook-target-invocations): dropping the waste needs an upstream change,
+/// TODO(hook-target-invocations): dropping the compile needs an upstream change,
 /// the invoker naming the target platform (or final artifact) on data-asset-only
 /// inputs, or flutter_tools not making the redundant native data pass. Revisit
 /// if a Flutter release adds such a field.
@@ -225,10 +264,12 @@ String? _targetOSName(BuildInput buildInput) {
 ///
 /// The engine belongs in the stamp because a shader bundle is only valid for
 /// the engine that consumes it, so switching Flutter versions must recompile
-/// even when every shader source is untouched. [what] names the bundle.
+/// even when every shader source is untouched. [what] names the bundle. The
+/// WGSL switch is in it too, so turning `flutter_scene_webgpu` on recompiles.
 Future<String> shaderBundleStamp(BuildInput buildInput, String what) async =>
     'rev=$buildCacheRevision $what target=${shaderBundleTargetKey(buildInput)} '
-    '${await engineIdentity()}';
+    '${await engineIdentity()}'
+    '${wgslSidecarsForBuild(buildInput) ? ' wgsl=$kTintReleaseTag' : ''}';
 
 /// Stable build-cache key for the selected shader backends. Recorded on every
 /// output that is only valid for them, and matched against

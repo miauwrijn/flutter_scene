@@ -1,5 +1,7 @@
 import 'package:flutter_scene/src/geometry/geometry.dart';
 import 'package:flutter_scene/src/material/material.dart';
+import 'package:flutter_scene/src/render/mesh_draw_selection.dart';
+import 'package:flutter_scene/src/render/draw_recorder.dart';
 import 'package:flutter_scene/src/render/instance_packing.dart';
 import 'package:flutter_scene/src/render/render_scene.dart';
 
@@ -13,9 +15,19 @@ abstract interface class OpaqueBatchRecord {
   int get lightChannelMask;
   Object? get jointsTexture;
   Object? get morphWeights;
+
+  /// Whether the item picks its instances or index range per draw.
+  bool get hasDrawSelector;
 }
 
-int opaqueBatchEnd(List<OpaqueBatchRecord> records, int start) {
+/// The end of the batch starting at [start]. Under [froxelLighting] each
+/// fragment reads its lights from the view's froxel grid, so the items' own
+/// light lists do not split batches.
+int opaqueBatchEnd(
+  List<OpaqueBatchRecord> records,
+  int start, {
+  bool froxelLighting = false,
+}) {
   final first = records[start];
   // Skinned and morphed items carry per-item state (skeleton, weights)
   // bound outside the instance buffer, so they draw unbatched. Batching also
@@ -27,33 +39,85 @@ int opaqueBatchEnd(List<OpaqueBatchRecord> records, int start) {
   if (first.geometry.instancedVertexLayout == null ||
       first.jointsTexture != null ||
       first.morphWeights != null ||
-      first.material.instanceAttributes != null) {
+      first.material.instanceAttributes != null ||
+      first.hasDrawSelector) {
     return start + 1;
   }
   var end = start + 1;
-  while (end < records.length && _canBatchOpaque(first, records[end])) {
+  while (end < records.length &&
+      _canBatchOpaque(first, records[end], froxelLighting)) {
     end++;
   }
   return end;
 }
 
-bool _canBatchOpaque(OpaqueBatchRecord first, OpaqueBatchRecord next) {
+bool _canBatchOpaque(
+  OpaqueBatchRecord first,
+  OpaqueBatchRecord next,
+  bool froxelLighting,
+) {
   return identical(first.pipeline, next.pipeline) &&
       identical(first.geometry, next.geometry) &&
       identical(first.material, next.material) &&
       first.fade == next.fade &&
-      first.lightListOffset == next.lightListOffset &&
-      first.lightListCount == next.lightListCount &&
+      (froxelLighting ||
+          (first.lightListOffset == next.lightListOffset &&
+              first.lightListCount == next.lightListCount)) &&
       first.lightChannelMask == next.lightChannelMask &&
       next.jointsTexture == null &&
-      next.morphWeights == null;
+      next.morphWeights == null &&
+      !next.hasDrawSelector;
+}
+
+/// Why [first] does not merge with [next], mirroring [opaqueBatchEnd]'s
+/// rules in the order they are checked. Capture-only; the hot path never
+/// asks.
+BatchBreakReason opaqueBatchBreakReason(
+  OpaqueBatchRecord first,
+  OpaqueBatchRecord? next, {
+  bool froxelLighting = false,
+}) {
+  if (first.geometry.instancedVertexLayout == null) {
+    return BatchBreakReason.unbatchableGeometry;
+  }
+  if (first.jointsTexture != null) return BatchBreakReason.skinned;
+  if (first.morphWeights != null) return BatchBreakReason.morphed;
+  if (first.material.instanceAttributes != null) {
+    return BatchBreakReason.instanceAttributes;
+  }
+  if (first.hasDrawSelector) return BatchBreakReason.drawSelector;
+  if (next == null) return BatchBreakReason.none;
+  if (!identical(first.pipeline, next.pipeline)) {
+    return BatchBreakReason.differentPipeline;
+  }
+  if (!identical(first.geometry, next.geometry)) {
+    return BatchBreakReason.differentGeometry;
+  }
+  if (!identical(first.material, next.material)) {
+    return BatchBreakReason.differentMaterial;
+  }
+  if (first.fade != next.fade) return BatchBreakReason.differentLodFade;
+  if (!froxelLighting &&
+      (first.lightListOffset != next.lightListOffset ||
+          first.lightListCount != next.lightListCount)) {
+    return BatchBreakReason.differentLights;
+  }
+  if (first.lightChannelMask != next.lightChannelMask) {
+    return BatchBreakReason.differentLightChannels;
+  }
+  if (next.jointsTexture != null || next.morphWeights != null) {
+    return BatchBreakReason.nextSkinnedOrMorphed;
+  }
+  if (next.hasDrawSelector) return BatchBreakReason.drawSelector;
+  return BatchBreakReason.none;
 }
 
 int depthBatchEnd(List<RenderItem> records, int start) {
   final first = records[start];
   if (first.geometry.instancedVertexLayout == null ||
       first.jointsTexture != null ||
-      first.morphWeights != null) {
+      first.morphWeights != null ||
+      hasMeshDrawSelector(first)) {
     return start + 1;
   }
   var end = start + 1;
@@ -62,7 +126,8 @@ int depthBatchEnd(List<RenderItem> records, int start) {
     if (!identical(first.geometry, next.geometry) ||
         !identical(first.material, next.material) ||
         next.jointsTexture != null ||
-        next.morphWeights != null) {
+        next.morphWeights != null ||
+        hasMeshDrawSelector(next)) {
       break;
     }
     end++;

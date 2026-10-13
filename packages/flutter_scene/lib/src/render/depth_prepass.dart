@@ -1,8 +1,17 @@
 import 'dart:typed_data';
 import 'dart:math' as math;
+
+import 'package:flutter_scene/src/render/viewport_camera.dart';
+import 'package:flutter_scene/src/render/depth_raster.dart';
+import 'package:flutter_scene/src/fmat/fmat_ast.dart' show DepthSurfaceKind;
+import 'package:flutter_scene/src/mesh_draw.dart';
 import 'package:flutter_scene/src/render/instance_packing.dart';
+import 'package:flutter_scene/src/render/mesh_draw_selection.dart';
+
 import 'dart:ui' as ui;
 
+import 'package:flutter_scene/src/geometry/vertex_layout.dart'
+    show VertexLayoutDescriptor;
 import 'package:flutter_scene/src/gpu/gpu.dart' as gpu;
 import 'package:vector_math/vector_math.dart';
 
@@ -10,13 +19,17 @@ import 'package:flutter_scene/src/camera.dart';
 import 'package:flutter_scene/src/geometry/geometry.dart'
     show Geometry, bindUnskinnedFrameInfo;
 import 'package:flutter_scene/src/material/material.dart' show Material;
+import 'package:flutter_scene/src/render/draw_recorder.dart';
 import 'package:flutter_scene/src/render/render_graph.dart';
 import 'package:flutter_scene/src/render/render_layers.dart';
 import 'package:flutter_scene/src/render/render_scene.dart';
-import 'package:flutter_scene/src/scene_encoder.dart' show resolvePipeline;
+import 'package:flutter_scene/src/scene_encoder.dart'
+    show cachedRenderPipeline, drawOrRejectPipeline, tryResolvePipeline;
 import 'package:flutter_scene/src/shaders.dart';
 import 'package:flutter_scene/src/render/frame_transients.dart';
 import 'package:flutter_scene/src/render/instance_batching.dart';
+import 'package:flutter_scene/src/material/vertex_attributes.dart';
+import 'package:flutter_scene/src/render/uniform_slots.dart';
 
 /// Render-graph blackboard key under which [DepthPrepass] publishes the
 /// camera linear-depth texture: planar view-space depth (world units) in
@@ -28,6 +41,9 @@ const String kLinearDepthBlackboardKey = 'linear_depth';
 /// `keepDepthStencil`. [TranslucentDepthPatchPass] loads it to depth-test
 /// translucent surfaces against the opaque scene.
 const String kPrepassDepthStencilBlackboardKey = 'prepass_depth_stencil';
+
+/// Render-graph blackboard key for [TranslucentSurfacePass]'s target.
+const String kTranslucentSurfaceBlackboardKey = 'translucent_surface';
 
 /// Renders the opaque scene's depth from the camera into a linear-depth
 /// color target and publishes it on the render-graph blackboard.
@@ -55,7 +71,9 @@ class DepthPrepass extends RenderGraphPass {
     Vector3? cameraUp,
     List<Plane> cullingPlanes = const [],
     Matrix4? cameraTransform,
-  }) : _camera = camera,
+    bool primaryView = false,
+  }) : _primaryView = primaryView,
+       _camera = camera,
        _renderScene = renderScene,
        _dimensions = dimensions,
        _cameraForward = cameraForward,
@@ -69,6 +87,7 @@ class DepthPrepass extends RenderGraphPass {
        _cameraTransform = cameraTransform;
 
   final Matrix4? _cameraTransform;
+  final bool _primaryView;
 
   final Camera _camera;
   final RenderScene _renderScene;
@@ -113,6 +132,9 @@ class DepthPrepass extends RenderGraphPass {
         height: height,
         format: gpu.PixelFormat.r32g32b32a32Float,
         debugName: 'linear_depth',
+        // The kept and transient depth attachments below are different
+        // textures, so the color target gets a ring per setup.
+        attachmentKey: _keepDepthStencil ? 'depth_stored' : 'depth_transient',
       ),
     );
     // A kept depth-stencil cannot live in transient tile memory (storing a
@@ -123,14 +145,14 @@ class DepthPrepass extends RenderGraphPass {
           ? TransientTextureDescriptor(
               width: width,
               height: height,
-              format: gpu.gpuContext.defaultDepthStencilFormat,
+              format: depthRasterOf(_camera).depthStencilFormat,
               enableShaderReadUsage: false,
               debugName: 'depth_prepass_depth',
             )
           : TransientTextureDescriptor.depth(
               width: width,
               height: height,
-              format: gpu.gpuContext.defaultDepthStencilFormat,
+              format: depthRasterOf(_camera).depthStencilFormat,
               debugName: 'depth_prepass_depth',
             ),
     );
@@ -143,7 +165,7 @@ class DepthPrepass extends RenderGraphPass {
       ),
       depthStencilAttachment: gpu.DepthStencilAttachment(
         texture: depth,
-        depthClearValue: 1.0,
+        depthClearValue: depthRasterOf(_camera).clearDepth,
         depthStoreAction: _keepDepthStencil
             ? gpu.StoreAction.store
             : gpu.StoreAction.dontCare,
@@ -155,7 +177,9 @@ class DepthPrepass extends RenderGraphPass {
     final encoder = _DepthPrepassEncoder(
       renderPass,
       context.transientsBuffer,
-      _cameraTransform ?? _camera.getViewTransform(_dimensions),
+      _cameraTransform ?? rasterViewTransformOf(_camera, _dimensions),
+      cullingFrustumOf(_camera, _dimensions),
+      depthRasterOf(_camera),
       _camera.position,
       _cameraForward,
       _layerMask,
@@ -163,6 +187,7 @@ class DepthPrepass extends RenderGraphPass {
       writeNormals: _writeNormals,
       cameraRight: _cameraRight,
       cameraUp: _cameraUp,
+      primaryView: _primaryView,
     );
     _renderScene.cull(
       encoder.frustum,
@@ -185,8 +210,10 @@ class DepthPrepass extends RenderGraphPass {
 /// field).
 ///
 /// Draws items whose material is translucent but declares
-/// [Material.translucentDepthWrite] (fmat `depth_write: true`, or a
-/// transmissive [PhysicallyBasedMaterial]), depth-tested against the opaque
+/// [Material.translucentEffectsDepth] (fmat `depth_write: true` or
+/// `effects_depth: true`, or a transmissive [PhysicallyBasedMaterial]), cut
+/// by the material's own alpha where it supplies a depth fragment,
+/// depth-tested against the opaque
 /// scene through the prepass depth-stencil. Without this, depth of field
 /// reads the backdrop's depth at a glass surface's pixels and smears the
 /// backdrop's blur across it. Content seen through the surface inherits the
@@ -198,11 +225,11 @@ class DepthPrepass extends RenderGraphPass {
 /// qualifies. The patch overwrites the target's green/blue/alpha channels
 /// (view-space normals when reflections requested them), so it runs after
 /// the built-in consumers of those channels (ambient occlusion,
-/// reflections). Custom render passes at the later stages read the same
-/// blackboard texture and therefore see patched depth and normals at
-/// depth-writing translucent pixels; that is the visible-surface semantics
-/// depth of field wants, and the accepted tradeoff for any pass wanting
-/// opaque-only geometry.
+/// reflections). Custom render passes from [RenderStage.afterScene] on read
+/// the same blackboard texture and therefore see patched depth and normals
+/// at depth-writing translucent pixels; that is the visible-surface
+/// semantics depth of field and depth-fogging passes want, and the accepted
+/// tradeoff for any pass wanting opaque-only geometry.
 class TranslucentDepthPatchPass extends RenderGraphPass {
   TranslucentDepthPatchPass({
     required Camera camera,
@@ -210,23 +237,28 @@ class TranslucentDepthPatchPass extends RenderGraphPass {
     required Vector3 cameraForward,
     int layerMask = kRenderLayerAll,
     List<Plane> cullingPlanes = const [],
+    bool primaryView = false,
   }) : _camera = camera,
        _renderScene = renderScene,
        _cameraForward = cameraForward,
        _layerMask = layerMask,
-       _cullingPlanes = cullingPlanes;
+       _cullingPlanes = cullingPlanes,
+       _primaryView = primaryView;
 
   final Camera _camera;
   final RenderScene _renderScene;
   final Vector3 _cameraForward;
   final int _layerMask;
   final List<Plane> _cullingPlanes;
+  // Whether this is a screen view, for mesh draw selectors, so the patch
+  // draws what the color pass drew.
+  final bool _primaryView;
 
   @override
   String get name => 'TranslucentDepthPatchPass';
 
   static bool _qualifies(RenderItem item) =>
-      !item.material.isOpaque() && item.material.translucentDepthWrite;
+      !item.material.isOpaque() && item.material.translucentEffectsDepth;
 
   @override
   void execute(RenderGraphContext context) {
@@ -244,8 +276,7 @@ class TranslucentDepthPatchPass extends RenderGraphPass {
       linearDepth.width.toDouble(),
       linearDepth.height.toDouble(),
     );
-    final viewTransform = _camera.getViewTransform(dimensions);
-    final frustum = Frustum.matrix(viewTransform);
+    final frustum = cullingFrustumOf(_camera, dimensions);
     final records = <RenderItem>[];
     _renderScene.cull(frustum, (item) {
       if (!item.drawsColor) return;
@@ -271,7 +302,9 @@ class TranslucentDepthPatchPass extends RenderGraphPass {
     final encoder = _DepthPrepassEncoder(
       renderPass,
       context.transientsBuffer,
-      viewTransform,
+      rasterViewTransformOf(_camera, dimensions),
+      frustum,
+      depthRasterOf(_camera),
       _camera.position,
       _cameraForward,
       _layerMask,
@@ -280,12 +313,132 @@ class TranslucentDepthPatchPass extends RenderGraphPass {
       cameraRight: Vector3.zero(),
       cameraUp: Vector3.zero(),
       translucentPatch: true,
+      primaryView: _primaryView,
     );
     for (final item in records) {
       encoder.submit(item);
     }
     encoder.flush();
     rendererSubmissions.submit(commandBuffer);
+  }
+}
+
+/// The nearest translucent depth-carrying surface (glass) in front of the
+/// opaque scene, into a target of its own: planar depth, octahedral
+/// view-space normal and roughness, as [DepthPrepass] writes them with
+/// normals, and the far plane where nothing translucent is in view.
+///
+/// Unlike [TranslucentDepthPatchPass] it leaves the scene's linear depth
+/// alone: reflections, occlusion and the like keep reading the opaque scene
+/// (what is seen through the pane), and an effect that wants the pane
+/// itself — its reflection — reads this. Depth-tested against the opaque
+/// scene through the prepass depth-stencil, which it needs kept.
+class TranslucentSurfacePass extends RenderGraphPass {
+  TranslucentSurfacePass({
+    required Camera camera,
+    required RenderScene renderScene,
+    required Vector3 cameraForward,
+    required Vector3 cameraRight,
+    required Vector3 cameraUp,
+    required double farDepth,
+    int layerMask = kRenderLayerAll,
+    List<Plane> cullingPlanes = const [],
+    Matrix4? cameraTransform,
+    bool primaryView = false,
+  }) : _camera = camera,
+       _renderScene = renderScene,
+       _cameraForward = cameraForward,
+       _cameraRight = cameraRight,
+       _cameraUp = cameraUp,
+       _farDepth = farDepth,
+       _layerMask = layerMask,
+       _cullingPlanes = cullingPlanes,
+       _cameraTransform = cameraTransform,
+       _primaryView = primaryView;
+
+  final Camera _camera;
+  final RenderScene _renderScene;
+  final Vector3 _cameraForward, _cameraRight, _cameraUp;
+  final double _farDepth;
+  final int _layerMask;
+  final List<Plane> _cullingPlanes;
+  // The prepass's view-projection (jittered under TAA), so the depth test
+  // against its depth-stencil lines up texel for texel.
+  final Matrix4? _cameraTransform;
+  final bool _primaryView;
+
+  @override
+  String get name => 'TranslucentSurfacePass';
+
+  @override
+  void execute(RenderGraphContext context) {
+    final linearDepth = context.blackboard.get<gpu.Texture>(
+      kLinearDepthBlackboardKey,
+    );
+    final depthStencil = context.blackboard.get<gpu.Texture>(
+      kPrepassDepthStencilBlackboardKey,
+    );
+    if (linearDepth == null || depthStencil == null) return;
+    final dimensions = ui.Size(
+      linearDepth.width.toDouble(),
+      linearDepth.height.toDouble(),
+    );
+    final frustum = cullingFrustumOf(_camera, dimensions);
+    final records = <RenderItem>[];
+    _renderScene.cull(frustum, (item) {
+      if (!item.drawsColor) return;
+      if ((item.layers & _layerMask) == 0) return;
+      if (!TranslucentDepthPatchPass._qualifies(item)) return;
+      if (!item.cullVisibleInstances(frustum, _cullingPlanes)) return;
+      records.add(item);
+    }, additionalPlanes: _cullingPlanes);
+    // No pane in view: nothing to publish, and consumers skip their work.
+    if (records.isEmpty) return;
+
+    final surface = context.texturePool.acquire(
+      TransientTextureDescriptor.color(
+        width: linearDepth.width,
+        height: linearDepth.height,
+        format: linearDepth.format,
+        debugName: 'translucent_surface',
+      ),
+    );
+    final target = gpu.RenderTarget.singleColor(
+      gpu.ColorAttachment(
+        texture: surface,
+        clearValue: Vector4(_farDepth, 0.0, 0.0, 1.0),
+      ),
+      depthStencilAttachment: gpu.DepthStencilAttachment(
+        texture: depthStencil,
+        depthLoadAction: gpu.LoadAction.load,
+        // Kept: the translucent depth patch tests against it later.
+        depthStoreAction: gpu.StoreAction.store,
+      ),
+    );
+    final commandBuffer = gpu.gpuContext.createCommandBuffer();
+    final renderPass = commandBuffer.createRenderPass(target);
+    final encoder = _DepthPrepassEncoder(
+      renderPass,
+      context.transientsBuffer,
+      _cameraTransform ?? rasterViewTransformOf(_camera, dimensions),
+      frustum,
+      depthRasterOf(_camera),
+      _camera.position,
+      _cameraForward,
+      _layerMask,
+      _cullingPlanes,
+      writeNormals: true,
+      cameraRight: _cameraRight,
+      cameraUp: _cameraUp,
+      translucentPatch: true,
+      primaryView: _primaryView,
+    );
+    for (final item in records) {
+      encoder.submit(item);
+    }
+    encoder.flush();
+    rendererSubmissions.submit(commandBuffer);
+    context.blackboard.set(kTranslucentSurfaceBlackboardKey, surface);
   }
 }
 
@@ -301,20 +454,23 @@ class _DepthPrepassEncoder {
     this._renderPass,
     this._transientsBuffer,
     this._cameraTransform,
+    this.frustum,
+    this._raster,
     this._cameraPosition,
-    Vector3 cameraForward,
+    this._cameraForward,
     this._layerMask,
     this._cullingPlanes, {
     required bool writeNormals,
     required Vector3 cameraRight,
     required Vector3 cameraUp,
     bool translucentPatch = false,
+    bool primaryView = false,
   }) : _writeNormals = writeNormals,
-       _translucentPatch = translucentPatch {
-    frustum = Frustum.matrix(_cameraTransform);
+       _translucentPatch = translucentPatch,
+       _primaryView = primaryView {
     _renderPass.setDepthWriteEnable(true);
     _renderPass.setColorBlendEnable(false);
-    _renderPass.setDepthCompareOperation(gpu.CompareFunction.lessEqual);
+    _renderPass.setDepthCompareOperation(_raster.nearerOrEqual);
     // Winding and culling are matched to each material per draw in [submit]
     // (winding follows the node/instance parity, culling follows the material's
     // own mode), so the same faces the color pass draws contribute depth.
@@ -325,9 +481,9 @@ class _DepthPrepassEncoder {
     // normal into view space; the depth-only path uses just forward.
     if (writeNormals) {
       _depthInfo = Float32List(20)
-        ..[0] = cameraForward.x
-        ..[1] = cameraForward.y
-        ..[2] = cameraForward.z
+        ..[0] = _cameraForward.x
+        ..[1] = _cameraForward.y
+        ..[2] = _cameraForward.z
         ..[4] = cameraRight.x
         ..[5] = cameraRight.y
         ..[6] = cameraRight.z
@@ -336,19 +492,25 @@ class _DepthPrepassEncoder {
         ..[10] = cameraUp.z;
     } else {
       _depthInfo = Float32List(4)
-        ..[0] = cameraForward.x
-        ..[1] = cameraForward.y
-        ..[2] = cameraForward.z;
+        ..[0] = _cameraForward.x
+        ..[1] = _cameraForward.y
+        ..[2] = _cameraForward.z;
     }
   }
 
   final gpu.RenderPass _renderPass;
   final TransientWriter _transientsBuffer;
+  // The view-projection draws rasterize with (see DepthRaster).
   final Matrix4 _cameraTransform;
+  final DepthRaster _raster;
   final Vector3 _cameraPosition;
+  final Vector3 _cameraForward;
   final int _layerMask;
   final List<Plane> _cullingPlanes;
   final bool _writeNormals;
+
+  // Whether this encodes a screen view's camera, for [MeshDrawSelector]s.
+  final bool _primaryView;
 
   // Flips the item filter from the prepass's opaque set to the translucent
   // depth-carrying set drawn by [TranslucentDepthPatchPass].
@@ -380,7 +542,7 @@ class _DepthPrepassEncoder {
   String get _infoBlockName => _writeNormals ? 'DepthNormalInfo' : 'DepthInfo';
 
   /// Frustum of the camera view-projection, used for per-item culling.
-  late final Frustum frustum;
+  final Frustum frustum;
 
   /// The pipeline currently bound on the render pass, or null before the
   /// first draw. `clearBindings` leaves the pipeline in place, so
@@ -398,7 +560,7 @@ class _DepthPrepassEncoder {
     if (!item.drawsColor) return;
     if ((item.layers & _layerMask) == 0) return;
     if (_translucentPatch
-        ? (item.material.isOpaque() || !item.material.translucentDepthWrite)
+        ? (item.material.isOpaque() || !item.material.translucentEffectsDepth)
         : !item.material.depthPrepassParticipates) {
       return;
     }
@@ -434,6 +596,31 @@ class _DepthPrepassEncoder {
   }
 
   void _encode(RenderItem item, {List<InstanceDataBatch>? batches}) {
+    if (batches != null) {
+      _encodeBody(item, batches: batches);
+      return;
+    }
+    final geometry = item.geometry;
+    final selection = beginMeshDraw(
+      item,
+      geometry,
+      MeshDrawPass.depth,
+      _cameraPosition,
+      _primaryView,
+    );
+    try {
+      if (selection.instanceCount == 0) return;
+      _encodeBody(item, instanceLimit: selection.instanceCount);
+    } finally {
+      endMeshDraw(geometry);
+    }
+  }
+
+  void _encodeBody(
+    RenderItem item, {
+    List<InstanceDataBatch>? batches,
+    int? instanceLimit,
+  }) {
     // Cull the same faces as the color pass; a double-sided (culling: none)
     // material must stay double-sided here, or its camera-facing back faces are
     // absent from the prepass and SSAO/SSR read the farther surface behind them.
@@ -443,16 +630,28 @@ class _DepthPrepassEncoder {
     // skeleton to the (possibly shared) geometry first.
     item.applyJointsTexture(geometry);
     item.applyMorphWeights(geometry);
-    // An alpha-masked material samples its mask through the full-vertex
-    // varyings, so it skips the position-only path too.
-    final masked = item.material.depthAlphaMasked;
-    final fragmentShader = _fragmentShaderFor(masked);
+    // A cutout `.fmat` supplies its own depth fragment, cut by its surface
+    // alpha. That and an alpha-masked material both read the full-vertex
+    // varyings, so they skip the position-only path.
+    // An explicitly configured mask wins over the automatic surface variant.
+    final surfaceShader = item.material.depthAlphaMasked
+        ? null
+        : item.material.depthSurfaceShader(
+            _writeNormals
+                ? DepthSurfaceKind.linearDepthNormal
+                : DepthSurfaceKind.linearDepth,
+          );
+    final masked = surfaceShader != null || item.material.depthAlphaMasked;
+    final fragmentShader = surfaceShader ?? _fragmentShaderFor(masked);
     // Unskinned geometry draws depth through a position-only shader and layout
     // (fetching only position); skinned geometry has no such variant, so it
     // falls back to its full vertex shader and bind. The normal-writing path
     // always uses the full vertex shader, since the position-only path
     // carries no normal.
-    final depthVertex = (_writeNormals || masked)
+    final depthVertex =
+        (_writeNormals ||
+            masked ||
+            item.material.needsFullVertexForDepth(geometry))
         ? null
         : geometry.depthOnlyVertex;
     // A `vertex { }` material displaces geometry in the color pass, so the
@@ -474,19 +673,38 @@ class _DepthPrepassEncoder {
         ? item.material.instanceAttributes
         : null;
     final attributeFloats = instanceSchema?.floatCount ?? 0;
-    final pipeline = resolvePipeline(
-      activeVertex,
-      fragmentShader,
-      vertexLayout:
-          depthVertex?.layout ??
-          geometry.instancedVertexLayoutFor(instanceSchema),
-    );
+    // The full-vertex path supplies the custom attributes its vertex shader
+    // reads; the position-only path fetches none.
+    final attributes = depthVertex == null
+        ? item.material.vertexAttributesFor(materialVertex)
+        : VertexAttributeSchema.none;
+    geometry.useVertexAttributes(attributes);
+    final vertexLayout =
+        depthVertex?.layout ??
+        geometry.instancedVertexLayoutFor(instanceSchema, attributes);
+    final pipeline =
+        cachedRenderPipeline(activeVertex, fragmentShader, vertexLayout) ??
+        _resolvePipeline(activeVertex, fragmentShader, vertexLayout, geometry);
+    // A sliced warm-up builds this pipeline in a later slice.
+    if (pipeline == null) return;
     if (!identical(_boundPipeline, pipeline)) {
       _renderPass.clearBindings();
       _renderPass.bindPipeline(pipeline);
       _boundPipeline = pipeline;
     }
     _renderPass.setPrimitiveType(geometry.primitiveType);
+    activeDrawRecorder?.setContext(
+      DrawContext(
+        phase: DrawPhase.depth,
+        item: item,
+        geometry: geometry,
+        material: item.material,
+        vertexShader: activeVertex,
+        fragmentShader: fragmentShader,
+        pipeline: pipeline,
+        batchedItems: batches?.length ?? 1,
+      ),
+    );
     if (_writeNormals) {
       // Carry this material's roughness so the reflection trace can fade out
       // on rough surfaces. camera_forward.w holds the roughness factor; the
@@ -505,19 +723,30 @@ class _DepthPrepassEncoder {
         ..[18] = item.material.reflectionRoughnessTextureTexCoord
             .clamp(0, 1)
             .toDouble();
-      _renderPass.bindTexture(
-        fragmentShader.getUniformSlot('metallic_roughness_texture'),
-        Material.whitePlaceholder(item.material.reflectionRoughnessTexture),
-        sampler:
-            item.material.reflectionRoughnessTextureSampler ??
-            _roughnessSampler,
-      );
+      // A surface fragment takes its roughness from Surface() instead.
+      if (surfaceShader == null) {
+        _renderPass.bindTexture(
+          fragmentShader.cachedUniformSlot('metallic_roughness_texture'),
+          Material.whitePlaceholder(item.material.reflectionRoughnessTexture),
+          sampler:
+              item.material.reflectionRoughnessTextureSampler ??
+              _roughnessSampler,
+        );
+      }
     }
     _renderPass.bindUniform(
-      fragmentShader.getUniformSlot(_infoBlockName),
-      _transientsBuffer.emplace(ByteData.sublistView(_depthInfo)),
+      fragmentShader.cachedUniformSlot(_infoBlockName),
+      _transientsBuffer.emplace(scratchBytesOf(_depthInfo)),
     );
-    if (masked) {
+    if (surfaceShader != null) {
+      item.material.bindDepthSurface(
+        _renderPass,
+        fragmentShader,
+        _transientsBuffer,
+        cameraPosition: _cameraPosition,
+        cameraForward: _cameraForward,
+      );
+    } else if (masked) {
       item.material.bindDepthAlphaMask(
         _renderPass,
         fragmentShader,
@@ -529,38 +758,16 @@ class _DepthPrepassEncoder {
     // The position-only path resolves FrameInfo against the depth shader; the
     // skinned fallback uses the geometry's own bind (which ignores the model
     // transform passed here, since skinned uses joint matrices).
-    void bindDraw(Matrix4 worldTransform) {
-      if (depthVertex != null) {
-        geometry.bindPositionStream(_renderPass);
-        bindUnskinnedFrameInfo(
-          _renderPass,
-          _transientsBuffer,
-          activeVertex,
-          _cameraTransform,
-          _cameraPosition,
-          depthBias: item.material.depthBias,
-        );
-      } else {
-        geometry.bind(
-          _renderPass,
-          _transientsBuffer,
-          worldTransform,
-          _cameraTransform,
-          _cameraPosition,
-          shaderOverride: materialVertex,
-          depthBias: item.material.depthBias,
-        );
-      }
-      // Feed the material's parameters to its vertex variant so the same
-      // displacement runs here as in the color pass.
-      if (materialVertex != null) {
-        item.material.bindVertexStage(
-          _renderPass,
-          materialVertex,
-          _transientsBuffer,
-        );
-      }
-    }
+    setCurrentDrawDepthOffset(
+      _raster,
+      item.material.depthLayer,
+      item.material.tieBreakRank,
+    );
+    _drawItem = item;
+    _drawGeometry = geometry;
+    _drawDepthPath = depthVertex != null;
+    _drawVertex = activeVertex;
+    _drawMaterialVertex = materialVertex;
 
     // The instance-rate model transform sits in the slot after the bound
     // vertex streams. The depth-only path binds just the position stream
@@ -570,7 +777,7 @@ class _DepthPrepassEncoder {
     final instanceSlot = depthVertex != null ? 1 : geometry.vertexStreamCount;
 
     if (batches != null) {
-      bindDraw(_identityTransform);
+      _bindDraw(_identityTransform);
       final PackedInstances packed = depthVertex == null
           ? packInstanceDataBatches(
               batches,
@@ -587,14 +794,18 @@ class _DepthPrepassEncoder {
 
     final instances = item.instanceTransforms;
     if (instances != null) {
+      final visible = limitInstanceIndices(
+        item.visibleInstanceIndices,
+        instances.length,
+        instanceLimit,
+      );
       if (geometry.instancedVertexLayout == null) {
         // Skinned geometry has no instance-attribute path; loop.
-        final visible = item.visibleInstanceIndices;
         final count = visible?.length ?? instances.length;
         for (var slot = 0; slot < count; slot++) {
           final instanceIndex = visible?[slot] ?? slot;
           final instanceTransform = instances[instanceIndex];
-          bindDraw(item.worldTransform * instanceTransform);
+          _bindDraw(item.worldTransform * instanceTransform);
           final flip =
               item.windingFlipped != (instanceTransform.determinant() < 0);
           _renderPass.setWindingOrder(
@@ -602,19 +813,45 @@ class _DepthPrepassEncoder {
                 ? gpu.WindingOrder.counterClockwise
                 : gpu.WindingOrder.clockwise,
           );
-          geometry.draw(_renderPass);
+          drawOrRejectPipeline(_renderPass, geometry, _boundPipeline);
         }
         return;
       }
-      bindDraw(item.worldTransform);
+      _bindDraw(item.worldTransform);
       final packedWorldData = item.instanceWorldData;
       final packedWinding = item.instanceWorldWindingFlipped;
+      if (depthVertex == null &&
+          item.visibleInstanceIndices == null &&
+          packedWorldData != null &&
+          packedWinding != null &&
+          item.instanceAttributeFloats == attributeFloats) {
+        final flipped = bindRetainedInstanceData(
+          _renderPass,
+          packedWorldData,
+          packedWinding,
+          slot: instanceSlot,
+        );
+        if (flipped != null) {
+          _renderPass.setWindingOrder(
+            flipped
+                ? gpu.WindingOrder.counterClockwise
+                : gpu.WindingOrder.clockwise,
+          );
+          drawOrRejectPipeline(
+            _renderPass,
+            geometry,
+            _boundPipeline,
+            instanceCount: visible?.length ?? instances.length,
+          );
+          return;
+        }
+      }
       final cached = packedWorldData == null || packedWinding == null
           ? null
           : transientInstancePackingScratch.singleCachedBatch(
               packedWorldData: packedWorldData,
               packedWindingFlipped: packedWinding,
-              indices: item.visibleInstanceIndices,
+              indices: visible,
               attributeFloats: item.instanceAttributeFloats,
             );
       final PackedInstances packed = depthVertex == null
@@ -625,7 +862,7 @@ class _DepthPrepassEncoder {
                     item.instanceColors!,
                     nodeWindingFlipped: item.windingFlipped,
                     instanceWindingFlipped: item.instanceWindingFlipped,
-                    indices: item.visibleInstanceIndices,
+                    indices: visible,
                     attributeData: item.instanceAttributeData,
                     attributeFloats: attributeFloats,
                     scratch: transientInstancePackingScratch,
@@ -641,7 +878,7 @@ class _DepthPrepassEncoder {
                     instances,
                     nodeWindingFlipped: item.windingFlipped,
                     instanceWindingFlipped: item.instanceWindingFlipped,
-                    indices: item.visibleInstanceIndices,
+                    indices: visible,
                     scratch: transientInstancePackingScratch,
                   )
                 : packInstanceTransformBatches(
@@ -653,7 +890,7 @@ class _DepthPrepassEncoder {
       return;
     }
 
-    bindDraw(item.worldTransform);
+    _bindDraw(item.worldTransform);
     // Skip the model-transform instance buffer for geometry that supplies its
     // own per-instance buffer (see the color encoder), or it clobbers the
     // stream slot.
@@ -679,10 +916,70 @@ class _DepthPrepassEncoder {
           ? gpu.WindingOrder.counterClockwise
           : gpu.WindingOrder.clockwise,
     );
-    geometry.draw(_renderPass);
+    drawOrRejectPipeline(_renderPass, geometry, _boundPipeline);
   }
 
   static final Matrix4 _identityTransform = Matrix4.identity();
+
+  // Per-draw state for [_bindDraw], set by the encode path. Fields rather
+  // than a local closure, which would allocate on every draw.
+  RenderItem? _drawItem;
+  Geometry? _drawGeometry;
+  bool _drawDepthPath = false;
+  gpu.Shader? _drawVertex;
+  gpu.Shader? _drawMaterialVertex;
+
+  // Binds the vertex/index buffers and the per-frame uniforms for one draw.
+  void _bindDraw(Matrix4 worldTransform) {
+    final item = _drawItem!;
+    final geometry = _drawGeometry!;
+    final activeVertex = _drawVertex!;
+    final materialVertex = _drawMaterialVertex;
+    if (_drawDepthPath) {
+      geometry.bindPositionStream(_renderPass);
+      bindUnskinnedFrameInfo(
+        _renderPass,
+        _transientsBuffer,
+        activeVertex,
+        _cameraTransform,
+        _cameraPosition,
+        depthBias: item.material.depthBias,
+      );
+    } else {
+      geometry.bind(
+        _renderPass,
+        _transientsBuffer,
+        worldTransform,
+        _cameraTransform,
+        _cameraPosition,
+        shaderOverride: materialVertex,
+        depthBias: item.material.depthBias,
+      );
+    }
+    // Feed the material's parameters to its vertex variant so the same
+    // displacement runs here as in the color pass.
+    if (materialVertex != null) {
+      item.material.bindVertexStage(
+        _renderPass,
+        materialVertex,
+        _transientsBuffer,
+      );
+    }
+  }
+
+  // The pipeline-cache miss path. Its debug closure lives here so the
+  // per-draw path does not allocate a capture context.
+  gpu.RenderPipeline? _resolvePipeline(
+    gpu.Shader vertexShader,
+    gpu.Shader fragmentShader,
+    VertexLayoutDescriptor? vertexLayout,
+    Geometry geometry,
+  ) => tryResolvePipeline(
+    vertexShader,
+    fragmentShader,
+    vertexLayout: vertexLayout,
+    debugContext: () => 'depth prepass ${geometry.runtimeType}',
+  );
 
   void _drawPacked(
     Geometry geometry,
@@ -697,7 +994,12 @@ class _DepthPrepassEncoder {
         bindInstanceTransforms(_renderPass, packed.ccw, slot: instanceSlot);
       }
       _renderPass.setWindingOrder(gpu.WindingOrder.clockwise);
-      geometry.draw(_renderPass, instanceCount: packed.ccwCount);
+      drawOrRejectPipeline(
+        _renderPass,
+        geometry,
+        _boundPipeline,
+        instanceCount: packed.ccwCount,
+      );
     }
     if (packed.cwCount > 0) {
       if (withColor) {
@@ -706,7 +1008,12 @@ class _DepthPrepassEncoder {
         bindInstanceTransforms(_renderPass, packed.cw, slot: instanceSlot);
       }
       _renderPass.setWindingOrder(gpu.WindingOrder.counterClockwise);
-      geometry.draw(_renderPass, instanceCount: packed.cwCount);
+      drawOrRejectPipeline(
+        _renderPass,
+        geometry,
+        _boundPipeline,
+        instanceCount: packed.cwCount,
+      );
     }
   }
 }

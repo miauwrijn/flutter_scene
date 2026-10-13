@@ -3,6 +3,8 @@ import 'dart:typed_data';
 import 'dart:ui' as ui;
 
 import 'package:flutter/foundation.dart' show debugPrint, visibleForTesting;
+import 'package:flutter_scene/src/depth_conflicts.dart' show DepthConflictIds;
+import 'package:flutter_scene/src/render/viewport_camera.dart';
 import 'package:flutter_scene/src/gpu/gpu.dart' as gpu;
 import 'package:vector_math/vector_math.dart';
 
@@ -11,14 +13,19 @@ import 'package:flutter_scene/src/fog.dart';
 import 'package:flutter_scene/src/weather.dart';
 import 'package:flutter_scene/src/light.dart';
 import 'package:flutter_scene/src/material/environment.dart';
+import 'package:flutter_scene/src/render/projection_params.dart';
 import 'package:flutter_scene/src/render/punctual_lights.dart';
 import 'package:flutter_scene/src/gpu/render_pass_compat.dart';
 import 'package:flutter_scene/src/render/depth_prepass.dart';
+import 'package:flutter_scene/src/render/display_referred_pass.dart';
 import 'package:flutter_scene/src/render/irradiance_field.dart';
 import 'package:flutter_scene/src/render/render_graph.dart';
 import 'package:flutter_scene/src/render/render_layers.dart';
 import 'package:flutter_scene/src/render/render_profile.dart';
+import 'package:flutter_scene/src/render/render_stats.dart';
+import 'package:flutter_scene/src/render/debug_view.dart';
 import 'package:flutter_scene/src/render/render_scene.dart';
+import 'package:flutter_scene/src/render/wireframe_overlay.dart';
 import 'package:flutter_scene/src/render/shadow_pass.dart';
 import 'package:flutter_scene/src/render/sh_composite.dart';
 import 'package:flutter_scene/src/render/skybox_encoder.dart';
@@ -27,6 +34,7 @@ import 'package:flutter_scene/src/scene_encoder.dart';
 import 'package:flutter_scene/src/skybox.dart';
 import 'package:flutter_scene/src/render/frame_transients.dart';
 import 'package:flutter_scene/src/shaders.dart';
+import 'package:flutter_scene/src/render/uniform_slots.dart';
 
 /// Render-graph blackboard key for the current scene-color texture.
 ///
@@ -62,6 +70,9 @@ int transmissionFilterBandOffset(int width, int level) {
 /// [ShadowPass] ran earlier this frame its shadow map is picked up from
 /// the blackboard and threaded into the per-draw [Lighting].
 class ScenePass extends RenderGraphPass {
+  // Whether this renders a screen view's camera, for [MeshDrawSelector]s.
+  final bool _primaryView;
+
   static final RenderProfileAccumulator _profile = RenderProfileAccumulator();
 
   ScenePass({
@@ -90,18 +101,30 @@ class ScenePass extends RenderGraphPass {
     Fog? fog,
     SceneWeather? weather,
     bool captureOpaqueColor = false,
+    bool displayReferredLayer = false,
+    gpu.PixelFormat? displayReferredFormat,
+    int maxCaptureBatches = maxSceneColorCaptureBatches,
     bool bindSceneDepth = false,
     double time = 0.0,
     List<Plane> cullingPlanes = const [],
     bool includeOffscreen = false,
     bool suppressPlanarReflections = false,
     Matrix4? cameraTransform,
-  }) : _captureOpaqueColor = captureOpaqueColor,
+    Matrix4? displayReferredCameraTransform,
+    DebugViewFrame? debugView,
+    bool primaryView = false,
+  }) : _debugView = debugView,
+       _primaryView = primaryView,
+       _captureOpaqueColor = captureOpaqueColor,
+       _displayReferredLayer = displayReferredLayer,
+       _displayReferredFormat = displayReferredFormat,
+       _maxCaptureBatches = maxCaptureBatches,
        _suppressPlanarReflections = suppressPlanarReflections,
        _bindSceneDepth = bindSceneDepth,
        _time = time,
        _camera = camera,
        _cameraTransform = cameraTransform,
+       _displayReferredCameraTransform = displayReferredCameraTransform,
        _layerMask = layerMask,
        _renderScene = renderScene,
        _dimensions = dimensions,
@@ -130,7 +153,13 @@ class ScenePass extends RenderGraphPass {
 
   final Camera _camera;
   final Matrix4? _cameraTransform;
+
+  // The unjittered transform the display-referred layer draws with under TAA;
+  // null when there is no jitter to undo.
+  final Matrix4? _displayReferredCameraTransform;
   final RenderScene _renderScene;
+  // The frame's surface debug view state, or null when none is active.
+  final DebugViewFrame? _debugView;
   final ui.Size _dimensions;
   final EnvironmentMap _environmentMap;
   final EnvironmentMap? _environmentMapB;
@@ -158,6 +187,19 @@ class ScenePass extends RenderGraphPass {
   // accumulated scene color, whether to hand materials the prepass linear
   // depth, and the engine time for material animation.
   final bool _captureOpaqueColor;
+
+  // The scene holds a display-referred surface, so depth must survive the
+  // scene's own passes and the extra layer is drawn after them.
+  final bool _displayReferredLayer;
+
+  // The display chain's color format, which the layer matches so the
+  // composite blends two identically encoded images. The swapchain's own
+  // default format is not necessarily creatable offscreen.
+  final gpu.PixelFormat? _displayReferredFormat;
+
+  // Overlap-safe capture batches this frame may open before the remaining
+  // readers share the final snapshot. See Scene.sceneColorCaptureBatches.
+  final int _maxCaptureBatches;
   final bool _bindSceneDepth;
   final bool _suppressPlanarReflections;
   final double _time;
@@ -182,25 +224,44 @@ class ScenePass extends RenderGraphPass {
   void execute(RenderGraphContext context) {
     final width = _dimensions.width.toInt();
     final height = _dimensions.height.toInt();
+    _conflictIds = _renderDepthConflictIds(context);
 
     final capture = _captureOpaqueColor;
+    // With MSAA the color targets are resolve destinations with no depth
+    // attachment; without it they carry the scene depth, whose ring differs
+    // between the captured and transient cases. Each setup keeps its own
+    // pooled texture (see TransientTextureDescriptor.attachmentKey).
+    final attachmentKey = _enableMsaa
+        ? 'resolve'
+        : capture || _displayReferredLayer
+        ? 'depth_stored'
+        : 'depth_transient';
     final hdrColor = context.texturePool.acquire(
       TransientTextureDescriptor.color(
         width: width,
         height: height,
         format: _hdrFormat,
         debugName: 'hdr_scene_color',
+        attachmentKey: attachmentKey,
       ),
     );
-    // Depth must survive from the opaque pass into the translucent pass, so it
-    // cannot be tile-transient when scene color is captured.
+    // Depth must outlive the render pass that wrote it whenever a later pass
+    // re-attaches it: a capture splits the scene across passes, and the
+    // display-referred layer draws in a pass of its own. Tile-transient
+    // storage does not survive that, so those cases take device memory.
+    // Shader-read usage is a separate question and only the capture path
+    // samples it.
+    final keepDepth = capture || _displayReferredLayer;
     final depth = context.texturePool.acquire(
-      TransientTextureDescriptor.depth(
+      TransientTextureDescriptor(
         width: width,
         height: height,
-        format: gpu.gpuContext.defaultDepthStencilFormat,
+        format: depthRasterOf(_camera).depthStencilFormat,
         sampleCount: _enableMsaa ? 4 : 1,
-        shaderReadable: capture,
+        storageMode: keepDepth
+            ? gpu.StorageMode.devicePrivate
+            : gpu.StorageMode.deviceTransient,
+        enableShaderReadUsage: capture,
         debugName: 'scene_depth',
       ),
     );
@@ -213,6 +274,7 @@ class ScenePass extends RenderGraphPass {
               height: height,
               format: _hdrFormat,
               debugName: 'alternate_scene_color',
+              attachmentKey: attachmentKey,
             ),
           )
         : null;
@@ -243,8 +305,8 @@ class ScenePass extends RenderGraphPass {
       colorAttachment,
       depthStencilAttachment: gpu.DepthStencilAttachment(
         texture: depth,
-        depthClearValue: 1.0,
-        depthStoreAction: capture
+        depthClearValue: depthRasterOf(_camera).clearDepth,
+        depthStoreAction: keepDepth
             ? gpu.StoreAction.store
             : gpu.StoreAction.dontCare,
       ),
@@ -282,35 +344,29 @@ class ScenePass extends RenderGraphPass {
     final cameraForward = camera.forward.normalized();
     final cameraRight = camera.up.cross(cameraForward)..normalize();
     final cameraUp = cameraForward.cross(cameraRight)..normalize();
-    final projection = camera.projection;
-    final tanHalfFovY = projection is PerspectiveProjection
-        ? math.tan(projection.fovRadiansY / 2.0)
-        : 0.0;
-    final tanHalfFovX = height > 0 ? tanHalfFovY * width / height : 0.0;
-    // The projection's depth row, published for materials that write their
-    // own gl_FragDepth (parallax relief with a silhouette). Read off the
-    // matrix in use rather than rebuilt from near/far: clip.z and clip.w are
-    // linear in the planar view depth for any of these lenses, so the two
-    // rows are the whole mapping, and an orthographic projection falls out of
-    // the same expression.
-    final projectionMatrix = projection.getProjectionMatrix(
-      height > 0 ? width / height : 1.0,
-    );
+    final projection = ProjectionParams.of(camera.projection, _dimensions);
+    // Froxel clustering for this view (views with uniform light channels);
+    // its data texture rides the per-object index sampler slot.
+    // The raster projection's depth row, published for materials that write
+    // their own gl_FragDepth (parallax relief with a silhouette). Read off the
+    // matrix the color pass rasterizes with (reversed or infinite as the view
+    // draws) rather than rebuilt from near/far: clip.z and clip.w are linear
+    // in the planar view depth for any of these lenses, so the two rows are
+    // the whole mapping, and an orthographic projection falls out of the same
+    // expression.
+    final projectionMatrix = rasterProjectionOf(camera, _dimensions);
     final depthProjection = Vector4(
       projectionMatrix.entry(2, 2),
       projectionMatrix.entry(2, 3),
       projectionMatrix.entry(3, 2),
       projectionMatrix.entry(3, 3),
     );
-    // Froxel clustering for this view (perspective views with uniform light
-    // channels); its data texture rides the per-object index sampler slot.
     final froxels = _punctualLighting.internalBuffer?.buildFroxels(
       cameraPosition: camera.position,
       forward: cameraForward,
       right: cameraRight,
       up: cameraUp,
-      tanHalfFovX: tanHalfFovX,
-      tanHalfFovY: tanHalfFovY,
+      projection: projection,
     );
     final lighting = Lighting(
       environmentMap: _environmentMap,
@@ -336,6 +392,7 @@ class ScenePass extends RenderGraphPass {
       pointShadowTileCount: shadowMap == null
           ? 0
           : _punctualLighting.pointShadowTileCount,
+      rectAreaLightCount: _punctualLighting.rectAreaLightCount,
       spotShadowDepthBias: _punctualLighting.spotShadowDepthBias,
       spotShadowNormalBias: _punctualLighting.spotShadowNormalBias,
       spotShadowSoftness: _punctualLighting.spotShadowSoftness,
@@ -358,8 +415,11 @@ class ScenePass extends RenderGraphPass {
       cameraForward: cameraForward,
       cameraRight: cameraRight,
       cameraUp: cameraUp,
-      tanHalfFovX: tanHalfFovX,
-      tanHalfFovY: tanHalfFovY,
+      projectionScaleX: projection.scaleX,
+      projectionScaleY: projection.scaleY,
+      projectionOffsetX: projection.offsetX,
+      projectionOffsetY: projection.offsetY,
+      orthographic: projection.orthographic,
       depthProjection: depthProjection,
       time: _time,
       planarReflectionsSuppressed: _suppressPlanarReflections,
@@ -397,6 +457,9 @@ class ScenePass extends RenderGraphPass {
       _cullingPlanes,
       !_includeOffscreen,
       cameraTransform: _cameraTransform,
+      displayReferredCameraTransform: _displayReferredCameraTransform,
+      debugView: _debugView,
+      primaryView: _primaryView,
     );
     final cullWatch = profileRendering ? (Stopwatch()..start()) : null;
     if (_includeOffscreen) {
@@ -404,17 +467,22 @@ class ScenePass extends RenderGraphPass {
         encoder.submit(item);
       }
     } else {
-      _renderScene.cull(
+      final rejected = _renderScene.cull(
         encoder.frustum,
         encoder.submit,
         additionalPlanes: _cullingPlanes,
       );
+      // A rejected subtree never reaches `encoder.submit`, so nothing else
+      // counts the items in it.
+      activeRenderCounters.submitted += rejected;
+      activeRenderCounters.culled += rejected;
     }
     cullWatch?.stop();
 
     if (!capture || !encoder.hasPendingSceneColorReaders) {
       final flushWatch = profileRendering ? (Stopwatch()..start()) : null;
       encoder.flush();
+      _encodeDebugOverlays(renderPass, context.transientsBuffer, encoder);
       flushWatch?.stop();
       if (profileRendering) {
         _recordProfile(
@@ -423,6 +491,7 @@ class ScenePass extends RenderGraphPass {
         );
       }
       rendererSubmissions.submit(commandBuffer);
+      _encodeDisplayReferredLayer(context, encoder, depth, width, height);
       context.blackboard.set(kSceneColorBlackboardKey, hdrColor);
       return;
     }
@@ -437,6 +506,9 @@ class ScenePass extends RenderGraphPass {
         !encoder.nextTranslucentBatchReadsSceneColor) {
       encoder.flushNextTranslucentBatch();
     }
+    if (!encoder.hasPendingTranslucent) {
+      _encodeDebugOverlays(renderPass, context.transientsBuffer, encoder);
+    }
     rendererSubmissions.submit(commandBuffer);
 
     var currentColor = hdrColor;
@@ -447,9 +519,12 @@ class ScenePass extends RenderGraphPass {
     while (encoder.hasPendingTranslucent) {
       assert(encoder.nextTranslucentBatchReadsSceneColor);
       final shareFinalSnapshot =
-          captureBatch == maxSceneColorCaptureBatches - 1 &&
+          captureBatch == _maxCaptureBatches - 1 &&
           encoder.pendingSceneColorReaderCount > 1;
-      if (shareFinalSnapshot && !_reportedSceneColorPassCap) {
+      // A cap the scene chose is not worth a warning; the built-in maximum is.
+      if (shareFinalSnapshot &&
+          _maxCaptureBatches == maxSceneColorCaptureBatches &&
+          !_reportedSceneColorPassCap) {
         _reportedSceneColorPassCap = true;
         debugPrint(
           'Scene color readers exceeded $maxSceneColorCaptureBatches '
@@ -508,7 +583,7 @@ class ScenePass extends RenderGraphPass {
           texture: depth,
           depthLoadAction: gpu.LoadAction.load,
           depthStoreAction: gpu.StoreAction.store,
-          depthClearValue: 1.0,
+          depthClearValue: depthRasterOf(_camera).clearDepth,
         ),
       );
       final translucentCommands = gpu.gpuContext.createCommandBuffer();
@@ -523,6 +598,13 @@ class ScenePass extends RenderGraphPass {
       } else {
         encoder.flushNextSceneColorBatch(translucentPass: translucentPass);
       }
+      if (!encoder.hasPendingTranslucent) {
+        _encodeDebugOverlays(
+          translucentPass,
+          context.transientsBuffer,
+          encoder,
+        );
+      }
       rendererSubmissions.submit(translucentCommands);
 
       final completedColor = nextColor;
@@ -531,6 +613,7 @@ class ScenePass extends RenderGraphPass {
       captureBatch++;
     }
 
+    _encodeDisplayReferredLayer(context, encoder, depth, width, height);
     context.blackboard.set(kSceneColorBlackboardKey, currentColor);
     flushWatch?.stop();
     if (profileRendering) {
@@ -539,6 +622,243 @@ class ScenePass extends RenderGraphPass {
         flushWatch?.elapsedMicroseconds ?? 0,
       );
     }
+  }
+
+  // Draws the display-referred surfaces into their own display-encoded layer,
+  // sharing the scene's depth attachment so opaque geometry occludes them.
+  // The layer is composited onto the resolved image by
+  // DisplayReferredCompositePass, past the tone curve.
+  void _encodeDisplayReferredLayer(
+    RenderGraphContext context,
+    SceneEncoder encoder,
+    gpu.Texture depth,
+    int width,
+    int height,
+  ) {
+    if (!_displayReferredLayer || !encoder.hasDisplayReferred) return;
+
+    final format = _displayReferredFormat;
+    if (format == null) return;
+    final layer = context.texturePool.acquire(
+      TransientTextureDescriptor.color(
+        width: width,
+        height: height,
+        format: format,
+        debugName: 'display_referred_color',
+      ),
+    );
+    // The depth attachment carries the scene's sample count, so the layer's
+    // own color must match it and resolve down, exactly as the scene targets
+    // do.
+    gpu.Texture? msaaLayer;
+    if (_enableMsaa) {
+      msaaLayer = context.texturePool.acquire(
+        TransientTextureDescriptor(
+          width: width,
+          height: height,
+          format: format,
+          sampleCount: 4,
+          storageMode: gpu.StorageMode.deviceTransient,
+          enableShaderReadUsage: false,
+          debugName: 'display_referred_color_msaa',
+        ),
+      );
+    }
+
+    final attachment = gpu.ColorAttachment(
+      texture: msaaLayer ?? layer,
+      clearValue: Vector4.zero(),
+    );
+    if (_enableMsaa) {
+      attachment.resolveTexture = layer;
+      attachment.storeAction = gpu.StoreAction.multisampleResolve;
+    }
+    final commands = gpu.gpuContext.createCommandBuffer();
+    final pass = commands.createRenderPass(
+      gpu.RenderTarget.singleColor(
+        attachment,
+        depthStencilAttachment: gpu.DepthStencilAttachment(
+          texture: depth,
+          depthLoadAction: gpu.LoadAction.load,
+          depthStoreAction: gpu.StoreAction.dontCare,
+          depthClearValue: depthRasterOf(_camera).clearDepth,
+        ),
+      ),
+    );
+    encoder.flushDisplayReferred(pass);
+    rendererSubmissions.submit(commands);
+
+    context.blackboard.set(kDisplayReferredBlackboardKey, layer);
+  }
+
+  // The object-id images the depth conflict overlay compares (random nudges,
+  // the same negated, and other nudges in reversed draw order), drawn before
+  // the scene when the overlay is on, else null.
+  List<gpu.Texture>? _conflictIds;
+
+  // Seeds the overlay's nudges, new every frame so a pair nudged alike in
+  // one frame is caught in the next.
+  static int _conflictFrame = 0;
+
+  static final gpu.Shader _conflictOverlayShader =
+      baseShaderLibrary['DepthConflictOverlayFragment']!;
+
+  static final gpu.SamplerOptions _nearestClamp = gpu.SamplerOptions(
+    minFilter: gpu.MinMagFilter.nearest,
+    magFilter: gpu.MinMagFilter.nearest,
+    mipFilter: gpu.MipFilter.nearest,
+    widthAddressMode: gpu.SamplerAddressMode.clampToEdge,
+    heightAddressMode: gpu.SamplerAddressMode.clampToEdge,
+  );
+
+  List<gpu.Texture>? _renderDepthConflictIds(RenderGraphContext context) {
+    final frame = _debugView;
+    final camera = _camera;
+    if (frame == null || camera is! ViewportBoundCamera) return null;
+    if (!frame.overlays.contains(DebugOverlay.depthConflicts) &&
+        !frame.splitOverlays.contains(DebugOverlay.depthConflicts)) {
+      return null;
+    }
+    final width = _dimensions.width.toInt();
+    final height = _dimensions.height.toInt();
+    final ids = DepthConflictIds(
+      renderScene: _renderScene,
+      camera: camera,
+      size: _dimensions,
+      layerMask: _layerMask,
+    );
+    final random = math.Random(_conflictFrame++);
+    final first = ids.randomNudges(random);
+    final second = ids.randomNudges(random);
+    final depth = context.texturePool.acquire(
+      TransientTextureDescriptor.depth(
+        width: width,
+        height: height,
+        format: depthRasterOf(camera).depthStencilFormat,
+        debugName: 'depth_conflict_depth',
+      ),
+    );
+    return [
+      for (var i = 0; i < 3; i++)
+        () {
+          final target = context.texturePool.acquire(
+            TransientTextureDescriptor.color(
+              width: width,
+              height: height,
+              format: gpu.PixelFormat.r8g8b8a8UNormInt,
+              debugName: 'depth_conflict_ids_$i',
+            ),
+          );
+          ids.draw(
+            target: target,
+            depth: depth,
+            transients: context.transientsBuffer,
+            reverseOrder: i == 2,
+            nudge: switch (i) {
+              0 => (id) => first[id],
+              1 => (id) => -first[id],
+              _ => (id) => second[id],
+            },
+          );
+          return target;
+        }(),
+    ];
+  }
+
+  // Marks the pixels the id images disagree on, over the finished scene.
+  void _encodeDepthConflictOverlay(
+    gpu.RenderPass pass,
+    TransientWriter transients,
+  ) {
+    final ids = _conflictIds;
+    if (ids == null) return;
+    pass.clearBindings();
+    pass.bindPipeline(
+      resolvePipeline(_copyVertexShader, _conflictOverlayShader),
+    );
+    pass.setDepthWriteEnable(false);
+    pass.setDepthCompareOperation(gpu.CompareFunction.always);
+    pass.setCullMode(gpu.CullMode.none);
+    pass.setColorBlendEnable(true);
+    pass.setColorBlendEquation(
+      gpu.ColorBlendEquation(
+        colorBlendOperation: gpu.BlendOperation.add,
+        sourceColorBlendFactor: gpu.BlendFactor.one,
+        destinationColorBlendFactor: gpu.BlendFactor.oneMinusSourceAlpha,
+        alphaBlendOperation: gpu.BlendOperation.add,
+        sourceAlphaBlendFactor: gpu.BlendFactor.one,
+        destinationAlphaBlendFactor: gpu.BlendFactor.oneMinusSourceAlpha,
+      ),
+    );
+    bindVertexBufferCompat(pass, _quadView, 6);
+    const names = ['id_nudged', 'id_opposite', 'id_reordered'];
+    for (var i = 0; i < 3; i++) {
+      pass.bindTexture(
+        _conflictOverlayShader.cachedUniformSlot(names[i]),
+        ids[i],
+        sampler: _nearestClamp,
+      );
+    }
+    final info = Float32List(4)
+      ..[0] = _time
+      ..[1] = 6.0
+      ..[2] = 0.85;
+    pass.bindUniform(
+      _conflictOverlayShader.cachedUniformSlot('DepthConflictInfo'),
+      transients.emplace(ByteData.sublistView(info)),
+    );
+    drawCompat(pass, 6);
+  }
+
+  // Draws the debug overlays (wireframe) into the pass the scene finished
+  // in, so they depth-test against the scene's own depth attachment.
+  void _encodeDebugOverlays(
+    gpu.RenderPass pass,
+    TransientWriter transients,
+    SceneEncoder encoder,
+  ) {
+    final frame = _debugView;
+    if (frame == null) return;
+    void encode(Set<DebugOverlay> overlays) {
+      if (overlays.isEmpty) return;
+      if (overlays.contains(DebugOverlay.depthConflicts)) {
+        _encodeDepthConflictOverlay(pass, transients);
+      }
+      encodeWireframeOverlay(
+        pass: pass,
+        transients: transients,
+        renderScene: _renderScene,
+        frustum: encoder.frustum,
+        cameraTransform: encoder.cameraTransform,
+        raster: depthRasterOf(_camera),
+        cameraPosition: _camera.position,
+        layerMask: _layerMask,
+        cullingPlanes: _cullingPlanes,
+        includeOffscreen: _includeOffscreen,
+        frame: frame,
+        overlays: overlays,
+      );
+    }
+
+    if (frame.splitPixels < 0) {
+      encode(frame.overlays);
+      return;
+    }
+    // Split: the view's overlays right of it, the split view's left.
+    final width = _dimensions.width.toInt();
+    final height = _dimensions.height.toInt();
+    final edge = frame.splitPixels.ceil().clamp(0, width);
+    if (edge < width && frame.overlays.isNotEmpty) {
+      pass.setScissor(
+        gpu.Scissor(x: edge, width: width - edge, height: height),
+      );
+      encode(frame.overlays);
+    }
+    if (edge > 0 && frame.splitOverlays.isNotEmpty) {
+      pass.setScissor(gpu.Scissor(width: edge, height: height));
+      encode(frame.splitOverlays);
+    }
+    pass.setScissor(gpu.Scissor(width: width, height: height));
   }
 
   static void _recordProfile(int cullMicros, int flushMicros) {
@@ -597,7 +917,7 @@ class ScenePass extends RenderGraphPass {
     pass.setCullMode(gpu.CullMode.none);
     bindVertexBufferCompat(pass, _quadView, 6);
     pass.bindTexture(
-      _copyFragmentShader.getUniformSlot('source_texture'),
+      _copyFragmentShader.cachedUniformSlot('source_texture'),
       source,
     );
     drawCompat(pass, 6);
@@ -639,7 +959,7 @@ class ScenePass extends RenderGraphPass {
         ),
       );
       pass.bindTexture(
-        _copyFragmentShader.getUniformSlot('source_texture'),
+        _copyFragmentShader.cachedUniformSlot('source_texture'),
         mip,
         sampler: _linearClamp,
       );
@@ -666,7 +986,7 @@ class ScenePass extends RenderGraphPass {
     pass.setCullMode(gpu.CullMode.none);
     bindVertexBufferCompat(pass, _quadView, 6);
     pass.bindTexture(
-      _transmissionFilterShader.getUniformSlot('source'),
+      _transmissionFilterShader.cachedUniformSlot('source'),
       source,
       sampler: _linearClamp,
     );
@@ -674,7 +994,7 @@ class ScenePass extends RenderGraphPass {
       ..[0] = 1.0 / source.width
       ..[1] = 1.0 / source.height;
     pass.bindUniform(
-      _transmissionFilterShader.getUniformSlot('BloomFilterInfo'),
+      _transmissionFilterShader.cachedUniformSlot('BloomFilterInfo'),
       context.transientsBuffer.emplace(ByteData.sublistView(filterInfo)),
     );
     drawCompat(pass, 6);

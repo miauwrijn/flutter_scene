@@ -14,6 +14,7 @@ import 'package:flutter_scene/src/shaders.dart';
 import 'package:flutter_scene/src/tone_mapping.dart';
 import 'package:flutter_scene/src/render/frame_transients.dart';
 import 'package:flutter_scene/src/scene_encoder.dart' show resolvePipeline;
+import 'package:flutter_scene/src/render/uniform_slots.dart';
 
 /// Render-graph blackboard key for the display-referred color the resolve
 /// pass produces. After-tone-mapping custom effects read it and republish
@@ -33,12 +34,18 @@ class ResolvePass extends RenderGraphPass {
     required double agxWhite,
     required double agxContrast,
     required PostProcessSettings postProcess,
+    bool debugViewActive = false,
+    double debugViewSplit = -1.0,
+    bool debugSkipsPost = false,
   }) : _outputColor = outputColor,
        _exposure = exposure,
        _toneMappingMode = toneMappingMode,
        _agxWhite = agxWhite,
        _agxContrast = agxContrast,
-       _postProcess = postProcess;
+       _postProcess = postProcess,
+       _debugViewActive = debugViewActive,
+       _debugViewSplit = debugViewSplit,
+       _debugSkipsPost = debugSkipsPost;
 
   final gpu.Texture _outputColor;
   final double _exposure;
@@ -46,6 +53,13 @@ class ResolvePass extends RenderGraphPass {
   final double _agxWhite;
   final double _agxContrast;
   final PostProcessSettings _postProcess;
+  // A surface debug view is active: its pixels copy through the resolve
+  // untouched, right of the split (a width fraction, negative for all).
+  final bool _debugViewActive;
+  final double _debugViewSplit;
+  // The frame skipped bloom for a debug view, so the resolve must not add
+  // it back whatever the settings say.
+  final bool _debugSkipsPost;
 
   static final gpu.Shader _vertexShader =
       baseShaderLibrary['FullscreenVertex']!;
@@ -99,13 +113,16 @@ class ResolvePass extends RenderGraphPass {
       flipY: false,
       time: timeSeconds,
       settings: _postProcess,
+      debugViewActive: _debugViewActive,
+      debugViewSplit: _debugViewSplit,
+      bloomEnabled: _postProcess.bloom.enabled && !_debugSkipsPost,
     );
     renderPass.bindUniform(
-      _fragmentShader.getUniformSlot('ResolveInfo'),
+      _fragmentShader.cachedUniformSlot('ResolveInfo'),
       context.transientsBuffer.emplace(ByteData.sublistView(info)),
     );
     renderPass.bindTexture(
-      _fragmentShader.getUniformSlot('scene_color'),
+      _fragmentShader.cachedUniformSlot('scene_color'),
       hdrColor,
       sampler: gpu.SamplerOptions(
         minFilter: gpu.MinMagFilter.linear,
@@ -120,7 +137,7 @@ class ResolvePass extends RenderGraphPass {
         context.blackboard.get<gpu.Texture>(kBloomTextureBlackboardKey) ??
         Material.getWhitePlaceholderTexture();
     renderPass.bindTexture(
-      _fragmentShader.getUniformSlot('bloom_color'),
+      _fragmentShader.cachedUniformSlot('bloom_color'),
       bloomTexture,
       sampler: gpu.SamplerOptions(
         minFilter: gpu.MinMagFilter.linear,
@@ -136,7 +153,7 @@ class ResolvePass extends RenderGraphPass {
         context.blackboard.get<gpu.Texture>(kAutoExposureFactorBlackboardKey) ??
         Material.getWhitePlaceholderTexture();
     renderPass.bindTexture(
-      _fragmentShader.getUniformSlot('exposure_factor'),
+      _fragmentShader.cachedUniformSlot('exposure_factor'),
       exposureFactor,
       sampler: gpu.SamplerOptions(
         minFilter: gpu.MinMagFilter.nearest,
@@ -148,7 +165,7 @@ class ResolvePass extends RenderGraphPass {
     // The film-look grading LUT, or a neutral placeholder when no look is
     // set (lut_params.x stays 0 and the sample is skipped).
     renderPass.bindTexture(
-      _fragmentShader.getUniformSlot('grading_lut'),
+      _fragmentShader.cachedUniformSlot('grading_lut'),
       _postProcess.colorGrading.lut?.texture ??
           Material.getWhitePlaceholderTexture(),
       sampler: gpu.SamplerOptions(

@@ -7,7 +7,11 @@ import 'package:flutter/services.dart' show rootBundle;
 import 'package:flutter_scene/gpu.dart' as gpu;
 import 'package:flutter_scene/scene.dart';
 // ignore: implementation_imports
+import 'package:flutter_scene/src/gpu/gpu.dart' as gpu_shim;
+// ignore: implementation_imports
 import 'package:flutter_scene/src/render/radiance_layout.dart';
+// ignore: implementation_imports
+import 'package:flutter_scene/src/texture/basisu/basis_ktx2_loader.dart';
 // ignore: implementation_imports
 import 'package:flutter_scene/src/texture/compressed_texture.dart';
 // ignore: implementation_imports
@@ -40,11 +44,18 @@ class SmokeScene {
     this.preload,
     this.warmupFrames = 0,
     this.fullCoverage = false,
+    this.colorPassCounters,
+    this.maxDepthConflictPixels,
   });
 
   final String id;
-  final ({Scene scene, PerspectiveCamera camera}) Function() setup;
+  final ({Scene scene, Camera camera}) Function() setup;
   final Future<void> Function()? preload;
+
+  /// Counters the captured frame's `ScenePass` must report exactly, keyed
+  /// as `RenderCounters.toJson` names them. For pinning a statistic the
+  /// image cannot show.
+  final Map<String, int>? colorPassCounters;
 
   /// Frames to render before the capture, for a feature that converges over
   /// time instead of resolving in one frame.
@@ -55,9 +66,13 @@ class SmokeScene {
   /// 60 Hz cadence, and the smoke lanes render well below that.
   final int warmupFrames;
 
-  /// Whether the scene geometry completely covers the viewport, meaning corners
-  /// are geometry rather than the background clear color.
+  /// Whether drawn content reaches the corners, meaning they are geometry or
+  /// glow (bloom over the transparent background) rather than the clear color.
   final bool fullCoverage;
+
+  /// When set, the scene is probed for depth conflicts (z-fighting) after the
+  /// capture, and at most this many probe pixels may change hands.
+  final int? maxDepthConflictPixels;
 }
 
 /// The fixed three-quarter view shared by the scenes.
@@ -455,10 +470,12 @@ Future<void> loadSmokeModels() async {
   _skinnedModel ??= await Node.fromGlbAsset('assets_src/two_triangles.glb');
 }
 
-/// The skinned and morphed model preloaded by [loadMorphSkinnedModel], plus
-/// the same model at rest weights beside it as the reference.
+/// The skinned and morphed model preloaded by [loadMorphSkinnedModel], the
+/// same model at rest weights beside it as the reference, and an unskinned
+/// copy at the same weights.
 Node? _morphSkinnedModel;
 Node? _morphSkinnedRest;
+Node? _morphUnskinnedModel;
 
 /// Imports the synthetic skinned and morphed GLB and pins its morph weights.
 /// The bytes are built in code (see `synthetic_morph_glb.dart`), so the scene
@@ -478,17 +495,138 @@ Future<void> loadMorphSkinnedModel() async {
       '${geometry.runtimeType}',
     );
   }
+  final unskinned = await Node.fromGlbBytes(
+    buildMorphSkinnedGlb(skinned: false),
+  );
+  final unskinnedMesh = unskinned.meshNodes.first;
+  unskinnedMesh.setMorphWeights(kMorphSkinnedWeights);
+  final unskinnedGeometry = unskinnedMesh.mesh!.primitives.first.geometry;
+  if (unskinnedGeometry is! MorphedUnskinnedGeometry ||
+      !unskinnedGeometry.usesGpuMorphing) {
+    throw StateError(
+      'morph_skinned expects GPU-morphed unskinned geometry, got '
+      '${unskinnedGeometry.runtimeType}',
+    );
+  }
   _morphSkinnedRest = rest;
   _morphSkinnedModel = model;
+  _morphUnskinnedModel = unskinned;
 }
 
-/// The Draco-compressed KTX2-textured quads preloaded by [loadBasisuQuads].
+/// The skinned tube whose weights sum to 0.98, for the skinned_weight_sum
+/// scene. Its targets stay at rest, so only the skin deforms it.
+Node? _weightSumModel;
+
+Future<void> loadWeightSumModel() async {
+  _weightSumModel ??= await Node.fromGlbBytes(
+    buildMorphSkinnedGlb(weightSum: 0.98),
+  );
+}
+
+/// A 64x64 PNG, a one-texel black and white checkerboard, uploaded through
+/// the encoded-image path by [loadMipChecker]. Every level above the base
+/// averages to one flat gray, so a minified sample shows which light the
+/// chain was built in.
+const String _kMipCheckerPng =
+    'iVBORw0KGgoAAAANSUhEUgAAAEAAAABACAYAAACqaXHeAAAAb0lEQVR42u3SsQ0AMBCEsNt/abJH3hU1'
+    'kle1ravd5fmqEUAAAQQQQAABBBBAAAEEEEAAAQQQQAABBBBAAAEEEEAAAQQQQAABBBBAAAEEEEAAAQQQ'
+    'QAABBBBAAAEEEEAAAQQQQAABBBBAAAEEEPBBH0+m2kofJeShAAAAAElFTkSuQmCC';
+
+Texture2D? _mipChecker;
+
+/// Decodes and uploads the checkerboard once, on whatever path the backend
+/// has for encoded images. Call before pumping the texture_mips scene.
+Future<void> loadMipChecker() async {
+  _mipChecker ??= await Texture2D.fromEncodedBytes(
+    base64Decode(_kMipCheckerPng),
+  );
+}
+
+/// The Draco-compressed KTX2-textured quads preloaded by [loadBasisuTextures].
 Node? _basisuQuads;
 
-/// Imports the compressed quads once. Call before pumping the basisu_textures
-/// scene.
-Future<void> loadBasisuQuads() async {
+/// The texture the build hook cooked to ETC1S.
+TextureSource? _etc1sCooked;
+
+/// Loads the basisu_textures scene's quads and cooked texture once.
+Future<void> loadBasisuTextures() async {
   _basisuQuads ??= await Node.fromGlbAsset('assets/basisu_quads_draco.glb');
+  _etc1sCooked ??= await loadTexture('assets/etc1s_cooked.png');
+}
+
+/// The ETC1S KTX2 fixtures, by asset name.
+final Map<String, Uint8List> _etc1sFixtures = {};
+
+/// Loads the ETC1S fixtures once. Call before [buildEtc1sUploadScene].
+Future<void> loadEtc1sFixtures() async {
+  for (final name in ['etc1s_srgb_mips_64', 'etc1s_features_rgba_64']) {
+    if (_etc1sFixtures.containsKey(name)) continue;
+    final data = await rootBundle.load('assets/$name.ktx2');
+    _etc1sFixtures[name] = data.buffer.asUint8List(
+      data.offsetInBytes,
+      data.lengthInBytes,
+    );
+  }
+}
+
+/// One unlit quad showing fixture [name]'s base level uploaded as [upload],
+/// sampled nearest, or null when the device cannot sample that format.
+({Scene scene, Camera camera})? buildEtc1sUploadScene(
+  String name,
+  StandardKtx2Upload upload,
+) {
+  // Offer only the requested format's family, so the loader picks it.
+  final family = switch (upload) {
+    StandardKtx2Upload.etc2Rgb ||
+    StandardKtx2Upload.etc2Rgba => gpu_shim.TextureCompressionFamily.etc2,
+    StandardKtx2Upload.bc1 ||
+    StandardKtx2Upload.bc3 => gpu_shim.TextureCompressionFamily.bc,
+    _ => null,
+  };
+  if (family != null &&
+      !gpu_shim.gpuContext.supportsTextureCompression(family)) {
+    return null;
+  }
+  final CompressionSupport support = [?family];
+  final decoded = decodeStandardKtx2ForUpload(
+    (bytes: _etc1sFixtures[name]!, content: TextureContent.color),
+    mips: false,
+    support: support,
+  );
+  if (decoded.error != null || decoded.upload != upload) {
+    throw StateError(
+      '$name decoded to ${decoded.upload} (${decoded.error}), not $upload',
+    );
+  }
+  final texture = uploadStandardKtx2(decoded);
+  final material = UnlitMaterial()
+    ..baseColorTexture = GpuTextureSource(
+      texture,
+      sampler: gpu.SamplerOptions(
+        minFilter: gpu.MinMagFilter.nearest,
+        magFilter: gpu.MinMagFilter.nearest,
+        mipFilter: gpu.MipFilter.nearest,
+        widthAddressMode: gpu.SamplerAddressMode.clampToEdge,
+        heightAddressMode: gpu.SamplerAddressMode.clampToEdge,
+      ),
+    )
+    // Unmirror u, so frames read like the source image.
+    ..baseColorTextureTransform = TextureTransform(
+      offset: vm.Vector2(1, 0),
+      scale: vm.Vector2(-1, 1),
+    );
+  final scene = Scene();
+  scene.add(
+    Node(mesh: Mesh(PlaneGeometry(width: 1.8, depth: 1.8), material))
+      ..localTransform = vm.Matrix4.rotationX(math.pi / 2),
+  );
+  return (
+    scene: scene,
+    camera: PerspectiveCamera(
+      position: vm.Vector3(0, 0, 2.2),
+      target: vm.Vector3.zero(),
+    ),
+  );
 }
 
 /// A flat NxN grid in the XZ plane carrying a per-vertex `phase` custom
@@ -527,6 +665,36 @@ MeshGeometry _phaseGrid() {
     ..setCustomAttribute('phase', phase, components: 1);
 }
 
+/// Outlines depth and normal edges from the engine's geometry buffers.
+class _ViewEdgesPass extends CustomRenderPass {
+  @override
+  String get name => 'view_edges';
+
+  @override
+  RenderStage get stage => RenderStage.afterScene;
+
+  @override
+  Set<RenderInput> get inputs => const {RenderInput.normals};
+
+  @override
+  void execute(RenderPassContext context) {
+    final depth = context.sceneDepthLinear;
+    if (depth == null) return;
+    context.applyShader(
+      _rawPairLibrary!['ViewEdgesFragment']!,
+      textures: {'input_depth': depth},
+      samplers: {
+        'input_depth': gpu.SamplerOptions(
+          minFilter: gpu.MinMagFilter.nearest,
+          magFilter: gpu.MinMagFilter.nearest,
+        ),
+      },
+      uniforms: {'PostCameraInfo': context.cameraInfo},
+      frameInfo: true,
+    );
+  }
+}
+
 class _NormalsProbePass extends CustomRenderPass {
   @override
   String get name => 'normals_probe';
@@ -541,8 +709,146 @@ class _NormalsProbePass extends CustomRenderPass {
   void execute(RenderPassContext context) {}
 }
 
+/// A square of half-width [half] facing the camera at depth [z], colored by
+/// [corners] (one RGBA per corner). Both windings are indexed so culling
+/// never hides it.
+Node _depthBiasQuad(
+  Geometry geometry,
+  double half,
+  double z,
+  UnlitMaterial material, {
+  List<List<double>> corners = const [
+    [1, 1, 1, 1],
+    [1, 1, 1, 1],
+    [1, 1, 1, 1],
+    [1, 1, 1, 1],
+  ],
+}) {
+  const positions = [(-1, -1), (1, -1), (1, 1), (-1, 1)];
+  final vertices = Float32List(4 * 18);
+  for (var i = 0; i < 4; i++) {
+    final (x, y) = positions[i];
+    vertices.setAll(i * 18, [
+      x * half, y * half, 0, 0, 0, -1, //
+      (x + 1) / 2, (y + 1) / 2, 0, 0, ...corners[i], 0, 0, 0, 0,
+    ]);
+  }
+  geometry.uploadVertexData(
+    vertices,
+    4,
+    Uint16List.fromList([0, 1, 2, 0, 2, 3, 0, 2, 1, 0, 3, 2]),
+  );
+  return Node(mesh: Mesh(geometry, material))
+    ..localTransform = vm.Matrix4.translation(vm.Vector3(0, 0, z));
+}
+
+UnlitMaterial _depthBiasMaterial(vm.Vector4 color, {double depthBias = 0}) =>
+    UnlitMaterial()
+      ..baseColorFactor = color
+      ..alphaMode = color.w < 1 ? AlphaMode.blend : AlphaMode.opaque
+      ..doubleSided = true
+      ..depthBias = depthBias;
+
 /// The smoke scene set. Mostly procedural for determinism; the final scenes
 /// exercise a custom `.fmat` material compiled by the build hook.
+/// A cube of half extent [half] in the packed format `packed_vertex.vert`
+/// reads: float positions in one stream and, in another, one code per vertex,
+/// the face index plus eight times [palette].
+UnskinnedGeometry _packedBox(double half, int palette) {
+  final positions = Float32List(24 * 3);
+  final codes = Float32List(24);
+  final indices = Uint16List(36);
+  var v = 0;
+  var i = 0;
+  for (final axis in [0, 1, 2]) {
+    for (final sign in [1.0, -1.0]) {
+      final u = (axis + 1) % 3;
+      final w = (axis + 2) % 3;
+      final face = axis * 2 + (sign > 0 ? 0 : 1);
+      final first = v;
+      for (final (a, b) in [
+        (-1.0, -1.0),
+        (1.0, -1.0),
+        (1.0, 1.0),
+        (-1.0, 1.0),
+      ]) {
+        final p = [0.0, 0.0, 0.0]
+          ..[axis] = sign * half
+          ..[u] = a * half
+          ..[w] = b * half;
+        positions.setAll(v * 3, p);
+        codes[v++] = (face + palette * 8).toDouble();
+      }
+      // Counter-clockwise seen from outside along the face normal.
+      for (final corner in sign < 0 ? [0, 2, 1, 0, 3, 2] : [0, 1, 2, 0, 2, 3]) {
+        indices[i++] = first + corner;
+      }
+    }
+  }
+  return UnskinnedGeometry()
+    ..setVertexLayout(
+      const VertexLayoutDescriptor(
+        buffers: [
+          VertexBufferDescriptor(
+            strideInBytes: 12,
+            attributes: [
+              VertexAttributeDescriptor(
+                name: 'position',
+                format: gpu.VertexFormat.float32x3,
+              ),
+            ],
+          ),
+          VertexBufferDescriptor(
+            strideInBytes: 4,
+            attributes: [
+              VertexAttributeDescriptor(
+                name: 'packed_face',
+                format: gpu.VertexFormat.float32,
+              ),
+            ],
+          ),
+          // The engine's 80-byte instance record: the model transform columns
+          // and the instance color.
+          VertexBufferDescriptor(
+            strideInBytes: 80,
+            stepMode: gpu.VertexStepMode.instance,
+            attributes: [
+              VertexAttributeDescriptor(
+                name: 'model_transform_0',
+                format: gpu.VertexFormat.float32x4,
+              ),
+              VertexAttributeDescriptor(
+                name: 'model_transform_1',
+                format: gpu.VertexFormat.float32x4,
+                offsetInBytes: 16,
+              ),
+              VertexAttributeDescriptor(
+                name: 'model_transform_2',
+                format: gpu.VertexFormat.float32x4,
+                offsetInBytes: 32,
+              ),
+              VertexAttributeDescriptor(
+                name: 'model_transform_3',
+                format: gpu.VertexFormat.float32x4,
+                offsetInBytes: 48,
+              ),
+              VertexAttributeDescriptor(
+                name: 'instance_color',
+                format: gpu.VertexFormat.float32x4,
+                offsetInBytes: 64,
+              ),
+            ],
+          ),
+        ],
+      ),
+    )
+    ..uploadVertexStreams([positions, codes], 24, indices: indices)
+    ..setLocalBounds(
+      vm.Aabb3.minMax(vm.Vector3.all(-half), vm.Vector3.all(half)),
+      vm.Sphere.centerRadius(vm.Vector3.zero(), half * math.sqrt(3)),
+    );
+}
+
 final List<SmokeScene> kSmokeScenes = <SmokeScene>[
   // Diffuse-ish PBR under the default studio IBL.
   SmokeScene('pbr_cuboid', () {
@@ -759,16 +1065,20 @@ final List<SmokeScene> kSmokeScenes = <SmokeScene>[
         );
       }
 
+      // The back wall spans the full outer width and the side walls stop at
+      // its front face, so the walls abut rather than overlap. Overlapping
+      // corners would put two tops in one plane, which flicker (z-fighting)
+      // and resolve differently from one depth setup to the next.
       box(vm.Vector3(3.4, 0.3, 3.4), vm.Vector3(0, -0.15, 0), white);
-      box(vm.Vector3(3.4, 2.0, 0.3), vm.Vector3(0, 1.0, -1.65), white);
+      box(vm.Vector3(3.6, 2.0, 0.3), vm.Vector3(0, 1.0, -1.65), white);
       box(
-        vm.Vector3(0.3, 2.0, 3.4),
-        vm.Vector3(-1.65, 1.0, 0),
+        vm.Vector3(0.3, 2.0, 3.2),
+        vm.Vector3(-1.65, 1.0, 0.1),
         matte(0.02, 0.02, 0.02, emissive: vm.Vector4(14.0, 0.45, 0.3, 1.0)),
       );
       box(
-        vm.Vector3(0.3, 2.0, 3.4),
-        vm.Vector3(1.65, 1.0, 0),
+        vm.Vector3(0.3, 2.0, 3.2),
+        vm.Vector3(1.65, 1.0, 0.1),
         matte(0.02, 0.02, 0.02, emissive: vm.Vector4(0.15, 4.0, 0.28, 1.0)),
       );
       box(vm.Vector3(0.7, 1.1, 1.1), vm.Vector3(0, 0.55, -0.2), white);
@@ -1191,7 +1501,8 @@ final List<SmokeScene> kSmokeScenes = <SmokeScene>[
   // Lens flares off the bloom chain: a single intense emissive card in a
   // dim scene must bloom and cast a ghost chain through the screen center
   // plus a halo ring. Guards the whole bloom pyramid (its only golden) and
-  // the flare ghost/halo/dispersion math across backends.
+  // the flare ghost/halo/dispersion math across backends. The glow carries
+  // over the transparent background to the corners.
   SmokeScene('lens_flare', () {
     final scene = Scene();
     scene.environmentIntensity = 0.05;
@@ -1230,7 +1541,7 @@ final List<SmokeScene> kSmokeScenes = <SmokeScene>[
         target: vm.Vector3(-0.1, 0.55, 0),
       ),
     );
-  }),
+  }, fullCoverage: true),
   // Low-roughness metallic: sensitive to IBL/reflections breaking (would go
   // dark or flat).
   SmokeScene('pbr_metallic', () {
@@ -1398,6 +1709,98 @@ final List<SmokeScene> kSmokeScenes = <SmokeScene>[
     scene.add(caster);
     return (scene: scene, camera: _shadowCamera());
   }),
+  // An isometric orthographic camera whose view volume starts behind the eye
+  // (the eye sits inside the scene), with a shadowed sun, ambient occlusion,
+  // and a custom pass outlining depth and normal edges. A backend or effect
+  // that still assumes perspective reconstruction draws misplaced shadows,
+  // occlusion, or outlines, and geometry behind the eye clips away.
+  SmokeScene('orthographic_camera', () {
+    final scene = Scene();
+    _configureAmbientOcclusion(scene);
+    scene.addRenderPass(_ViewEdgesPass());
+    scene.add(
+      _directionalLightNode(
+        vm.Vector3(-0.4, -1.0, -0.25),
+        DirectionalLight(castsShadow: true, shadowMaxDistance: 12.0),
+      ),
+    );
+    scene.add(
+      Node(
+        mesh: Mesh(
+          PlaneGeometry(width: 3.0, depth: 3.0),
+          PhysicallyBasedMaterial()
+            ..baseColorFactor = vm.Vector4(0.78, 0.78, 0.80, 1.0)
+            ..metallicFactor = 0.0
+            ..roughnessFactor = 0.9
+            ..vertexColorWeight = 0.0,
+        ),
+      ),
+    );
+    final colors = [
+      vm.Vector4(0.85, 0.45, 0.25, 1.0),
+      vm.Vector4(0.30, 0.65, 0.45, 1.0),
+      vm.Vector4(0.30, 0.45, 0.85, 1.0),
+    ];
+    for (var i = 0; i < 3; i++) {
+      scene.add(
+        _cuboid(colors[i], 0.0, 0.6)
+          ..localTransform =
+              vm.Matrix4.translation(
+                vm.Vector3(-0.8 + i * 0.8, 0.5 + i * 0.35, 0.6 - i * 0.6),
+              ) *
+              vm.Matrix4.rotationY(0.3 * i),
+      );
+    }
+    return (
+      scene: scene,
+      camera: OrthographicCamera(
+        position: vm.Vector3(0.4, 0.4, 0.4),
+        target: vm.Vector3.zero(),
+        projection: OrthographicProjection(
+          size: const OrthographicSize.contain(5.2, 5.2),
+          near: -10.0,
+          far: 10.0,
+        ),
+      ),
+    );
+  }, preload: loadSmokeMaterials),
+  // The surface debug views. The left half is the lit shadow scene, the
+  // right half its world normals (split at the middle), and the wireframe
+  // overlay traces every edge on both. Covers the material hook, the split
+  // select, the resolve bypass, and the edge overlay in one frame; a
+  // backend whose hook does not compile draws the whole scene wrong.
+  SmokeScene('debug_view', () {
+    final scene = Scene();
+    scene.add(
+      _directionalLightNode(
+        vm.Vector3(-0.4, -1.0, -0.35),
+        DirectionalLight(castsShadow: true, shadowMaxDistance: 20.0),
+      ),
+    );
+    scene.add(
+      Node(
+        mesh: Mesh(
+          PlaneGeometry(width: 3.0, depth: 3.0),
+          PhysicallyBasedMaterial()
+            ..baseColorFactor = vm.Vector4(0.78, 0.78, 0.80, 1.0)
+            ..metallicFactor = 0.0
+            ..roughnessFactor = 0.9
+            ..vertexColorWeight = 0.0,
+        ),
+      ),
+    );
+    final caster = _cuboid(vm.Vector4(0.85, 0.45, 0.25, 1.0), 0.0, 0.6)
+      ..localTransform =
+          vm.Matrix4.translation(vm.Vector3(0, 1.0, 0)) *
+          vm.Matrix4.rotationY(0.6);
+    scene.add(caster);
+    scene.debug.view = const DebugView(
+      channel: SurfaceDebugChannel.worldNormal,
+    );
+    scene.debug.split = 0.5;
+    scene.debug.overlays.add(DebugOverlay.wireframe);
+    return (scene: scene, camera: _shadowCamera());
+  }),
   // Both shadow-catcher modes in one frame, two catcher planes side by side
   // under one shadow-casting sun, each with the same chiral caster above it.
   // One plane bakes its footprint cache, the other samples the atlas live,
@@ -1511,17 +1914,65 @@ final List<SmokeScene> kSmokeScenes = <SmokeScene>[
     );
     return (scene: scene, camera: _camera());
   }),
+  // One PNG uploaded through the encoded-image path on two unlit quads. The
+  // near quad is texel-sized, so its checker resolves; the far quad is minified
+  // to a level the box filter has collapsed to a flat gray. Averaged in linear
+  // light that gray is 188, averaged in sRGB space it is 128, so the far quad
+  // reads whether this backend's chain (CPU or GPU) matches the others. The
+  // scene renders at the view's pixel ratio while the capture is logical, so
+  // the far quad is small enough to stay past level 1 at a ratio of 3.
+  SmokeScene('texture_mips', () {
+    final material = UnlitMaterial()..baseColorTexture = _mipChecker!;
+    final scene = Scene();
+    // The rotation turns each plane to face +z, square on to the camera.
+    Node quad(double size, vm.Vector3 position) =>
+        Node(
+            mesh: Mesh(PlaneGeometry(width: size, depth: size), material),
+          )
+          ..localTransform =
+              vm.Matrix4.translation(position) *
+              vm.Matrix4.rotationX(math.pi / 2);
+    scene.add(quad(0.8, vm.Vector3(0.45, 0, 0)));
+    scene.add(quad(0.03, vm.Vector3(-0.45, 0, 0)));
+    return (
+      scene: scene,
+      camera: PerspectiveCamera(
+        position: vm.Vector3(0, 0, 2.2),
+        target: vm.Vector3.zero(),
+      ),
+    );
+  }, preload: loadMipChecker),
   // Two quads sampling KHR_texture_basisu KTX2 textures through the standard
   // glTF path, one a mipped zstd-supercompressed UASTC sRGB file with no
   // alpha, the other an ETC1S sRGB file whose alpha blob is drawn with alpha
   // blending, so the magenta clear reads through everywhere it thins.
   // The quads themselves arrive Draco-compressed, so one scene covers
   // compressed geometry import and Basis Universal transcode all the way to
-  // pixels. Both materials are unlit, so the frame reads the decoded texels
-  // rather than a lighting response.
+  // pixels. A third, smaller quad draws a texture the build hook cooked to
+  // ETC1S, covering the encoder's path to the GPU. Every material is unlit,
+  // so the frame reads the decoded texels rather than a lighting response.
   SmokeScene('basisu_textures', () {
     final scene = Scene();
     scene.add(_basisuQuads!);
+    // Below them, a texture the build hook cooked to ETC1S, drawn through
+    // loadTexture. The rotation turns the plane to face the camera at -z, and
+    // the transform flips v so the frame reads like the source image.
+    scene.add(
+      Node(
+          mesh: Mesh(
+            PlaneGeometry(width: 0.5, depth: 0.5),
+            UnlitMaterial()
+              ..baseColorTexture = _etc1sCooked!
+              ..baseColorTextureTransform = TextureTransform(
+                offset: vm.Vector2(0, 1),
+                scale: vm.Vector2(1, -1),
+              ),
+          ),
+        )
+        ..localTransform =
+            vm.Matrix4.translationValues(0, -0.95, 0) *
+            vm.Matrix4.rotationX(-math.pi / 2),
+    );
     return (
       scene: scene,
       // Square on to the quads' front, which the root handedness flip puts on
@@ -1531,7 +1982,7 @@ final List<SmokeScene> kSmokeScenes = <SmokeScene>[
         target: vm.Vector3.zero(),
       ),
     );
-  }, preload: loadBasisuQuads),
+  }, preload: loadBasisuTextures),
   // The single custom-material scene: one .fmat that customizes BOTH the
   // vertex stage (a world-space ripple, which also displaces the shadow) and
   // the fragment color (blended from a per-vertex attribute forwarded through a
@@ -1584,6 +2035,28 @@ final List<SmokeScene> kSmokeScenes = <SmokeScene>[
           UnlitMaterial()..baseColorFactor = vm.Vector4(0.2, 0.9, 1.0, 1.0),
         ),
       )..localTransform = vm.Matrix4.translation(vm.Vector3(0, 0.5, 0)),
+    );
+    // Mesh and material need not agree on custom attributes. A patch with no
+    // `phase` stream drawn with the material reads it as zero, and the hero
+    // grid, which carries one, still draws with a built-in material.
+    scene.add(
+      Node(mesh: Mesh(PlaneGeometry(width: 0.7, depth: 0.7), material))
+        ..localTransform = vm.Matrix4.translation(vm.Vector3(1.3, 0.3, 0.8)),
+    );
+    scene.add(
+      Node(
+          mesh: Mesh(
+            grid,
+            PhysicallyBasedMaterial()
+              ..baseColorFactor = vm.Vector4(0.9, 0.45, 0.15, 1.0)
+              ..metallicFactor = 0.0
+              ..roughnessFactor = 0.6
+              ..vertexColorWeight = 0.0,
+          ),
+        )
+        ..localTransform =
+            vm.Matrix4.translation(vm.Vector3(0.1, 0.3, 1.5)) *
+            vm.Matrix4.diagonal3Values(0.35, 1.0, 0.35),
     );
     return (scene: scene, camera: _shadowCamera());
   }, preload: loadSmokeMaterials),
@@ -1734,25 +2207,388 @@ final List<SmokeScene> kSmokeScenes = <SmokeScene>[
   // displacement with it, which is what separates the two orderings, and the
   // per-corner vertex colors make a twist or a flip read directly. The
   // second copy is the same mesh and skin at rest weights, so a morph that
-  // stops blending collapses the pair into two identical shapes.
-  // [loadMorphSkinnedModel] asserts the geometry took the GPU path.
+  // stops blending collapses the pair into two identical shapes. The third
+  // copy has no skin, so it covers the unskinned morph path and stands
+  // straight while still bulging, hooking, and twisting.
+  // [loadMorphSkinnedModel] asserts every geometry took the GPU path.
   SmokeScene('morph_skinned', () {
     final scene = Scene();
     Node placed(Node model, double x) => Node()
       ..localTransform = vm.Matrix4.translation(vm.Vector3(x, 0, 0))
       ..add(model);
-    scene.add(placed(_morphSkinnedRest!, -1.0));
-    scene.add(placed(_morphSkinnedModel!, 1.0));
+    scene.add(placed(_morphSkinnedRest!, -1.1));
+    scene.add(placed(_morphSkinnedModel!, 0.8));
+    scene.add(placed(_morphUnskinnedModel!, 2.4));
     return (
       scene: scene,
       // Imported glTF sits behind the root handedness flip, so the model's
       // front faces -z; the camera views it from there.
       camera: PerspectiveCamera(
-        position: vm.Vector3(0.5, 2.0, -5.6),
-        target: vm.Vector3(0, 0.9, 0),
+        position: vm.Vector3(0.6, 2.0, -7.4),
+        target: vm.Vector3(0.6, 1.0, 0),
       ),
     );
   }, preload: loadMorphSkinnedModel),
+  // Three translucent squares behind an opaque wall, drawn back to front on
+  // one pipeline. The middle one is CPU-morphed (its 2100 targets overflow
+  // the delta texture) with a 0.75 depth bias, so it takes the full geometry
+  // bind. The green square sits 0.2 behind the wall with no bias and must
+  // stay hidden; inheriting the middle draw's bias pulls it in front.
+  SmokeScene('depth_bias_rebind', () {
+    final morphed = MorphedUnskinnedGeometry(
+      MorphTargetData(
+        vertexCount: 4,
+        targetCount: 2100,
+        positionDeltas: Float32List(2100 * 4 * 3),
+      ),
+    );
+    if (morphed.usesGpuMorphing) {
+      throw StateError('depth_bias_rebind expects CPU morphing');
+    }
+    final blue = vm.Vector4(0.1, 0.2, 1, 0.9);
+    final scene = Scene()
+      ..add(
+        _depthBiasQuad(
+          UnskinnedGeometry(),
+          1.5,
+          5.0,
+          _depthBiasMaterial(vm.Vector4(1, 1, 1, 1)),
+          corners: const [
+            [0.9, 0.05, 0.05, 1],
+            [0.6, 0.0, 0.3, 1],
+            [0.9, 0.3, 0.0, 1],
+            [0.5, 0.05, 0.1, 1],
+          ],
+        ),
+      )
+      ..add(
+        _depthBiasQuad(UnskinnedGeometry(), 1, 8.0, _depthBiasMaterial(blue)),
+      )
+      ..add(
+        _depthBiasQuad(
+          morphed,
+          1,
+          6.5,
+          _depthBiasMaterial(blue, depthBias: 0.75),
+        ),
+      )
+      ..add(
+        _depthBiasQuad(
+          UnskinnedGeometry(),
+          0.5,
+          5.2,
+          _depthBiasMaterial(vm.Vector4(0, 1, 0, 0.9)),
+        ),
+      );
+    return (
+      scene: scene,
+      camera: PerspectiveCamera(
+        position: vm.Vector3.zero(),
+        target: vm.Vector3(0, 0, 1),
+      ),
+    );
+  }),
+  // Opaque surfaces that cut themselves out: a card masked by its texture's
+  // alpha (a grid of round holes), and an object held mid level-of-detail
+  // cross-fade between a lit sphere and an unlit cube. Both take the main
+  // pass's coverage pre-draw, so the gray backdrop must show through the holes
+  // and through each level's half of the dither.
+  SmokeScene('coverage_cutouts', () {
+    const size = 64;
+    final pixels = Uint8List(size * size * 4);
+    for (var y = 0; y < size; y++) {
+      for (var x = 0; x < size; x++) {
+        final i = (y * size + x) * 4;
+        final dx = (x % 16) - 7.5, dy = (y % 16) - 7.5;
+        pixels[i] = 235;
+        pixels[i + 1] = 190;
+        pixels[i + 2] = 40;
+        pixels[i + 3] = dx * dx + dy * dy < 20 ? 0 : 255;
+      }
+    }
+    final card = PhysicallyBasedMaterial()
+      ..alphaMode = AlphaMode.mask
+      ..baseColorTexture = Texture2D.fromPixels(pixels, size, size)
+      ..metallicFactor = 0.0
+      ..roughnessFactor = 0.8;
+    // FXAA, which `auto` picks on lower-tier backends, blends the one-pixel
+    // dither away, so the dither itself is what this frame compares.
+    final scene = Scene()..antiAliasingMode = AntiAliasingMode.none;
+    scene.add(
+      Node(
+          mesh: Mesh(
+            PlaneGeometry(width: 5, depth: 5),
+            UnlitMaterial()..baseColorFactor = vm.Vector4(0.3, 0.3, 0.3, 1),
+          ),
+        )
+        ..localTransform =
+            vm.Matrix4.translation(vm.Vector3(0, 0, -1)) *
+            vm.Matrix4.rotationX(math.pi / 2),
+    );
+    scene.add(
+      Node(mesh: Mesh(PlaneGeometry(width: 1.1, depth: 1.1), card))
+        ..localTransform =
+            vm.Matrix4.translation(vm.Vector3(-0.6, 0, 0)) *
+            vm.Matrix4.rotationX(math.pi / 2),
+    );
+    // A green quad, then a fully cut-away red twin with identical geometry,
+    // so every pixel of the twin ties the green's depth exactly. The cut-away
+    // twin must leave the green showing, not pass an equal depth test on it.
+    MeshGeometry twin() => MeshGeometry.fromArrays(
+      positions: Float32List.fromList([
+        -0.5, 0, -0.2, -0.5, 0, 0.2, 0.5, 0, 0.2, 0.5, 0, -0.2, //
+      ]),
+      colors: Float32List.fromList([
+        for (var i = 0; i < 4; i++) ...[1.0, 1.0, 1.0, 0.0],
+      ]),
+      indices: const [0, 1, 2, 0, 2, 3],
+    );
+    final twinTransform =
+        vm.Matrix4.translation(vm.Vector3(0, -0.85, 0)) *
+        vm.Matrix4.rotationX(math.pi / 2);
+    scene.add(
+      Node(
+          mesh: Mesh(
+            twin(),
+            UnlitMaterial()
+              ..baseColorFactor = vm.Vector4(0.1, 0.8, 0.2, 1)
+              ..vertexColorWeight = 0.0,
+          ),
+        )
+        ..renderOrder = -1
+        ..localTransform = twinTransform,
+    );
+    scene.add(
+      Node(
+        mesh: Mesh(
+          twin(),
+          PhysicallyBasedMaterial()
+            ..alphaMode = AlphaMode.mask
+            ..baseColorFactor = vm.Vector4(1, 0, 0, 1),
+        ),
+      )..localTransform = twinTransform,
+    );
+    // One masked mesh with a wide cyan layer behind a narrow magenta one,
+    // the farther layer first in index order. The color draw reaches the cyan
+    // layer first where they overlap and fails its equal depth test there;
+    // the magenta layer must still shade.
+    List<double> band(double halfWidth, double z) => [
+      -halfWidth, 0.65, z, halfWidth, 0.65, z, //
+      halfWidth, 1.05, z, -halfWidth, 1.05, z, //
+    ];
+    List<double> tint(double r, double g, double b) => [
+      for (var i = 0; i < 4; i++) ...[r, g, b, 1.0],
+    ];
+    scene.add(
+      Node(
+        mesh: Mesh(
+          MeshGeometry.fromArrays(
+            positions: Float32List.fromList([
+              ...band(0.7, -0.3),
+              ...band(0.3, 0),
+            ]),
+            colors: Float32List.fromList([...tint(0, 1, 1), ...tint(1, 0, 1)]),
+            indices: const [0, 1, 2, 0, 2, 3, 4, 5, 6, 4, 6, 7],
+          ),
+          PhysicallyBasedMaterial()
+            ..alphaMode = AlphaMode.mask
+            ..doubleSided = true
+            ..roughnessFactor = 0.8,
+        ),
+      ),
+    );
+    // A blend band this wide puts the object's size inside it, so both
+    // levels draw with complementary dithers.
+    scene.add(
+      Node()
+        ..position = vm.Vector3(0.6, 0, 0)
+        ..addComponent(
+          LodComponent([
+            LodLevel(
+              geometry: SphereGeometry(radius: 0.45),
+              material: PhysicallyBasedMaterial()
+                ..baseColorFactor = vm.Vector4(0.9, 0.15, 0.1, 1)
+                ..roughnessFactor = 0.5,
+              screenSize: 0.4,
+            ),
+            LodLevel(
+              geometry: CuboidGeometry(vm.Vector3.all(0.6)),
+              material: UnlitMaterial()
+                ..baseColorFactor = vm.Vector4(0.1, 0.35, 0.95, 1),
+              screenSize: 0.0,
+            ),
+          ], blendRange: 0.9),
+        ),
+    );
+    return (
+      scene: scene,
+      camera: PerspectiveCamera(
+        position: vm.Vector3(0, 0, 3.2),
+        target: vm.Vector3.zero(),
+      ),
+    );
+  }, fullCoverage: true),
+  // Overlays flush on their surfaces at depth layer 1 (a screen on its
+  // backing, road paint on a long ground plane seen at a grazing angle),
+  // window bands 4 cm proud of towers 150 m away, and an alpha-masked patch
+  // on the road that shows nothing, under the engine's depth defaults. The
+  // probe must find nothing fighting on any backend.
+  SmokeScene(
+    'depth_layering',
+    () {
+      UnlitMaterial flat(double r, double g, double b, {int layer = 0}) =>
+          UnlitMaterial()
+            ..baseColorFactor = vm.Vector4(r, g, b, 1)
+            ..depthLayer = layer;
+      Node box(vm.Vector3 size, UnlitMaterial material, vm.Vector3 at) =>
+          Node(mesh: Mesh(CuboidGeometry(size), material))..position = at;
+      final scene = Scene();
+      scene.add(
+        Node(
+          name: 'road',
+          mesh: Mesh(
+            PlaneGeometry(width: 12, depth: 400),
+            flat(0.22, 0.22, 0.24),
+          ),
+        )..position = vm.Vector3(0, 0, 195),
+      );
+      // An opaque-pass cutout fully cut away by its vertex alpha, so the
+      // probe must test its coverage, not its quad.
+      scene.add(
+        Node(
+          name: 'cutout',
+          mesh: Mesh(
+            MeshGeometry.fromArrays(
+              positions: Float32List.fromList([
+                -2, 0, -2, -2, 0, 2, 2, 0, 2, 2, 0, -2, //
+              ]),
+              colors: Float32List.fromList([
+                for (var i = 0; i < 4; i++) ...[1.0, 0.0, 0.0, 0.0],
+              ]),
+              indices: const [0, 1, 2, 0, 2, 3],
+            ),
+            PhysicallyBasedMaterial()..alphaMode = AlphaMode.mask,
+          ),
+        )..position = vm.Vector3(-3, 0, 14),
+      );
+      final paint = flat(0.95, 0.92, 0.8, layer: 1);
+      for (var z = 2.0; z < 200; z += 6) {
+        scene.add(
+          Node(
+            name: 'paint',
+            mesh: Mesh(PlaneGeometry(width: 0.25, depth: 3), paint),
+          )..position = vm.Vector3(0, 0, z),
+        );
+      }
+      scene.add(
+        box(vm.Vector3(6, 3, 0.3), flat(0.02, 0.02, 0.02), vm.Vector3(0, 4, 24))
+          ..name = 'backing',
+      );
+      scene.add(
+        Node(
+            name: 'screen',
+            mesh: Mesh(
+              PlaneGeometry(width: 5.4, depth: 2.4),
+              flat(0.95, 0.3, 0.6, layer: 1),
+            ),
+          )
+          ..position = vm.Vector3(0, 4, 24 - 0.15)
+          ..rotation = vm.Quaternion.axisAngle(
+            vm.Vector3(1, 0, 0),
+            -math.pi / 2,
+          ),
+      );
+      final tower = flat(0.12, 0.12, 0.18);
+      final band = flat(1.0, 0.7, 0.3);
+      for (var i = 0; i < 6; i++) {
+        final x = -45.0 + i * 18;
+        final height = 20.0 + (i % 3) * 8;
+        scene.add(
+          box(vm.Vector3(12, height, 12), tower, vm.Vector3(x, height / 2, 150))
+            ..name = 'tower',
+        );
+        scene.add(
+          box(
+            vm.Vector3(12.08, 0.8, 12.08),
+            band,
+            vm.Vector3(x, height * 0.6, 150),
+          )..name = 'band',
+        );
+      }
+      return (
+        scene: scene,
+        camera: PerspectiveCamera(
+          position: vm.Vector3(1.2, 2.0, 0),
+          target: vm.Vector3(0, 4.5, 40),
+          fovRadiansY: 50 * vm.degrees2Radians,
+          fovFar: 500,
+        ),
+      );
+    },
+    fullCoverage: true,
+    maxDepthConflictPixels: 32,
+  ),
+  // The skinned tube with its weights summing to 0.98, placed 3 km from the
+  // origin. A joint matrix carries the model's world position, so an
+  // unnormalized weight sum pulls every vertex toward the origin by 2% of
+  // that distance (60 m here) and the tube draws as rails; the normalized
+  // sum keeps it whole. No CI lane honors mediump, so the small-scale normal
+  // underflow the vertex-stage normalization also fixes has no capture.
+  SmokeScene('skinned_weight_sum', () {
+    final scene = Scene();
+    final model = _weightSumModel!;
+    model.localTransform = vm.Matrix4.translation(vm.Vector3(3000, 0, 0));
+    scene.add(model);
+    return (
+      scene: scene,
+      camera: PerspectiveCamera(
+        position: vm.Vector3(3000.5, 2.0, -5.6),
+        target: vm.Vector3(3000, 0.9, 0),
+      ),
+    );
+  }, preload: loadWeightSumModel),
+  // Nine unit cubes ahead of the camera and twenty-seven behind it. The
+  // frame shows the nine; the counters have to say the other twenty-seven
+  // were culled, which is what a rejected BVH subtree never reported.
+  SmokeScene('bvh_culled', () {
+    final scene = Scene();
+    var index = 0;
+    void cube(double x, double y, double z) {
+      final tint = vm.Vector4(
+        0.25 + 0.75 * (index % 3) / 2,
+        0.25 + 0.75 * ((index ~/ 3) % 3) / 2,
+        0.9,
+        1,
+      );
+      scene.add(
+        Node(
+          name: 'cube${index++}',
+          mesh: Mesh(
+            CuboidGeometry(vm.Vector3.all(1)),
+            UnlitMaterial()..baseColorFactor = tint,
+          ),
+        )..position = vm.Vector3(x, y, z),
+      );
+    }
+
+    for (var row = -1; row <= 1; row++) {
+      for (var column = -1; column <= 1; column++) {
+        cube(column * 1.6, row * 1.6, 6);
+      }
+    }
+    for (var row = -1; row <= 1; row++) {
+      for (var column = -4; column <= 4; column++) {
+        cube(column * 1.6, row * 1.6, -6);
+      }
+    }
+    return (
+      scene: scene,
+      camera: PerspectiveCamera(
+        position: vm.Vector3.zero(),
+        target: vm.Vector3(0, 0, 1),
+      ),
+    );
+  }, colorPassCounters: const {'draws': 9, 'submitted': 36, 'culled': 27}),
 
   // A hand-written vertex/fragment pair driven through ShaderMaterial, with no
   // engine vertex shader involved. The vertex stage displaces the grid along
@@ -1817,6 +2653,75 @@ final List<SmokeScene> kSmokeScenes = <SmokeScene>[
         target: vm.Vector3.zero(),
       ),
     );
+  }, preload: loadSmokeMaterials),
+
+  // A caller-defined vertex format: two boxes in a 16-byte packed vertex
+  // (a float position stream plus one packed code per vertex) drawn by the
+  // engine's lit material, casting onto a mesh with no texture coordinates
+  // or colors. The left box declares a position-only depth vertex; the right
+  // one leaves depth to its full vertex shader. A backend that misreads the
+  // second stream draws black or garbled boxes, and a broken depth path
+  // drops a shadow.
+  SmokeScene('packed_vertex_format', () {
+    // Dim ambient, so both shadows read against the ground.
+    final scene = Scene()..environmentIntensity = 0.3;
+    scene.add(
+      _directionalLightNode(
+        vm.Vector3(0.6, -1.0, 0.7),
+        DirectionalLight(castsShadow: true, shadowMaxDistance: 20.0),
+      ),
+    );
+    final lit = PhysicallyBasedMaterial()
+      ..metallicFactor = 0.0
+      ..roughnessFactor = 0.8;
+    // Normals are generated; texture coordinates, colors, and tangents are
+    // absent, so they bind the shared default streams.
+    scene.add(
+      Node(
+        mesh: Mesh(
+          MeshGeometry.fromArrays(
+            positions: Float32List.fromList([
+              -1.6, 0, -1.3, //
+              1.6, 0, -1.3, //
+              -1.6, 0, 1.3, //
+              1.6, 0, 1.3, //
+            ]),
+            indices: const [0, 2, 1, 1, 2, 3],
+          ),
+          lit,
+        ),
+      ),
+    );
+    final library = _rawPairLibrary!;
+    final depthVertex = library['PackedVertexDepth']!;
+    for (final (x, z, palette, declaresDepth) in [
+      (0.75, -0.65, 0, true),
+      (-0.75, 0.65, 1, false),
+    ]) {
+      final geometry = _packedBox(0.3, palette)
+        ..setVertexShader(library['PackedVertex']!);
+      if (declaresDepth) {
+        geometry.setDepthOnlyVertex(
+          depthVertex,
+          positionStream: const VertexBufferDescriptor(
+            strideInBytes: 12,
+            attributes: [
+              VertexAttributeDescriptor(
+                name: 'position',
+                format: gpu.VertexFormat.float32x3,
+              ),
+            ],
+          ),
+        );
+      }
+      scene.add(
+        Node(mesh: Mesh(geometry, lit))
+          ..localTransform =
+              vm.Matrix4.translation(vm.Vector3(x, 0.3, z)) *
+              vm.Matrix4.rotationY(0.5),
+      );
+    }
+    return (scene: scene, camera: _shadowCamera());
   }, preload: loadSmokeMaterials),
 
   // A pre-baked KTX2 radiance cubemap loaded straight from file bytes, with no
@@ -1977,10 +2882,8 @@ final List<SmokeScene> kSmokeScenes = <SmokeScene>[
   // sweeps red to blue across the grid and dark to bright along it, and the
   // float lifts each cube (vertex stage) while ramping its gloss (fragment
   // stage), so a mispacked instance record scrambles the gradient or flattens
-  // the staircase. The light casts so the depth and shadow variants render
-  // too; they bind no instance data and read zero (the documented contract),
-  // so every cube's shadow sits in the flat unlifted grid while the cubes
-  // themselves stair-step above it.
+  // the staircase. The light casts, and the shadow pass runs the same vertex
+  // variant, so each cube's shadow follows it up the staircase.
   SmokeScene('instance_attributes', () {
     final scene = Scene();
     scene.add(
@@ -2036,6 +2939,56 @@ final List<SmokeScene> kSmokeScenes = <SmokeScene>[
   }, preload: loadSmokeMaterials),
 ];
 
+/// A near red square in front of a far green wall, for the anti-aliasing
+/// switch probe. Not part of [kSmokeScenes]; its test samples the center
+/// pixel numerically after switching the scene from MSAA to none. Both
+/// surfaces live in one mesh with the wall's triangles indexed after the
+/// square's, so the draw order is fixed regardless of sorting; a frame that
+/// lost its depth test paints the wall over the square and the center reads
+/// green instead of red.
+({Scene scene, PerspectiveCamera camera}) buildDepthPairingScene() {
+  final scene = Scene()
+    ..toneMapping = ToneMappingMode.linear
+    ..environment = EnvironmentMap.empty();
+  final positions = <double>[];
+  final colors = <double>[];
+  final indices = <int>[];
+  // Emits a camera-facing square with both windings, so the probe does not
+  // depend on the cull mode.
+  void square(double half, double z, List<double> color) {
+    final base = positions.length ~/ 3;
+    for (final (x, y) in [
+      (-half, -half),
+      (half, -half),
+      (half, half),
+      (-half, half),
+    ]) {
+      positions.addAll([x, y, z]);
+      colors.addAll(color);
+    }
+    indices.addAll([base, base + 1, base + 2, base, base + 2, base + 3]);
+    indices.addAll([base, base + 2, base + 1, base, base + 3, base + 2]);
+  }
+
+  square(0.5, -2.0, [1.0, 0.0, 0.0, 1.0]);
+  square(3.0, -6.0, [0.0, 1.0, 0.0, 1.0]);
+  final geometry = MeshGeometry.fromArrays(
+    positions: Float32List.fromList(positions),
+    colors: Float32List.fromList(colors),
+    indices: indices,
+  );
+  scene.add(
+    Node(mesh: Mesh(geometry, UnlitMaterial()..vertexColorWeight = 1.0)),
+  );
+  return (
+    scene: scene,
+    camera: PerspectiveCamera(
+      position: vm.Vector3(0, 0, 3.0),
+      target: vm.Vector3(0, 0, -6.0),
+    ),
+  );
+}
+
 /// Renders one [SmokeScene] into a fixed-size [RepaintBoundary] over the
 /// magenta clear.
 /// The CPU/GPU noise parity probe (see `assets/noise_parity.fmat`). Not part
@@ -2074,12 +3027,15 @@ class SmokeSceneView extends StatefulWidget {
   final SmokeScene scene;
 
   @override
-  State<SmokeSceneView> createState() => _SmokeSceneViewState();
+  State<SmokeSceneView> createState() => SmokeSceneViewState();
 }
 
-class _SmokeSceneViewState extends State<SmokeSceneView> {
+class SmokeSceneViewState extends State<SmokeSceneView> {
   late final Scene _scene;
-  late final PerspectiveCamera _camera;
+  late final Camera _camera;
+
+  /// The rendered scene, for the test's frame diagnostics.
+  Scene get scene => _scene;
 
   @override
   void initState() {
@@ -2088,10 +3044,10 @@ class _SmokeSceneViewState extends State<SmokeSceneView> {
     _scene = setup.scene;
     _camera = setup.camera;
 
-    // The first paint happens before flutter_scene's static resources finish
-    // loading and is skipped; this view is otherwise static, so trigger one
-    // repaint when initialization completes so the scene actually renders.
-    Scene.initializeStaticResources().then((_) {
+    // The first paint happens before flutter_scene's resources finish loading
+    // and is skipped; this view is otherwise static, so trigger one repaint
+    // once they have, including the ones that otherwise load on first use.
+    Scene.preload(smaa: true).then((_) {
       if (mounted) setState(() {});
     });
   }
@@ -2119,7 +3075,7 @@ class _SmokePainter extends CustomPainter {
   _SmokePainter(this.scene, this.camera);
 
   final Scene scene;
-  final PerspectiveCamera camera;
+  final Camera camera;
 
   @override
   void paint(Canvas canvas, Size size) {

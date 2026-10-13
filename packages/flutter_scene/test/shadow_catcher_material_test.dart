@@ -1,3 +1,6 @@
+@TestOn('vm')
+library;
+
 import 'dart:convert';
 import 'dart:io';
 import 'dart:ui' show Color;
@@ -9,6 +12,8 @@ import 'package:flutter_scene/src/fmat/build_materials.dart';
 import 'package:flutter_scene/src/fmat/fmat.dart';
 // ignore: implementation_imports
 import 'package:flutter_scene/src/gpu/gpu.dart' as gpu;
+// ignore: implementation_imports
+import 'package:flutter_scene/src/material/physical_material_variant.dart';
 // ignore: implementation_imports
 import 'package:flutter_scene/src/render/render_scene.dart';
 // ignore: implementation_imports
@@ -72,6 +77,11 @@ Set<String> _samplerNames(Object? reflection) {
 }
 
 void main() {
+  // These cover the catcher once its shaders are in; without them it draws
+  // nothing (physical_bundle_on_demand_test.dart).
+  setUp(() => debugPhysicalMaterialResourcesReadyOverride = true);
+  tearDown(resetPhysicalMaterialResourcesForTesting);
+
   test('shadow catcher compiles two variants and no cube twins', () {
     final compiled = _compileCatcher();
     final variants = emitFragmentShaderVariants(
@@ -90,7 +100,7 @@ void main() {
       expect(
         glsl,
         contains(
-          'frag_color = vec4(material.base_color.rgb, 1.0) * '
+          'return vec4(material.base_color.rgb, 1.0) * '
           'material.base_color.a;',
         ),
       );

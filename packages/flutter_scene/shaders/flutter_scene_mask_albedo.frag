@@ -4,6 +4,8 @@
 // with the engine's full vertex shaders (the UVs and vertex color come from
 // the varyings); MaskInfo matches flutter_scene_mask.frag.
 
+// Varyings only; nothing here reads the view axis.
+#define FLUTTER_SCENE_NO_VIEW_INFO
 #include <material_varyings.glsl>
 #include <material_inputs.glsl>
 #include <mask_surface.glsl>

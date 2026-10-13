@@ -15,23 +15,40 @@ import 'package:flutter_scene/src/runtime_importer/runtime_importer.dart';
 import 'package:flutter_scene/src/scene.dart';
 import 'package:flutter_scene/src/animation.dart';
 import 'package:flutter_scene/src/mesh.dart';
+import 'package:flutter_scene/src/render/debug_view.dart';
 import 'package:flutter_scene/src/render/render_layers.dart';
 import 'package:flutter_scene/src/render/render_scene.dart';
 import 'package:flutter_scene/src/skin.dart';
 import 'package:vector_math/vector_math.dart';
 import 'package:vector_math/vector_math.dart' as vm;
 
-void _visitMutable<T>(List<T> items, void Function(T item) visit) {
+/// Visits [items] in order while tolerating mutation by [visit].
+///
+/// Pass [index] and [justVisited] to resume after the caller visited
+/// `items[index]` itself and found the list changed.
+void _visitMutable<T extends Object>(
+  List<T> items,
+  void Function(T item) visit, {
+  int index = 0,
+  T? justVisited,
+}) {
   HashSet<T>? visited;
-  var index = 0;
-  while (index < items.length) {
-    final item = items[index];
-    final tracked = visited;
-    if (tracked != null && tracked.contains(item)) {
-      index++;
-      continue;
+  var resumed = justVisited;
+  while (resumed != null || index < items.length) {
+    final T item;
+    if (resumed != null) {
+      item = resumed;
+      resumed = null;
+    } else {
+      item = items[index];
+      final tracked = visited;
+      if (tracked != null && tracked.contains(item)) {
+        index++;
+        continue;
+      }
+      visit(item);
     }
-    visit(item);
+    final tracked = visited;
 
     // Unmutated and detachment paths stay linear and allocation-free.
     // Insertion before the cursor creates identity tracking.
@@ -122,6 +139,16 @@ base class Node implements SceneGraph {
   /// inherited by children.
   int layers = kRenderLayerDefault;
 
+  /// Where this node's meshes draw within their pass, lowest first. Draws
+  /// sort by it before anything else: opaque ones before their state and
+  /// depth sort, translucent ones before their back-to-front sort. Use it to
+  /// pin the order of overlapping translucent surfaces that depth sorting
+  /// gets wrong (a thing seen through glass, or parts of one object). The
+  /// default 0 leaves ordering to the renderer. Not inherited by children.
+  // TODO(render-order-fscene): carry it in the .fscene document so authored
+  // scenes and the editor can set it.
+  double renderOrder = 0.0;
+
   // TODO(fscene): serialize this mask (NodeSpec field + json + diff).
   /// The light channels this node's meshes occupy, an 8-bit bitmask. A light
   /// reaches them only when its own channel mask intersects this one
@@ -136,6 +163,39 @@ base class Node implements SceneGraph {
   /// and the other way around.
   /// {@category Scene graph}
   int lightChannelMask = 0xFF;
+
+  /// A surface debug view for this subtree, overriding the scene's
+  /// `Scene.debug.view`. Null (the default) inherits from the nearest
+  /// ancestor that sets one, then the scene. [DebugView.none] excludes the
+  /// subtree from an active scene view, so it shades normally.
+  /// {@category Scene graph}
+  DebugView? get debugView => _debugView;
+  set debugView(DebugView? value) {
+    if (identical(_debugView, value)) return;
+    if ((_debugView == null) != (value == null)) {
+      _debugViewOverrideCount += value == null ? -1 : 1;
+    }
+    _debugView = value;
+  }
+
+  DebugView? _debugView;
+
+  /// How many nodes currently set [debugView], across every scene. Zero
+  /// means the per-item resolution can be skipped this frame.
+  @internal
+  static int get debugViewOverrideCount => _debugViewOverrideCount;
+  static int _debugViewOverrideCount = 0;
+
+  /// The nearest [debugView] up this node's ancestry, or null when no
+  /// ancestor sets one.
+  @internal
+  DebugView? get effectiveDebugView {
+    for (Node? node = this; node != null; node = node._parent) {
+      final view = node._debugView;
+      if (view != null) return view;
+    }
+    return null;
+  }
 
   /// Marks this node's meshes as static shadow casters: their geometry,
   /// material coverage, and world transform are promised not to change while
@@ -463,6 +523,30 @@ base class Node implements SceneGraph {
     return _worldTransform;
   }
 
+  /// The world-space direction this node's local `+Z` axis points along (unit
+  /// length), the forward axis [lookAt] aims.
+  /// {@category Scene graph}
+  Vector3 get forward {
+    final world = globalTransform.storage;
+    return Vector3(world[8], world[9], world[10]).normalized();
+  }
+
+  /// The world-space direction this node's local `+X` axis points along (unit
+  /// length), pointing right when viewed along [forward] with [up] upward.
+  /// {@category Scene graph}
+  Vector3 get right {
+    final world = globalTransform.storage;
+    return Vector3(world[0], world[1], world[2]).normalized();
+  }
+
+  /// The world-space direction this node's local `+Y` axis points along (unit
+  /// length).
+  /// {@category Scene graph}
+  Vector3 get up {
+    final world = globalTransform.storage;
+    return Vector3(world[4], world[5], world[6]).normalized();
+  }
+
   /// Orients this node so its forward axis (local `+Z`) points at [target] in
   /// world space, keeping [up] as the reference up (defaults to `+Y`). Only
   /// the node's rotation changes; its world position and scale are preserved.
@@ -635,6 +719,15 @@ base class Node implements SceneGraph {
   Node? get parent => _parent;
   bool _isSceneRoot = false;
 
+  /// Whether an importer synthesized this node as an imported scene's root.
+  @internal
+  bool isImportRoot = false;
+
+  /// Whether the engine named this node (an import root or the scene root),
+  /// so its name may collide with an authored one.
+  @internal
+  bool get hasEngineAssignedName => isImportRoot || _isSceneRoot;
+
   /// The collection of [MeshPrimitive] objects that represent the 3D
   /// geometry and material properties of this node.
   ///
@@ -684,11 +777,6 @@ base class Node implements SceneGraph {
 
   // The components attached to this node, in attach order.
   final List<Component> _components = [];
-
-  /// The components attached to this node, in attach order — for a reader
-  /// that walks the graph (a light cache building its own scene from the
-  /// nodes) and needs the instanced meshes a node draws.
-  Iterable<Component> get components => _components;
 
   // Typed fast paths: the subsets of [_components] that feed the render
   // layer, so the per-frame pre-pass refreshes their render items
@@ -1119,6 +1207,10 @@ base class Node implements SceneGraph {
   /// unrecognized extension, an image that fell back to a placeholder);
   /// without it they print instead.
   ///
+  /// [maxTextureSize], when given, caps the longest side of every texture. A
+  /// larger image is scaled down as it decodes, keeping its aspect ratio, so
+  /// its full-size pixels are never held.
+  ///
   /// Example:
   /// ```dart
   /// final bytes = await rootBundle.load('assets/dash.glb');
@@ -1127,14 +1219,20 @@ base class Node implements SceneGraph {
   static Future<Node> fromGlbBytes(
     Uint8List bytes, {
     GltfWarningCallback? onWarning,
+    int? maxTextureSize,
   }) {
-    return importGlb(bytes, onWarning: onWarning);
+    return importGlb(
+      bytes,
+      onWarning: onWarning,
+      maxTextureSize: maxTextureSize,
+    );
   }
 
   /// Convenience wrapper for [fromGlbBytes] that loads from the asset bundle.
   static Future<Node> fromGlbAsset(
     String assetPath, {
     GltfWarningCallback? onWarning,
+    int? maxTextureSize,
   }) async {
     final byteData = await rootBundle.load(assetPath);
     return importGlb(
@@ -1143,6 +1241,7 @@ base class Node implements SceneGraph {
         byteData.lengthInBytes,
       ),
       onWarning: onWarning,
+      maxTextureSize: maxTextureSize,
     );
   }
 
@@ -1172,8 +1271,14 @@ base class Node implements SceneGraph {
     Uint8List gltfJson, {
     required GltfResourceResolver resolveUri,
     GltfWarningCallback? onWarning,
+    int? maxTextureSize,
   }) {
-    return importGltf(gltfJson, resolveUri: resolveUri, onWarning: onWarning);
+    return importGltf(
+      gltfJson,
+      resolveUri: resolveUri,
+      onWarning: onWarning,
+      maxTextureSize: maxTextureSize,
+    );
   }
 
   /// This list allows the node to act as a parent in the scene graph hierarchy. Transformations
@@ -1414,6 +1519,7 @@ base class Node implements SceneGraph {
       mesh: mesh?.clone(),
     );
     result.isJoint = isJoint;
+    result.isImportRoot = isImportRoot;
     result._localTransformTrs = _localTransformTrs?.clone();
     result._morphWeights = _morphWeights == null
         ? null
@@ -1468,8 +1574,10 @@ base class Node implements SceneGraph {
     if (restPoseOf != null) {
       for (final animation in _animations) {
         for (final channel in animation.channels) {
-          final nodeName = channel.bindTarget.nodeName;
-          final target = nodeName == name ? this : getChildByName(nodeName);
+          final target = resolveAnimationTarget(
+            this,
+            channel.bindTarget.nodeName,
+          );
           if (target == null) continue;
           final pose = restPoseOf(target);
           if (pose != null) target.localTransform = pose;
@@ -1509,7 +1617,17 @@ base class Node implements SceneGraph {
     _effectiveVisible = ancestorsVisible && visible;
 
     // Components tick whenever the node is mounted, independent of visibility.
-    _visitMutable(_components, (component) => component.tick(deltaSeconds));
+    // These loops stay closure-free while nothing mutates the lists; a
+    // mutation hands the rest of the walk to [_visitMutable].
+    for (var i = 0; i < _components.length; i++) {
+      final component = _components[i];
+      component.tick(deltaSeconds);
+      if (i < _components.length && identical(_components[i], component)) {
+        continue;
+      }
+      _tickComponentsFrom(i, component, deltaSeconds);
+      break;
+    }
 
     if (_effectiveVisible) {
       _animationPlayer?.update(deltaSeconds);
@@ -1528,9 +1646,32 @@ base class Node implements SceneGraph {
         instancedMeshComponent.hideRenderItem();
       }
     }
+    for (var i = 0; i < children.length; i++) {
+      final child = children[i];
+      child.scenePrePass(deltaSeconds, _effectiveVisible);
+      if (i < children.length && identical(children[i], child)) continue;
+      _prePassChildrenFrom(i, child, deltaSeconds);
+      break;
+    }
+  }
+
+  // The closures live here, off the per-node path, so [scenePrePass] does
+  // not allocate a capture context.
+  void _tickComponentsFrom(int index, Component visited, double dt) {
+    _visitMutable(
+      _components,
+      (component) => component.tick(dt),
+      index: index,
+      justVisited: visited,
+    );
+  }
+
+  void _prePassChildrenFrom(int index, Node visited, double dt) {
     _visitMutable(
       children,
-      (child) => child.scenePrePass(deltaSeconds, _effectiveVisible),
+      (child) => child.scenePrePass(dt, _effectiveVisible),
+      index: index,
+      justVisited: visited,
     );
   }
 

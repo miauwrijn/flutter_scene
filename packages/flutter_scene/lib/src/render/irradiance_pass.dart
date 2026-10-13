@@ -6,6 +6,7 @@ import 'package:flutter_scene/src/global_illumination.dart';
 import 'package:flutter_scene/src/gpu/gpu.dart' as gpu;
 import 'package:flutter_scene/src/gpu/render_pass_compat.dart';
 import 'package:flutter_scene/src/geometry/vertex_layout.dart';
+import 'package:flutter_scene/src/render/projection_params.dart';
 import 'package:flutter_scene/src/render/depth_prepass.dart'
     show kLinearDepthBlackboardKey;
 import 'package:flutter_scene/src/render/frame_transients.dart';
@@ -14,6 +15,7 @@ import 'package:flutter_scene/src/render/render_graph.dart';
 import 'package:flutter_scene/src/scene_encoder.dart' show resolvePipeline;
 import 'package:flutter_scene/src/shaders.dart';
 import 'package:vector_math/vector_math.dart';
+import 'package:flutter_scene/src/render/uniform_slots.dart';
 
 /// The scene-owned GPU state of the irradiance field: the atlas the lit
 /// shader samples, the ping-ponged blend history, and the scatter
@@ -293,9 +295,7 @@ class IrradianceInjectPass extends RenderGraphPass {
     required this.cameraRight,
     required this.cameraUp,
     required this.cameraForward,
-    required this.tanHalfFovX,
-    required this.tanHalfFovY,
-    required this.far,
+    required this.projection,
     required this.sceneRadiance,
   });
 
@@ -306,9 +306,7 @@ class IrradianceInjectPass extends RenderGraphPass {
   final Vector3 cameraRight;
   final Vector3 cameraUp;
   final Vector3 cameraForward;
-  final double tanHalfFovX;
-  final double tanHalfFovY;
-  final double far;
+  final ProjectionParams projection;
   final gpu.Texture? sceneRadiance;
 
   static final gpu.Shader _vertexShader =
@@ -435,12 +433,12 @@ class IrradianceInjectPass extends RenderGraphPass {
     bindVertexBufferCompat(renderPass, _quadView, 6);
     renderPass.bindVertexBuffer(instances, slot: 1);
     renderPass.bindTexture(
-      _vertexShader.getUniformSlot('linear_depth_normal'),
+      _vertexShader.cachedUniformSlot('linear_depth_normal'),
       depthNormal,
       sampler: _nearestClamp,
     );
     renderPass.bindTexture(
-      _vertexShader.getUniformSlot('scene_radiance'),
+      _vertexShader.cachedUniformSlot('scene_radiance'),
       radiance,
       sampler: _nearestClamp,
     );
@@ -449,7 +447,7 @@ class IrradianceInjectPass extends RenderGraphPass {
       ..[0] = tileSize
       ..[1] = interior;
     renderPass.bindUniform(
-      fragmentShader.getUniformSlot('InjectTileInfo'),
+      fragmentShader.cachedUniformSlot('InjectTileInfo'),
       context.transientsBuffer.emplace(ByteData.sublistView(tileInfo)),
     );
 
@@ -461,9 +459,9 @@ class IrradianceInjectPass extends RenderGraphPass {
     info[1] = sourceHeight.toDouble();
     info[2] = 1.0 / sourceWidth;
     info[3] = 1.0 / sourceHeight;
-    info[4] = tanHalfFovX;
-    info[5] = tanHalfFovY;
-    info[6] = far;
+    info[4] = projection.scaleX;
+    info[5] = projection.scaleY;
+    info[6] = projection.far;
     info[7] = settings.fireflyClamp;
     info[8] = cameraPosition.x;
     info[9] = cameraPosition.y;
@@ -472,12 +470,15 @@ class IrradianceInjectPass extends RenderGraphPass {
     info[12] = cameraRight.x;
     info[13] = cameraRight.y;
     info[14] = cameraRight.z;
+    info[15] = projection.offsetX;
     info[16] = cameraUp.x;
     info[17] = cameraUp.y;
     info[18] = cameraUp.z;
+    info[19] = projection.offsetY;
     info[20] = cameraForward.x;
     info[21] = cameraForward.y;
     info[22] = cameraForward.z;
+    info[23] = projection.orthographicFlag;
     info[24] = spacing.x;
     info[25] = spacing.y;
     info[26] = spacing.z;
@@ -502,7 +503,7 @@ class IrradianceInjectPass extends RenderGraphPass {
       info[45] = (corner & 2) != 0 ? 1.0 : 0.0;
       info[46] = (corner & 4) != 0 ? 1.0 : 0.0;
       renderPass.bindUniform(
-        _vertexShader.getUniformSlot('InjectInfo'),
+        _vertexShader.cachedUniformSlot('InjectInfo'),
         context.transientsBuffer.emplace(ByteData.sublistView(info)),
       );
       drawCompat(renderPass, 6, instanceCount: instanceCount);
@@ -627,22 +628,22 @@ class IrradianceBlendPass extends RenderGraphPass {
       );
       bindVertexBufferCompat(renderPass, _fullscreenView, 6);
       renderPass.bindTexture(
-        _irradianceShader.getUniformSlot('injection'),
+        _irradianceShader.cachedUniformSlot('injection'),
         state._irradianceAccumulator!,
         sampler: _nearestClamp,
       );
       renderPass.bindTexture(
-        _irradianceShader.getUniformSlot('history'),
+        _irradianceShader.cachedUniformSlot('history'),
         history,
         sampler: _nearestClamp,
       );
       renderPass.bindTexture(
-        _irradianceShader.getUniformSlot('sh_strip'),
+        _irradianceShader.cachedUniformSlot('sh_strip'),
         shStrip,
         sampler: _nearestClamp,
       );
       renderPass.bindUniform(
-        _irradianceShader.getUniformSlot('BlendInfo'),
+        _irradianceShader.cachedUniformSlot('BlendInfo'),
         context.transientsBuffer.emplace(ByteData.sublistView(info)),
       );
       drawCompat(renderPass, 6);
@@ -675,17 +676,17 @@ class IrradianceBlendPass extends RenderGraphPass {
       renderPass.bindPipeline(resolvePipeline(_vertexShader, _depthShader));
       bindVertexBufferCompat(renderPass, _fullscreenView, 6);
       renderPass.bindTexture(
-        _depthShader.getUniformSlot('injection'),
+        _depthShader.cachedUniformSlot('injection'),
         state._depthAccumulator!,
         sampler: _nearestClamp,
       );
       renderPass.bindTexture(
-        _depthShader.getUniformSlot('history'),
+        _depthShader.cachedUniformSlot('history'),
         history,
         sampler: _nearestClamp,
       );
       renderPass.bindUniform(
-        _depthShader.getUniformSlot('BlendDepthInfo'),
+        _depthShader.cachedUniformSlot('BlendDepthInfo'),
         context.transientsBuffer.emplace(ByteData.sublistView(info)),
       );
       drawCompat(renderPass, 6);
@@ -749,12 +750,12 @@ class IrradianceFilterPass extends RenderGraphPass {
     renderPass.bindPipeline(resolvePipeline(_vertexShader, _stripShader));
     bindVertexBufferCompat(renderPass, _fullscreenView, 6);
     renderPass.bindTexture(
-      _stripShader.getUniformSlot('sh_strip'),
+      _stripShader.cachedUniformSlot('sh_strip'),
       shStrip,
       sampler: _nearestClamp,
     );
     renderPass.bindUniform(
-      _stripShader.getUniformSlot('StripInfo'),
+      _stripShader.cachedUniformSlot('StripInfo'),
       context.transientsBuffer.emplace(
         ByteData.sublistView(
           Float32List(4)..[0] = layout.irradianceOriginY.toDouble(),
@@ -780,12 +781,12 @@ class IrradianceFilterPass extends RenderGraphPass {
       renderPass.bindPipeline(resolvePipeline(_vertexShader, _filterShader));
       bindVertexBufferCompat(renderPass, _fullscreenView, 6);
       renderPass.bindTexture(
-        _filterShader.getUniformSlot('atlas'),
+        _filterShader.cachedUniformSlot('atlas'),
         blended,
         sampler: _nearestClamp,
       );
       renderPass.bindUniform(
-        _filterShader.getUniformSlot('FilterInfo'),
+        _filterShader.cachedUniformSlot('FilterInfo'),
         context.transientsBuffer.emplace(ByteData.sublistView(info)),
       );
       drawCompat(renderPass, 6);

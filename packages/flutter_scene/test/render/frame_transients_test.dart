@@ -1,17 +1,9 @@
 import 'dart:typed_data';
 
-import 'package:flutter_scene/scene.dart';
 import 'package:flutter_scene/src/render/frame_transients.dart';
 import 'package:flutter_test/flutter_test.dart';
 
-bool _gpuAvailable() {
-  try {
-    Scene();
-    return true;
-  } catch (_) {
-    return false;
-  }
-}
+import '../support/gpu_available.dart';
 
 ByteData _bytes(int length, [int fill = 0xAB]) {
   final data = ByteData(length);
@@ -40,6 +32,79 @@ void main() {
       expect(tracker.completedThrough, b);
       tracker.complete(c);
       expect(tracker.completedThrough, c);
+    });
+
+    test('frames in flight counts ended frames the GPU has not finished', () {
+      final tracker = GpuSubmissionTracker();
+      expect(tracker.framesInFlight, 0);
+      tracker.endFrame();
+      expect(tracker.framesInFlight, 0, reason: 'nothing submitted yet');
+      final a = tracker.record();
+      final b = tracker.record();
+      tracker.endFrame();
+      final c = tracker.record();
+      tracker.endFrame();
+      expect(tracker.framesInFlight, 2);
+      // A paced frame submits nothing and adds no frame.
+      tracker.endFrame();
+      expect(tracker.framesInFlight, 2);
+      tracker.complete(a);
+      expect(tracker.framesInFlight, 2, reason: 'frame one still has b');
+      tracker.complete(b);
+      expect(tracker.framesInFlight, 1);
+      tracker.complete(c);
+      expect(tracker.framesInFlight, 0);
+    });
+
+    test('renders in one display frame pace together', () {
+      final tracker = GpuSubmissionTracker();
+      // Two scenes paint in display frame 1.
+      tracker.beginFrame(1);
+      final a = tracker.record();
+      tracker.endFrame();
+      expect(tracker.priorFramesInFlight, 0, reason: "the first's own frame");
+      final b = tracker.record();
+      tracker.endFrame();
+      expect(tracker.framesInFlight, 1, reason: 'one frame, not two');
+      // Both see frame 1 as a frame behind in display frame 2.
+      tracker.beginFrame(2);
+      expect(tracker.priorFramesInFlight, 1);
+      tracker.complete(a);
+      tracker.complete(b);
+      expect(tracker.priorFramesInFlight, 0);
+      // Unkeyed renders each count as their own frame.
+      tracker.beginFrame(null);
+      tracker.record();
+      tracker.endFrame();
+      tracker.record();
+      tracker.endFrame();
+      expect(tracker.priorFramesInFlight, 2);
+    });
+
+    test('completion listeners run after a submission completes', () {
+      final tracker = GpuSubmissionTracker();
+      var fired = 0;
+      late void Function() once;
+      // A listener that removes itself once the tracker drains, the shape
+      // the scene uses to release a paced frame.
+      once = () {
+        fired++;
+        if (tracker.framesInFlight == 0) {
+          tracker.removeCompletionListener(once);
+        }
+      };
+      tracker.addCompletionListener(once);
+      final a = tracker.record();
+      final b = tracker.record();
+      tracker.endFrame();
+      tracker.complete(a);
+      expect(fired, 1);
+      tracker.complete(b);
+      expect(fired, 2);
+      final c = tracker.record();
+      tracker.endFrame();
+      tracker.complete(c);
+      expect(fired, 2, reason: 'removed itself once drained');
     });
 
     test('before-submit listeners run with the id being recorded', () {
@@ -89,7 +154,7 @@ void main() {
     });
   });
 
-  if (!_gpuAvailable()) {
+  if (!gpuAvailable()) {
     test(
       'transient arena suite (skipped: no GPU device)',
       () {},
@@ -167,7 +232,7 @@ void main() {
       expect(second.lengthInBytes, 3500);
     });
 
-    test('oversize capacity classes shrink after an idle frame', () {
+    test('oversize capacity classes shrink after an idle window', () {
       final tracker = GpuSubmissionTracker();
       final arena = TransientArena(
         tracker,
@@ -184,8 +249,9 @@ void main() {
       for (final id in ids) {
         tracker.complete(id);
       }
-      arena.beginFrame();
-      arena.beginFrame();
+      for (var i = 0; i <= kTransientIdleFrames; i++) {
+        arena.beginFrame();
+      }
       expect(arena.blockCount, lessThanOrEqualTo(1));
     });
 
@@ -207,11 +273,12 @@ void main() {
       tracker.record();
       arena.beginFrame();
 
-      // Everything completed: the first block is reusable now.
+      // Everything completed: a pooled block is reused, most recent first.
       tracker.complete(1);
       tracker.complete(2);
       final third = arena.emplace(_bytes(100));
-      expect(identical(third.buffer, first.buffer), isTrue);
+      expect(identical(third.buffer, second.buffer), isTrue);
+      expect(arena.blockCount, 2);
     });
 
     test('a submission seals the open block mid-frame', () {
@@ -249,10 +316,67 @@ void main() {
       for (final id in ids) {
         tracker.complete(id);
       }
-      // Two idle frames: the pool trims to last frame's usage plus a spare.
+      // Freshly used blocks stay pooled; once idle long enough they go.
       arena.beginFrame();
+      expect(arena.blockCount, 4);
+      for (var i = 0; i <= kTransientIdleFrames; i++) {
+        arena.beginFrame();
+      }
+      expect(arena.blockCount, lessThanOrEqualTo(1));
+    });
+
+    test('a surplus block ages out while the working set is reused', () {
+      final tracker = GpuSubmissionTracker();
+      final arena = TransientArena(
+        tracker,
+        alignment: 256,
+        blockLengthInBytes: 1024,
+      );
+      // A spike needs two blocks at once, then one block per frame.
+      arena.emplace(_bytes(100));
+      final a = tracker.record();
+      arena.emplace(_bytes(100));
+      tracker
+        ..complete(a)
+        ..complete(tracker.record());
       arena.beginFrame();
-      expect(arena.blockCount, lessThanOrEqualTo(2));
+      expect(arena.blockCount, 2);
+      final seen = <Object>{};
+      for (var i = 0; i <= kTransientIdleFrames + 1; i++) {
+        seen.add(arena.emplace(_bytes(100)).buffer);
+        tracker.complete(tracker.record());
+        arena.beginFrame();
+      }
+      expect(seen.length, 1);
+      expect(arena.blockCount, 1);
+    });
+
+    test('paced frames and lighter frames keep the pool', () {
+      final tracker = GpuSubmissionTracker();
+      final arena = TransientArena(
+        tracker,
+        alignment: 256,
+        blockLengthInBytes: 1024,
+      );
+      // Each frame fills three blocks (one per submission), with a paced
+      // frame (no emplacements at all) and a lighter frame in between.
+      final seen = <Object>{};
+      void frame(int submissions) {
+        arena.beginFrame();
+        for (var i = 0; i < submissions; i++) {
+          seen.add(arena.emplace(_bytes(100)).buffer);
+          tracker.complete(tracker.record());
+        }
+      }
+
+      for (var i = 0; i < 20; i++) {
+        frame(3);
+        frame(0);
+        frame(1);
+      }
+      // Blocks complete as soon as they are submitted here, so steady state
+      // needs only what one frame fills; nothing is reallocated.
+      expect(seen.length, lessThanOrEqualTo(4));
     });
 
     test(
@@ -294,7 +418,7 @@ void main() {
       );
     });
 
-    test('immediate pool: shrinks idle size classes', () {
+    test('immediate pool: releases buffers left idle', () {
       final tracker = GpuSubmissionTracker();
       final pool = ImmediatePoolTransients(tracker);
 
@@ -309,8 +433,11 @@ void main() {
         tracker.complete(id);
       }
       pool.beginFrame();
-      pool.beginFrame();
-      // Last frame used none, so at most one spare per class survives.
+      expect(pool.bufferCount, greaterThan(1));
+      // Buffers idle for kTransientIdleFrames are released.
+      for (var i = 0; i <= kTransientIdleFrames; i++) {
+        pool.beginFrame();
+      }
       expect(pool.bufferCount, lessThanOrEqualTo(1));
     });
 

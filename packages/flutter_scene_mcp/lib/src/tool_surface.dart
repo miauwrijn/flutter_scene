@@ -83,6 +83,16 @@ class ToolError implements Exception {
 typedef CommandRunner =
     Future<Transaction> Function(String command, Map<String, Object?> params);
 
+/// Runs many commands through the host as one undoable step, named [name]
+/// when the caller supplied one, filling [bindings] with what each call's
+/// alias named.
+typedef BatchRunner =
+    Future<Transaction> Function(
+      List<CommandCall> calls,
+      String? name,
+      Map<String, LocalId> bindings,
+    );
+
 /// Captures the next frame's render graph as a JSON-shaped summary
 /// (passes, timings, data flow, resources). [thumbnails] false is a
 /// metadata-only capture.
@@ -104,6 +114,45 @@ typedef RenderGraphPixel =
 
 /// Captures a frame and scans every float target for NaN/Inf.
 typedef RenderGraphScan = Future<Map<String, Object?>> Function();
+
+/// Probes the viewport camera for surfaces that trade pixels as the camera
+/// moves (z-fighting). [options] carries `width`, `height`, and `limit` when
+/// given.
+typedef DepthConflictScan =
+    Future<Map<String, Object?>> Function(Map<String, Object?> options);
+
+/// The live scene's rendering statistics, the last frame plus [frames] of
+/// history.
+typedef RenderStatsReader = Map<String, Object?> Function(int frames);
+
+/// Lists the draw calls of the host's most recent capture. [options] carries
+/// `pass`, `phase`, `node`, `material`, `includeUniforms`, `offset`, and
+/// `limit` when given.
+typedef RenderDrawList =
+    Future<Map<String, Object?>> Function(Map<String, Object?> options);
+
+/// One draw of the most recent capture, addressed by pass (name or index)
+/// and draw order, with decoded uniform values.
+typedef RenderDrawReader =
+    Future<Map<String, Object?>> Function(Object pass, int order);
+
+/// Lists every loaded shader bundle with its entries.
+typedef ShaderLister = Future<Map<String, Object?>> Function();
+
+/// Reflection for one shader entry by name.
+typedef ShaderInfoReader =
+    Future<Map<String, Object?>> Function(
+      String name, {
+      String? backend,
+      bool includeSource,
+    });
+
+/// Writes the most recent capture to [path] as JSON, returning a summary.
+typedef RenderCaptureSaver =
+    Future<Map<String, Object?>> Function(
+      String path, {
+      required bool includeImages,
+    });
 
 /// Lists the viewport debug outputs (`[{id, label, active}]`).
 typedef DebugModesList = List<Map<String, Object?>> Function();
@@ -242,6 +291,7 @@ class EditorToolSurface {
     this.screenshot,
     this.windowScreenshot,
     this.commandRunner,
+    this.batchRunner,
     this.undoRunner,
     this.redoRunner,
     this.readCamera,
@@ -273,6 +323,13 @@ class EditorToolSurface {
     this.renderGraphImage,
     this.renderGraphPixel,
     this.renderGraphScan,
+    this.depthConflictScan,
+    this.readRenderStats,
+    this.listDraws,
+    this.readDraw,
+    this.listShaders,
+    this.readShaderInfo,
+    this.saveRenderCapture,
     this.listDebugModes,
     this.setDebugMode,
   }) : _sessionProvider = sessionProvider;
@@ -311,6 +368,30 @@ class EditorToolSurface {
 
   /// Host-routed mutation, so applied commands reach the host's display.
   final CommandRunner? commandRunner;
+
+  /// Host-routed batch, for the same reason. Null runs on the session.
+  final BatchRunner? batchRunner;
+
+  /// Pushes events to the connected client, set by a transport that can send
+  /// server notifications. Null leaves every subscription poll-only.
+  void Function(String subscription, List<EditorEvent> events)? eventPush;
+
+  /// The subscriptions this connection made.
+  ///
+  /// The bus is shared across every connection and outlives any one of them,
+  /// so a surface that did not make a subscription must not be able to poll
+  /// or cancel it, and one that goes away must not leave its buffers and push
+  /// closures behind. Both follow from owning them here.
+  final Map<String, EventSubscription> _subscriptions = {};
+
+  /// Cancels every subscription this connection made. The transport calls it
+  /// when the client disconnects.
+  void dispose() {
+    for (final subscription in _subscriptions.values) {
+      subscription.cancel();
+    }
+    _subscriptions.clear();
+  }
 
   /// Host-routed undo; returns whether a transaction was undone.
   final Future<bool> Function()? undoRunner;
@@ -381,6 +462,27 @@ class EditorToolSurface {
 
   /// The whole-frame non-finite scan.
   final RenderGraphScan? renderGraphScan;
+
+  /// The depth conflict (z-fighting) probe of the viewport camera.
+  final DepthConflictScan? depthConflictScan;
+
+  /// Steady-state per-frame rendering statistics.
+  final RenderStatsReader? readRenderStats;
+
+  /// Draw calls of the most recent capture.
+  final RenderDrawList? listDraws;
+
+  /// One draw of the most recent capture.
+  final RenderDrawReader? readDraw;
+
+  /// The loaded shader bundles.
+  final ShaderLister? listShaders;
+
+  /// Reflection for one shader entry.
+  final ShaderInfoReader? readShaderInfo;
+
+  /// Writes the most recent capture to disk.
+  final RenderCaptureSaver? saveRenderCapture;
 
   /// The viewport debug-output registry.
   final DebugModesList? listDebugModes;
@@ -773,6 +875,165 @@ class EditorToolSurface {
         inputSchema: {'type': 'object', 'properties': {}},
       ),
     ],
+    if (depthConflictScan != null)
+      const ToolDefinition(
+        name: 'scan_for_depth_conflicts',
+        description:
+            'Probe the viewport camera for surfaces that trade pixels as the '
+            'camera moves (z-fighting) and list each pair of nodes with the '
+            'pixels they trade and the distance, plus faces that overlap in '
+            'one plane. Drive conflicts to empty: separate or abut the '
+            'surfaces, or give an overlay a higher Material.depthLayer.',
+        inputSchema: {
+          'type': 'object',
+          'properties': {
+            'width': {
+              'type': 'integer',
+              'description': 'Probe width in pixels (default 960).',
+            },
+            'height': {
+              'type': 'integer',
+              'description': 'Probe height in pixels (default 540).',
+            },
+            'limit': {
+              'type': 'integer',
+              'description': 'Most pairs to list (default 20).',
+            },
+          },
+          'additionalProperties': false,
+        },
+      ),
+    if (readRenderStats != null)
+      const ToolDefinition(
+        name: 'get_render_stats',
+        description:
+            'Return the last rendered frame\'s counters (draws, instances, '
+            'vertices, culling, batching, pipeline traffic) broken down by '
+            'view and pass, with CPU times. Always on, no capture needed.',
+        inputSchema: {
+          'type': 'object',
+          'properties': {
+            'frames': {
+              'type': 'integer',
+              'description':
+                  'Also return this many recent frames of history '
+                  '(default 0).',
+            },
+          },
+          'additionalProperties': false,
+        },
+      ),
+    if (listDraws != null)
+      const ToolDefinition(
+        name: 'list_draws',
+        description:
+            'List the draw calls of the most recent capture (capturing one '
+            'first when there is none), with node paths, materials, shader '
+            'names, and batching, plus a per-pass tally of why items were '
+            'skipped.',
+        inputSchema: {
+          'type': 'object',
+          'properties': {
+            'pass': {
+              'type': ['string', 'integer'],
+              'description': 'Only draws in this pass name or index.',
+            },
+            'phase': {
+              'type': 'string',
+              'description': 'Only draws in this draw phase.',
+            },
+            'node': {
+              'type': 'string',
+              'description': 'Substring match on the node path.',
+            },
+            'material': {
+              'type': 'string',
+              'description': 'Substring match on the material type or source.',
+            },
+            'includeUniforms': {
+              'type': 'boolean',
+              'description': 'Include decoded uniform values (default false).',
+            },
+            'offset': {'type': 'integer'},
+            'limit': {
+              'type': 'integer',
+              'description': 'Draws to return (default 200).',
+            },
+          },
+          'additionalProperties': false,
+        },
+      ),
+    if (readDraw != null)
+      const ToolDefinition(
+        name: 'get_draw',
+        description:
+            'Return one draw of the most recent capture with its decoded '
+            'uniform blocks and shader names. Address it by the pass name or '
+            'index and the draw order from list_draws.',
+        inputSchema: {
+          'type': 'object',
+          'properties': {
+            'pass': {
+              'type': ['string', 'integer'],
+            },
+            'order': {'type': 'integer'},
+          },
+          'required': ['pass', 'order'],
+          'additionalProperties': false,
+        },
+      ),
+    if (listShaders != null)
+      const ToolDefinition(
+        name: 'list_shaders',
+        description:
+            'List every loaded shader bundle and its entries, with each '
+            'entry\'s stage, compiled backends, uniform block names, and '
+            'texture names.',
+        inputSchema: {'type': 'object', 'properties': {}},
+      ),
+    if (readShaderInfo != null)
+      const ToolDefinition(
+        name: 'get_shader_info',
+        description:
+            'Return one shader entry\'s reflection by name (inputs, uniform '
+            'blocks with field offsets, textures), optionally with the '
+            'compiled source. SPIR-V comes back base64.',
+        inputSchema: {
+          'type': 'object',
+          'properties': {
+            'name': {'type': 'string'},
+            'backend': {
+              'type': 'string',
+              'description':
+                  'metalIos, metalDesktop, openglEs, openglDesktop, or '
+                  'vulkan (default the running platform\'s).',
+            },
+            'includeSource': {'type': 'boolean'},
+          },
+          'required': ['name'],
+          'additionalProperties': false,
+        },
+      ),
+    if (saveRenderCapture != null)
+      const ToolDefinition(
+        name: 'save_render_graph_capture',
+        description:
+            'Write the most recent capture (capturing one first when there '
+            'is none) to a JSON file, including every draw, uniform block, '
+            'and resource image, for offline inspection.',
+        inputSchema: {
+          'type': 'object',
+          'properties': {
+            'path': {'type': 'string'},
+            'includeImages': {
+              'type': 'boolean',
+              'description': 'Embed resource PNGs (default true).',
+            },
+          },
+          'required': ['path'],
+          'additionalProperties': false,
+        },
+      ),
     if (listDebugModes != null) ...[
       const ToolDefinition(
         name: 'list_viewport_debug_modes',
@@ -947,6 +1208,129 @@ class EditorToolSurface {
       },
     ),
     ToolDefinition(
+      name: 'run_commands',
+      description:
+          'Run many commands in order as ONE undoable step. Name a call with '
+          '"as" and later calls reference what it created as "\$name" '
+          'wherever an id goes, so a payload and the geometry over it are one '
+          'batch. Nothing is kept unless every call succeeds. Takes document '
+          'and selection commands only. Use this instead of repeated '
+          'run_command whenever you are making more than a couple of edits.',
+      inputSchema: {
+        'type': 'object',
+        'properties': {
+          'commands': {
+            'type': 'array',
+            'description': 'The calls, in order.',
+            'items': {
+              'type': 'object',
+              'properties': {
+                'command': {'type': 'string'},
+                'params': {'type': 'object'},
+                'as': {
+                  'type': 'string',
+                  'description':
+                      'Name what this call creates, so a later call can '
+                      'reference it as "\$name" wherever an id goes.',
+                },
+              },
+              'required': ['command'],
+            },
+          },
+          'name': {
+            'type': 'string',
+            'description': 'The label the undo history shows for the step.',
+          },
+        },
+        'required': ['commands'],
+        'additionalProperties': false,
+      },
+    ),
+    ToolDefinition(
+      name: 'search_queries',
+      description:
+          'Search the read surface by name, category, or words in the '
+          'description. Returns each match with its argument schema, ready to '
+          'pass to run_query.',
+      inputSchema: {
+        'type': 'object',
+        'properties': {
+          'query': {
+            'type': 'string',
+            'description': 'Substring to match, or empty for every query.',
+          },
+        },
+      },
+    ),
+    ToolDefinition(
+      name: 'run_query',
+      description:
+          'Read the document through a named query. Queries answer in bulk '
+          '(a whole subtree, a whole resource, a whole payload), so prefer '
+          'one query over many small reads. Binary comes back base64-encoded '
+          'under "blobs".',
+      inputSchema: {
+        'type': 'object',
+        'properties': {
+          'query': {'type': 'string'},
+          'params': {'type': 'object'},
+        },
+        'required': ['query'],
+        'additionalProperties': false,
+      },
+    ),
+    ToolDefinition(
+      name: 'subscribe_events',
+      description:
+          'Subscribe to editor events. Returns a subscription id to pass to '
+          'poll_events. Events are coalesced, so a batch of a thousand edits '
+          'is one notification.',
+      inputSchema: {
+        'type': 'object',
+        'properties': {
+          'types': {
+            'type': 'array',
+            'description': 'Event names; omit for every event.',
+            'items': {'type': 'string'},
+          },
+        },
+        'additionalProperties': false,
+      },
+    ),
+    ToolDefinition(
+      name: 'poll_events',
+      description:
+          'Drain the events buffered for a subscription, oldest first. '
+          'Reports how many were dropped when a client fell far behind.',
+      inputSchema: {
+        'type': 'object',
+        'properties': {
+          'subscription': {'type': 'string'},
+        },
+        'required': ['subscription'],
+        'additionalProperties': false,
+      },
+    ),
+    ToolDefinition(
+      name: 'unsubscribe_events',
+      description: 'Cancel a subscription and release what it buffered.',
+      inputSchema: {
+        'type': 'object',
+        'properties': {
+          'subscription': {'type': 'string'},
+        },
+        'required': ['subscription'],
+        'additionalProperties': false,
+      },
+    ),
+    ToolDefinition(
+      name: 'get_protocol_info',
+      description:
+          'The protocol version this editor speaks, what it can do, and the '
+          'event names it emits. Ask before assuming a capability is here.',
+      inputSchema: {'type': 'object', 'properties': {}},
+    ),
+    ToolDefinition(
       name: 'list_resources',
       description:
           'List every resource in the document (geometries, materials, '
@@ -972,20 +1356,29 @@ class EditorToolSurface {
     String tool,
     Map<String, Object?> args,
   ) async {
+    // TODO(query-parity): get_node still assembles its own answer, because it
+    // mixes in world bounds only the host can compute. Give queries a host
+    // seam and it collapses onto getResource and nodeSubtree like the rest.
     switch (tool) {
       case 'describe_scene':
         return {
-          'roots': [for (final n in _query.roots) _nodeTree(n)],
+          'roots': [
+            for (final node in session.ask('nodeSubtree').body['nodes'] as List)
+              _compactTree(node as Map<String, Object?>),
+          ],
         };
       case 'get_node':
         return _nodeDetail(_resolve(_requireRef(args)));
       case 'get_selection':
         return _selectionResult();
       case 'select_node':
-        session.selection.selectOnly(_resolve(_requireRef(args)).id);
+        // Through the command, so this tool and a script take one path.
+        await _invoke('selectNodes', {
+          'nodeIds': [_resolve(_requireRef(args)).id.toToken()],
+        });
         return _selectionResult();
       case 'clear_selection':
-        session.selection.clear();
+        await _invoke('clearSelection', const {});
         return _selectionResult();
       case 'new_document':
         final creator = newDocument;
@@ -1208,6 +1601,30 @@ class EditorToolSurface {
         return {'commands': _searchCommands(args['query'] as String? ?? '')};
       case 'run_command':
         return _runCommand(args);
+      case 'run_commands':
+        return _runCommands(args);
+      case 'search_queries':
+        return {'queries': _searchQueries(args['query'] as String? ?? '')};
+      case 'run_query':
+        return _runQuery(args);
+      case 'subscribe_events':
+        return _subscribeEvents(args);
+      case 'poll_events':
+        return _pollEvents(args);
+      case 'unsubscribe_events':
+        return _unsubscribeEvents(args);
+      case 'get_protocol_info':
+        // Answered without a document, since a client asks what this build
+        // speaks before it decides what to open.
+        final open = _sessionProvider();
+        return {
+          'version': EditorProtocol.version,
+          'capabilities': EditorProtocol.capabilities,
+          'events': EditorEventType.all,
+          'documentOpen': open != null,
+          if (open != null) 'commandCount': open.registry.all.length,
+          if (open != null) 'queryCount': open.queries.all.length,
+        };
       case 'undo':
         final undone = await (undoRunner?.call() ?? Future.value(_undoHere()));
         return {'undone': undone, 'canUndo': session.history.canUndo};
@@ -1215,12 +1632,7 @@ class EditorToolSurface {
         final redone = await (redoRunner?.call() ?? Future.value(_redoHere()));
         return {'redone': redone, 'canRedo': session.history.canRedo};
       case 'list_resources':
-        return {
-          'resources': [
-            for (final entry in session.document.resources.entries)
-              {'id': entry.key.toToken(), 'kind': _resourceKind(entry.value)},
-          ],
-        };
+        return session.ask('listResources').body;
       case 'get_viewport_camera':
         return _cameraResult();
       case 'set_viewport_camera':
@@ -1285,6 +1697,95 @@ class EditorToolSurface {
           throw const ToolError('No render graph capture in this session');
         }
         return scanner();
+      case 'scan_for_depth_conflicts':
+        final scanner = depthConflictScan;
+        if (scanner == null) {
+          throw const ToolError('No live renderer in this session');
+        }
+        final options = <String, Object?>{};
+        for (final name in ['width', 'height', 'limit']) {
+          final value = _optionalInt(args, name);
+          if (value == null) continue;
+          if (value <= 0) throw ToolError('$name must be positive');
+          options[name] = value;
+        }
+        return scanner(options);
+      case 'get_render_stats':
+        final reader = readRenderStats;
+        if (reader == null) {
+          throw const ToolError('No render statistics in this session');
+        }
+        return reader(_optionalInt(args, 'frames') ?? 0);
+      case 'list_draws':
+        final lister = listDraws;
+        if (lister == null) {
+          throw const ToolError('No render graph capture in this session');
+        }
+        _requirePassRef(args, required: false);
+        for (final name in ['phase', 'node', 'material']) {
+          if (args[name] is! String?) {
+            throw ToolError('$name must be a string');
+          }
+        }
+        if (args['includeUniforms'] is! bool?) {
+          throw const ToolError('includeUniforms must be a boolean');
+        }
+        _optionalInt(args, 'offset');
+        _optionalInt(args, 'limit');
+        return lister(args);
+      case 'get_draw':
+        final reader = readDraw;
+        if (reader == null) {
+          throw const ToolError('No render graph capture in this session');
+        }
+        final pass = _requirePassRef(args, required: true)!;
+        final order = args['order'];
+        if (order is! num) {
+          throw const ToolError('get_draw needs an order');
+        }
+        return reader(pass, order.toInt());
+      case 'list_shaders':
+        final lister = listShaders;
+        if (lister == null) {
+          throw const ToolError('No shader reflection in this session');
+        }
+        return lister();
+      case 'get_shader_info':
+        final reader = readShaderInfo;
+        if (reader == null) {
+          throw const ToolError('No shader reflection in this session');
+        }
+        final name = args['name'];
+        if (name is! String) {
+          throw const ToolError('get_shader_info needs a shader name');
+        }
+        final backend = args['backend'];
+        if (backend is! String?) {
+          throw const ToolError('backend must be a string');
+        }
+        final includeSource = args['includeSource'];
+        if (includeSource is! bool?) {
+          throw const ToolError('includeSource must be a boolean');
+        }
+        return reader(
+          name,
+          backend: backend,
+          includeSource: includeSource ?? false,
+        );
+      case 'save_render_graph_capture':
+        final saver = saveRenderCapture;
+        if (saver == null) {
+          throw const ToolError('No render graph capture in this session');
+        }
+        final path = args['path'];
+        if (path is! String || path.isEmpty) {
+          throw const ToolError('save_render_graph_capture needs a path');
+        }
+        final includeImages = args['includeImages'];
+        if (includeImages is! bool?) {
+          throw const ToolError('includeImages must be a boolean');
+        }
+        return saver(path, includeImages: includeImages ?? true);
       case 'list_viewport_debug_modes':
         final lister = listDebugModes;
         if (lister == null) {
@@ -1357,6 +1858,21 @@ class EditorToolSurface {
     }
   }
 
+  // A pass is addressed by name or index, so both types pass through.
+  static Object? _requirePassRef(
+    Map<String, Object?> args, {
+    required bool required,
+  }) {
+    final pass = args['pass'];
+    if (pass == null) {
+      if (!required) return null;
+      throw const ToolError('A pass name or index is required');
+    }
+    if (pass is String) return pass;
+    if (pass is num) return pass.toInt();
+    throw const ToolError('pass must be a pass name or index');
+  }
+
   static int? _optionalInt(Map<String, Object?> args, String name) {
     final value = args[name];
     if (value == null) return null;
@@ -1420,17 +1936,184 @@ class EditorToolSurface {
     ];
   }
 
+  List<Map<String, Object?>> _searchQueries(String query) {
+    final q = query.toLowerCase();
+    bool matches(QueryEntry e) =>
+        q.isEmpty ||
+        e.name.toLowerCase().contains(q) ||
+        e.category.toLowerCase().contains(q) ||
+        e.doc.toLowerCase().contains(q);
+    return [
+      for (final entry in session.queries.all)
+        if (matches(entry))
+          {
+            'name': entry.name,
+            'category': entry.category,
+            'description': entry.doc,
+            'inputSchema': querySchema(entry)['inputSchema'],
+          },
+    ];
+  }
+
+  Map<String, Object?> _runQuery(Map<String, Object?> args) {
+    final name = args['query'];
+    if (name is! String || name.isEmpty) {
+      throw const ToolError('run_query needs a string "query"');
+    }
+    final params =
+        (args['params'] as Map?)?.cast<String, Object?>() ?? const {};
+    final QueryResult result;
+    try {
+      result = session.ask(name, params);
+    } on QueryException catch (e) {
+      throw ToolError(e.message);
+    } on ArgumentError catch (e) {
+      throw ToolError('${e.message}');
+    }
+    // JSON-RPC cannot frame binary, so blobs ride in the body as base64, the
+    // fallback the protocol declares. A transport that can frame them sends
+    // the same blobs beside the body instead, with the body unchanged.
+    return {
+      ...result.body,
+      if (result.blobs.isNotEmpty)
+        'blobs': {
+          for (final blob in result.blobs)
+            blob.id: {
+              'mimeType': blob.mimeType,
+              'byteCount': blob.bytes.lengthInBytes,
+              'base64': base64Encode(blob.bytes),
+            },
+        },
+    };
+  }
+
+  Future<Map<String, Object?>> _runCommands(Map<String, Object?> args) async {
+    final entries = args['commands'];
+    if (entries is! List) {
+      throw const ToolError('run_commands needs a "commands" array');
+    }
+    if (entries.isEmpty) {
+      throw const ToolError('run_commands needs at least one command');
+    }
+    final calls = <CommandCall>[];
+    for (final entry in entries) {
+      if (entry is! Map) {
+        throw const ToolError('Every entry in "commands" must be an object');
+      }
+      try {
+        calls.add(CommandCall.fromJson(entry.cast<String, Object?>()));
+      } on CommandException catch (e) {
+        throw ToolError(e.message);
+      }
+    }
+    final name = args['name'];
+    final label = name is String && name.isNotEmpty ? name : null;
+    final bindings = <String, LocalId>{};
+    final runner = batchRunner;
+    // Caught around both paths, since a host-routed batch throws the same
+    // failure and a client should read it, not a stack trace.
+    final Transaction transaction;
+    try {
+      transaction = runner != null
+          ? await runner(calls, label, bindings)
+          : session.runAll(
+              calls,
+              name: label ?? 'Batch edit',
+              bindings: bindings,
+            );
+    } on BatchException catch (e) {
+      throw ToolError(e.message);
+    } on CommandException catch (e) {
+      throw ToolError(e.message);
+    }
+    return {
+      'ok': true,
+      'applied': transaction.name,
+      'commandCount': calls.length,
+      'recordCount': transaction.records.length,
+      'noOp': transaction.isEmpty,
+      'canUndo': session.history.canUndo,
+      'created': _createdIn(transaction),
+      if (bindings.isNotEmpty)
+        'bindings': {
+          for (final entry in bindings.entries)
+            entry.key: entry.value.toToken(),
+        },
+    };
+  }
+
+  Map<String, Object?> _subscribeEvents(Map<String, Object?> args) {
+    final types = args['types'];
+    final wanted = <String>[];
+    if (types == null) {
+      wanted.addAll(EditorEventType.all);
+    } else if (types is List) {
+      for (final type in types) {
+        if (type is! String) {
+          throw const ToolError('"types" must be an array of event names');
+        }
+        wanted.add(type);
+      }
+    } else {
+      throw const ToolError('"types" must be an array of event names');
+    }
+    try {
+      // The closure names the subscription it belongs to, which only exists
+      // once subscribe returns; nothing can fire before then.
+      late final EventSubscription subscription;
+      subscription = session.events.subscribe(
+        wanted,
+        onEvents: (events) => eventPush?.call(subscription.id, events),
+      );
+      _subscriptions[subscription.id] = subscription;
+      return {
+        'subscription': subscription.id,
+        'types': subscription.types.toList(),
+        'pushed': eventPush != null,
+      };
+    } on ArgumentError catch (e) {
+      throw ToolError('${e.message}');
+    }
+  }
+
+  EventSubscription _requireSubscription(Map<String, Object?> args) {
+    final id = args['subscription'];
+    if (id is! String || id.isEmpty) {
+      throw const ToolError('Expected a "subscription" id');
+    }
+    // Looked up among this connection's own, so one client cannot reach
+    // another's by guessing an id.
+    final subscription = _subscriptions[id];
+    if (subscription == null) {
+      throw ToolError(
+        'No subscription "$id" on this connection; it may have been '
+        'cancelled, or it belongs to another client',
+      );
+    }
+    return subscription;
+  }
+
+  Map<String, Object?> _pollEvents(Map<String, Object?> args) {
+    final subscription = _requireSubscription(args);
+    // Deliver whatever this turn produced before draining, so a client that
+    // edits and immediately polls does not have to poll twice.
+    session.events.flush();
+    final drained = subscription.drain();
+    return {
+      'events': [for (final event in drained.events) event.toJson()],
+      'dropped': drained.dropped,
+    };
+  }
+
+  Map<String, Object?> _unsubscribeEvents(Map<String, Object?> args) {
+    final subscription = _requireSubscription(args)..cancel();
+    _subscriptions.remove(subscription.id);
+    return {'ok': true};
+  }
+
   bool _undoHere() => session.undo();
 
   bool _redoHere() => session.redo();
-
-  String _resourceKind(ResourceSpec spec) => switch (spec) {
-    GeometryResource() => 'geometry',
-    TextureResource() => 'texture',
-    RenderTextureResource() => 'renderTexture',
-    MaterialResource() => 'material',
-    EnvironmentResource() => 'environment',
-  };
 
   ViewportCameraPose _requireCamera() {
     final pose = readCamera?.call();
@@ -1451,6 +2134,18 @@ class EditorToolSurface {
     };
   }
 
+  /// Runs [command] the way `run_command` does, so tools that wrap a command
+  /// cannot drift from it.
+  Future<void> _invoke(String command, Map<String, Object?> params) async {
+    try {
+      commandRunner != null
+          ? await commandRunner!(command, params)
+          : session.run(command, params);
+    } on CommandException catch (e) {
+      throw ToolError(e.message);
+    }
+  }
+
   Future<Map<String, Object?>> _runCommand(Map<String, Object?> args) async {
     final command = args['command'];
     if (command is! String) {
@@ -1465,6 +2160,17 @@ class EditorToolSurface {
       );
     }
     try {
+      final entry = session.registry.lookup(command);
+      if (entry != null && entry.kind == CommandKind.application) {
+        // Asynchronous, and outside the document, so it reports what it did
+        // rather than a transaction.
+        await session.invoke(command, params);
+        return {
+          'ok': true,
+          'applied': command,
+          'canUndo': session.history.canUndo,
+        };
+      }
       final transaction = commandRunner != null
           ? await commandRunner!(command, params)
           : session.run(command, params);
@@ -1519,6 +2225,12 @@ class EditorToolSurface {
           AnimationChange(value: final n),
         ) =>
           ('animation', o == null, n != null),
+        (
+          ChangeSlot.poolPayload,
+          PayloadChange(value: final o),
+          PayloadChange(value: final n),
+        ) =>
+          ('payload', o == null, n != null),
         _ => ('', false, false),
       };
       if (wasAbsent && isPresent) {
@@ -1538,13 +2250,20 @@ class EditorToolSurface {
     'selected': [for (final id in session.selection.ids) id.toToken()],
   };
 
-  Map<String, Object?> _nodeTree(NodeSpec node) => {
-    'id': node.id.toToken(),
-    'path': _query.namePathOf(node.id),
-    'name': node.name,
-    'components': [for (final c in node.components) c.type],
+  /// The compact tree an agent reads first, projected from the `nodeSubtree`
+  /// query so both describe the same data. Component types only, since the
+  /// whole point of this view is to be small enough to take in at once.
+  Map<String, Object?> _compactTree(Map<String, Object?> node) => {
+    'id': node['id'],
+    'path': node['path'],
+    'name': node['name'],
+    'components': [
+      for (final component in node['components'] as List)
+        (component as Map)['type'],
+    ],
     'children': [
-      for (final child in _query.childrenOf(node.id)) _nodeTree(child),
+      for (final child in (node['children'] as List? ?? const []))
+        _compactTree(child as Map<String, Object?>),
     ],
   };
 
@@ -1568,7 +2287,7 @@ class EditorToolSurface {
           'type': c.type,
           'properties': {
             for (final entry in c.properties.entries)
-              entry.key: _propertyJson(entry.value),
+              entry.key: propertyValueToJson(entry.value),
           },
           // Declared kinds for the carried properties, when the type's
           // schema is known (see describe_component_type for the full one).
@@ -1634,38 +2353,6 @@ class EditorToolSurface {
       'scale': _vec3(t.scale),
     },
     MatrixTransform m => {'matrix': m.matrix.storage.toList()},
-  };
-
-  Object? _propertyJson(PropertyValue value) => switch (value) {
-    BoolValue v => v.value,
-    IntValue v => v.value,
-    DoubleValue v => v.value,
-    StringValue v => v.value,
-    Vec2Value v => {'x': v.value.x, 'y': v.value.y},
-    Vec3Value v => {'x': v.value.x, 'y': v.value.y, 'z': v.value.z},
-    Vec4Value v => {
-      'x': v.value.x,
-      'y': v.value.y,
-      'z': v.value.z,
-      'w': v.value.w,
-    },
-    QuaternionValue v => {
-      '\$quat': {
-        'x': v.value.x,
-        'y': v.value.y,
-        'z': v.value.z,
-        'w': v.value.w,
-      },
-    },
-    Matrix4Value v => v.value.storage.toList(),
-    ColorValue v => {'r': v.r, 'g': v.g, 'b': v.b, 'a': v.a},
-    ResourceRefValue v => {'\$resource': v.id.toToken()},
-    NodeRefValue v => {'\$node': v.id.toToken()},
-    ListValue v => [for (final e in v.values) _propertyJson(e)],
-    MapValue v => {
-      for (final entry in v.values.entries)
-        entry.key: _propertyJson(entry.value),
-    },
   };
 
   Map<String, Object?> _vec3(Vector3 v) => {'x': v.x, 'y': v.y, 'z': v.z};

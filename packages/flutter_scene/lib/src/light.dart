@@ -1,7 +1,9 @@
 import 'dart:math' as math;
+import 'dart:typed_data';
 import 'dart:ui' as ui;
 
 import 'package:flutter/foundation.dart' show internal;
+import 'package:flutter_scene/src/render/projection_params.dart';
 import 'package:flutter_scene/src/gpu/gpu.dart' as gpu;
 import 'package:vector_math/vector_math.dart';
 
@@ -49,7 +51,8 @@ enum ShadowCastingMode {
   off,
 
   /// The meshes cast shadows from the faces the light sees, respecting each
-  /// material's own culling. The default.
+  /// material's own culling: a double-sided material casts from both faces.
+  /// The default.
   on,
 
   /// The meshes cast from every face, ignoring material culling. Fixes light
@@ -171,12 +174,15 @@ class DirectionalLight {
   ///
   /// Disable this for a light whose direction changes every frame. Rebuilding
   /// and replaying cached tiles would add work compared with rendering all
-  /// casters directly into the frame atlas.
+  /// casters directly into the frame atlas. A light that turns in small,
+  /// occasional steps (a stepped sun) can keep it on; each step refreshes the
+  /// cached cascades one per frame, so far cascades lag the turn briefly.
   bool cacheStaticShadows;
 
-  /// World-space width of the band at the far shadow cascade's edge
-  /// over which shadowing fades back to lit, so the shadow distance
-  /// limit is soft rather than a hard cutoff. `0` disables the fade.
+  /// World-space width over which shadowing fades back to lit before the
+  /// shadow distance, so its limit is soft rather than a hard cutoff. The
+  /// fade is at least a tenth of [shadowMaxDistance] deep, and the far
+  /// cascade's tile edge fades over this width too.
   double shadowFadeRange;
 
   /// World-space radius of the shadow penumbra. Larger values give a
@@ -190,7 +196,8 @@ class DirectionalLight {
   int shadowCascadeCount;
 
   /// View distance, in world units, out to which [computeCascades]
-  /// spreads the shadow cascades. Beyond it surfaces are unshadowed.
+  /// spreads the shadow cascades. Shadows fade out approaching it (see
+  /// [shadowFadeRange]) and surfaces beyond it are unshadowed.
   double shadowMaxDistance;
 
   /// Blends the cascade split spacing between logarithmic (`1.0`) and
@@ -318,6 +325,10 @@ class DirectionalLight {
   /// camera rotates; the projection is then texel-snapped so shadow
   /// edges do not shimmer.
   ///
+  /// An orthographic camera's slices are boxes of constant cross-section, so
+  /// its splits are uniform from the near plane (the logarithmic blend exists
+  /// to follow perspective's shrinking texel footprint).
+  ///
   /// [worldDirection] is the light's world-space travel direction. When
   /// omitted it falls back to [direction] (the light's own field), which
   /// is correct for a light placed without a node transform.
@@ -326,11 +337,19 @@ class DirectionalLight {
     double aspectRatio, [
     Vector3? worldDirection,
   ]) {
-    // Cascades fit the camera frustum, which is perspective-specific.
-    final perspective = camera.projection as PerspectiveProjection;
+    // The unit-height view carries the aspect ratio; a projection the renderer
+    // bound to its view ignores it.
+    final projection = ProjectionParams.of(
+      camera.projection,
+      ui.Size(aspectRatio, 1.0),
+    );
+    final orthographic = projection.orthographic;
     final count = shadowCascadeCount.clamp(1, 4);
-    final near = perspective.near;
-    final far = shadowMaxDistance;
+    final near = projection.near;
+    final far = orthographic
+        ? math.min(shadowMaxDistance, projection.far)
+        : shadowMaxDistance;
+    final lambda = orthographic ? 0.0 : shadowCascadeSplitLambda;
 
     // Practical split scheme: a blend of logarithmic and uniform
     // spacing, so the near cascades get proportionally more resolution. A
@@ -350,19 +369,28 @@ class DirectionalLight {
     final splitCount = pinned != null ? count - 1 : count;
     for (var i = 1; i <= splitCount; i++) {
       final ratio = i / splitCount;
-      final logSplit = splitNear * math.pow(far / splitNear, ratio);
       final uniformSplit = splitNear + (far - splitNear) * ratio;
-      splits.add(
-        shadowCascadeSplitLambda * logSplit +
-            (1.0 - shadowCascadeSplitLambda) * uniformSplit,
-      );
+      if (lambda == 0.0) {
+        splits.add(uniformSplit);
+        continue;
+      }
+      final logSplit = splitNear * math.pow(far / splitNear, ratio);
+      splits.add(lambda * logSplit + (1.0 - lambda) * uniformSplit);
     }
 
-    // Camera direction and field-of-view tangents.
+    // Camera basis and the projection's lateral extents (half-fov tangents,
+    // or half sizes when orthographic).
     final forward = camera.forward;
-    final tanV = math.tan(perspective.fovRadiansY * 0.5);
-    final tanH = tanV * aspectRatio;
-    final tanRadius2 = tanH * tanH + tanV * tanV;
+    final right = camera.up.cross(forward)..normalize();
+    final up = forward.cross(right)..normalize();
+    final tanRadius2 =
+        projection.scaleX * projection.scaleX +
+        projection.scaleY * projection.scaleY;
+    // Where the orthographic volume's axis sits off the eye (an offset
+    // projection shifts it across the view plane).
+    final lateralCenter =
+        right * (-projection.offsetX * projection.scaleX) +
+        up * (-projection.offsetY * projection.scaleY);
 
     final effectiveDirection = worldDirection ?? direction;
     final lightLength = effectiveDirection.length;
@@ -386,23 +414,33 @@ class DirectionalLight {
       final sliceFar = overlap > 0.0 && c < count - 1
           ? splits[c + 1] + (splits[c + 1] - sliceNear) * overlap
           : splits[c + 1];
-      final centerDepth = math.min(
-        sliceFar,
-        (sliceNear + sliceFar) * (1.0 + tanRadius2) * 0.5,
-      );
       final position = camera.position;
-      final center = Vector3(
-        position.x + forward.x * centerDepth,
-        position.y + forward.y * centerDepth,
-        position.z + forward.z * centerDepth,
-      );
-      final nearRadius2 =
-          (centerDepth - sliceNear) * (centerDepth - sliceNear) +
-          sliceNear * sliceNear * tanRadius2;
-      final farRadius2 =
-          (sliceFar - centerDepth) * (sliceFar - centerDepth) +
-          sliceFar * sliceFar * tanRadius2;
-      final radius = math.sqrt(math.max(nearRadius2, farRadius2));
+      final Vector3 center;
+      final double radius;
+      if (orthographic) {
+        // A box slice: its bounding sphere sits at the box center.
+        final centerDepth = (sliceNear + sliceFar) * 0.5;
+        final halfLength = (sliceFar - sliceNear) * 0.5;
+        center = position + forward * centerDepth + lateralCenter;
+        radius = math.sqrt(tanRadius2 + halfLength * halfLength);
+      } else {
+        final centerDepth = math.min(
+          sliceFar,
+          (sliceNear + sliceFar) * (1.0 + tanRadius2) * 0.5,
+        );
+        center = Vector3(
+          position.x + forward.x * centerDepth,
+          position.y + forward.y * centerDepth,
+          position.z + forward.z * centerDepth,
+        );
+        final nearRadius2 =
+            (centerDepth - sliceNear) * (centerDepth - sliceNear) +
+            sliceNear * sliceNear * tanRadius2;
+        final farRadius2 =
+            (sliceFar - centerDepth) * (sliceFar - centerDepth) +
+            sliceFar * sliceFar * tanRadius2;
+        radius = math.sqrt(math.max(nearRadius2, farRadius2));
+      }
 
       cascades.add(
         ShadowCascade(
@@ -561,6 +599,7 @@ class PointLight {
     this.intensity = 1.0,
     this.range = 0.0,
     this.falloffExponent = 2.0,
+    this.radius = 0.0,
     this.castsShadow = false,
     this.shadowMapResolution = 512,
     this.shadowNear = 0.1,
@@ -570,13 +609,28 @@ class PointLight {
     this.shadowCasterFaces = ShadowCasterFaces.front,
     this.channelMask = 0xFF,
     this.shadowCasterChannelMask = 0xFF,
-  }) : color = color ?? Vector3(1.0, 1.0, 1.0);
+    this.photometry,
+    Vector3? photometryAxis,
+  }) : color = color ?? Vector3(1.0, 1.0, 1.0),
+       photometryAxis = photometryAxis ?? Vector3(0.0, -1.0, 0.0);
 
   /// Linear RGB color of the light.
   Vector3 color;
 
   /// Scalar multiplier applied to [color]; the radiance at unit distance.
   double intensity;
+
+  /// An angular intensity profile (a photometric web reduced to its polar
+  /// curve, as an IES file's averaged over azimuth): relative intensity,
+  /// peak 1, at evenly spaced angles from [photometryAxis] (0) to its
+  /// opposite (π). [intensity] scales it. Null is a uniform point light.
+  /// Resampled to 64 samples when packed; shared lists are packed once.
+  Float32List? photometry;
+
+  /// The axis [photometry]'s angles are measured from (a pendant's points
+  /// down), in the owning node's local space like [SpotLight.direction].
+  /// Need not be unit length.
+  Vector3 photometryAxis;
 
   /// World-space distance at which the light's influence smoothly reaches
   /// zero. `0` means infinite range (pure inverse-square falloff, clamped
@@ -586,8 +640,15 @@ class PointLight {
   /// The distance-falloff exponent. `2` (the default) is the physical
   /// inverse square; lower values are an artistic control that lets the
   /// light reach further without blowing out its near field (a hero light
-  /// touching distant scenery). Values at or below zero are clamped.
+  /// touching distant scenery). `0` disables the distance falloff, leaving
+  /// only the [range] window; negative values are clamped to `0`.
   double falloffExponent;
+
+  /// World-space radius of the emitter (a bulb's size). Glossy reflections
+  /// widen to the light's apparent size, so a near-mirror shows a small disc
+  /// of bounded brightness instead of a point of unbounded radiance, and the
+  /// inverse-square falloff stops growing inside it. `0` is a point source.
+  double radius;
 
   /// Whether this light casts a shadow. When true, the renderer renders six
   /// perspective depth faces around the light if the scene's point-shadow
@@ -781,6 +842,7 @@ class SpotLight {
     this.intensity = 1.0,
     this.range = 0.0,
     this.falloffExponent = 2.0,
+    this.radius = 0.0,
     Vector3? direction,
     this.innerConeAngle = 0.0,
     this.outerConeAngle = math.pi / 4.0,
@@ -790,11 +852,18 @@ class SpotLight {
     this.shadowDepthBias = 0.0,
     this.shadowNormalBias = 0.1,
     this.shadowSoftness = 1.0,
+    this.shadowFieldOfView,
     this.shadowCasterFaces = ShadowCasterFaces.front,
     this.channelMask = 0xFF,
     this.shadowCasterChannelMask = 0xFF,
+    this.photometry,
   }) : color = color ?? Vector3(1.0, 1.0, 1.0),
        direction = direction ?? Vector3(0.0, -1.0, 0.0);
+
+  /// An angular intensity profile around [direction] (see
+  /// [PointLight.photometry]). When set it replaces the cone: the profile
+  /// is the beam.
+  Float32List? photometry;
 
   /// Linear RGB color of the light.
   Vector3 color;
@@ -808,6 +877,9 @@ class SpotLight {
 
   /// The distance-falloff exponent (see [PointLight.falloffExponent]).
   double falloffExponent;
+
+  /// World-space radius of the emitter (see [PointLight.radius]).
+  double radius;
 
   /// The cone's aim, in the owning node's local space. Need not be unit
   /// length. Rotated to world by the node's transform.
@@ -853,6 +925,11 @@ class SpotLight {
   /// Radius, in shadow-map texels, of the soft-shadow PCF kernel. `0` gives a
   /// hard edge.
   double shadowSoftness;
+
+  /// Vertical field of view of the shadow frustum, in radians, or null to
+  /// cover the cone ([outerConeAngle] with a small margin). A narrower frustum
+  /// spends the tile's texels on the core of a wide, soft-edged cone.
+  double? shadowFieldOfView;
 
   /// Which faces are rendered into the shadow map. [ShadowCasterFaces.back]
   /// (second-depth) removes the shadow detaching from a solid caster's base
@@ -902,7 +979,9 @@ class SpotLight {
     final far = range > 0.0 ? range : 100.0;
     // A small margin past the outer cone so its lit edge sits inside the
     // frustum rather than on its clipped border.
-    final fovY = math.min(2.0 * outerConeAngle * 1.05, math.pi * 0.98);
+    final fovY =
+        shadowFieldOfView ??
+        math.min(2.0 * outerConeAngle * 1.05, math.pi * 0.98);
     final projection = PerspectiveProjection(
       fovRadiansY: fovY,
       near: shadowNear,
@@ -953,6 +1032,38 @@ class ShadowCascade {
   final double radius;
 }
 
+/// Forces the full lit entries everywhere, so parity tests can render the
+/// same frame with and without the lean tier.
+bool debugDisableLeanLighting = false;
+
+/// Whether a frame with these features may draw with the lean lit entries:
+/// every feature `FLUTTER_SCENE_LEAN_LIGHTING` compiles out must be off.
+@internal
+bool leanLightingAllowed({
+  required bool irradianceField,
+  required int rectAreaLightCount,
+  required bool environmentBlending,
+  required bool ambientOcclusion,
+  required int pointShadowTileCount,
+  bool weather = false,
+}) =>
+    shadingTierOverride ??
+    (!debugDisableLeanLighting &&
+        // The lean entries compile the weather out (weather.glsl).
+        !weather &&
+        !irradianceField &&
+        rectAreaLightCount == 0 &&
+        !environmentBlending &&
+        !ambientOcclusion &&
+        pointShadowTileCount == 0);
+
+/// Forces every eligible draw onto the lean (true) or full (false) lit entries
+/// regardless of the frame's features, or null to decide per frame. Set only
+/// around a warm-up frame whose image is discarded, to compile a tier's
+/// pipelines before the scene needs them.
+@internal
+bool? shadingTierOverride;
+
 /// The lighting state handed to a [Material] when it binds for a draw.
 ///
 /// Bundles the image-based-lighting [EnvironmentMap] (and the scene's
@@ -978,6 +1089,7 @@ class Lighting {
     this.froxels,
     this.spotShadowCount = 0,
     this.pointShadowTileCount = 0,
+    this.rectAreaLightCount = 0,
     this.spotShadowDepthBias = 0.0,
     this.spotShadowNormalBias = 0.0,
     this.spotShadowSoftness = 0.0,
@@ -999,8 +1111,11 @@ class Lighting {
     this.cameraForward,
     this.cameraRight,
     this.cameraUp,
-    this.tanHalfFovX = 0.0,
-    this.tanHalfFovY = 0.0,
+    this.projectionScaleX = 0.0,
+    this.projectionScaleY = 0.0,
+    this.projectionOffsetX = 0.0,
+    this.projectionOffsetY = 0.0,
+    this.orthographic = false,
     this.depthProjection,
     this.weather,
     this.time = 0.0,
@@ -1013,6 +1128,24 @@ class Lighting {
   /// The scene's distance fog, or null when fog is off for this frame. Applied
   /// per-fragment by every material in linear HDR before tone mapping.
   final Fog? fog;
+
+  /// The rect area lights packed into the punctual light data this frame.
+  @internal
+  final int rectAreaLightCount;
+
+  /// Whether every feature the lean lit entries compile out is off this frame
+  /// (see `FLUTTER_SCENE_LEAN_LIGHTING` in `material_lighting.glsl`), so a
+  /// draw may use them. The draw's environment must also carry no parallax
+  /// box (see [Material.usesLeanVariant]).
+  @internal
+  bool get allowsLeanShading => leanLightingAllowed(
+    irradianceField: irradianceField != null,
+    rectAreaLightCount: rectAreaLightCount,
+    environmentBlending: environmentMapB != null && environmentBlend > 0.0,
+    ambientOcclusion: ssaoMap != null || ssaoIndirectLight,
+    pointShadowTileCount: pointShadowTileCount,
+    weather: weather != null,
+  );
 
   /// A secondary environment cross-faded with [environmentMap] by
   /// [environmentBlend], or null when a single environment is in effect.
@@ -1066,7 +1199,7 @@ class Lighting {
   final gpu.Texture? punctualIndexTexture;
 
   /// This view's froxel clustering, or null when the view shades through the
-  /// per-object light lists (non-perspective camera, non-uniform light
+  /// per-object light lists (a degenerate projection, non-uniform light
   /// channels, or clustering disabled). When set, [punctualIndexTexture] and
   /// its dimensions describe the froxel data texture.
   final FroxelLighting? froxels;
@@ -1166,11 +1299,35 @@ class Lighting {
   final Vector3? cameraRight;
   final Vector3? cameraUp;
 
-  /// Tangents of the half field of view (x and y), letting a material
-  /// project world positions to screen UV (screen-space marches). Zero
-  /// for non-perspective cameras; materials treat that as unavailable.
-  final double tanHalfFovX;
-  final double tanHalfFovY;
+  /// The view-space width per unit of NDC, letting a material project world
+  /// positions to screen UV (screen-space marches): the half-fov tangent for a
+  /// perspective camera (at unit depth), the half width for an orthographic
+  /// one. Zero when unavailable.
+  final double projectionScaleX;
+
+  /// The view-space height per unit of NDC, as [projectionScaleX].
+  final double projectionScaleY;
+
+  /// The NDC x position of the view axis, nonzero only for an off-center
+  /// projection.
+  final double projectionOffsetX;
+
+  /// The NDC y position of the view axis, as [projectionOffsetX].
+  final double projectionOffsetY;
+
+  /// Whether the camera projection is orthographic (parallel view rays), so
+  /// view-space x and y do not scale with depth.
+  final bool orthographic;
+
+  /// The perspective half-fov tangent along x, zero for an orthographic
+  /// camera.
+  @Deprecated('Use projectionScaleX, which also covers orthographic cameras.')
+  double get tanHalfFovX => orthographic ? 0.0 : projectionScaleX;
+
+  /// The perspective half-fov tangent along y, zero for an orthographic
+  /// camera.
+  @Deprecated('Use projectionScaleY, which also covers orthographic cameras.')
+  double get tanHalfFovY => orthographic ? 0.0 : projectionScaleY;
 
   /// The frame projection's depth row, for a material that writes its own
   /// fragment depth: window depth is `(x * z + y) / (z * z + w)` over the

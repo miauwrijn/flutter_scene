@@ -10,13 +10,9 @@
 // The packaged bundle carries the offline shader toolchain the editor needs
 // to compile .fmat materials at runtime: the SDK's impellerc, its shader_lib
 // includes, flutter_scene's framework GLSL, and a tool_manifest.json that
-// records the Flutter revision everything was built from. macOS packages a
-// release build (Info.plist enables Impeller + Flutter GPU). Linux and
-// Windows package PROFILE builds behind a launcher that sets the engine
-// switches, because release builds compile out the environment switch path
-// and those embedders have no project-level Flutter GPU setting yet.
-// TODO(editor-dist-release): switch Linux/Windows to release builds once the
-// embedders can enable Flutter GPU without environment switches.
+// records the Flutter revision everything was built from. Every platform
+// packages a release build that enables Impeller + Flutter GPU itself, through
+// Info.plist on macOS and the runner's DartProject on Linux and Windows.
 import 'dart:convert';
 import 'dart:io';
 
@@ -32,11 +28,7 @@ void main(List<String> args) async {
     // master channel is the case that patches (tool/patches/
     // window_names_master.patch), and it must be reversed before packaging.
     _requireStableWindowingNames(appDir);
-    _run('flutter', [
-      'build',
-      options.platform,
-      options.platform == 'macos' ? '--release' : '--profile',
-    ], cwd: appDir);
+    _run('flutter', ['build', options.platform, '--release'], cwd: appDir);
   }
 
   final bundle = _builtBundle(appDir, options.platform);
@@ -183,7 +175,13 @@ ProcessResult _run(
   bool check = true,
 }) {
   stdout.writeln('+ $executable ${args.join(' ')}');
-  final result = Process.runSync(executable, args, workingDirectory: cwd);
+  // `flutter` is a .bat on Windows, which resolves only through a shell.
+  final result = Process.runSync(
+    executable,
+    args,
+    workingDirectory: cwd,
+    runInShell: Platform.isWindows && executable == 'flutter',
+  );
   if (check && result.exitCode != 0) {
     _fail('$executable failed:\n${result.stdout}\n${result.stderr}');
   }
@@ -215,13 +213,13 @@ String _builtBundle(String appDir, String platform) {
         '$appDir/build/linux',
         (e) => e is Directory,
       ).split('/').last;
-      return '$appDir/build/linux/$arch/profile/bundle';
+      return '$appDir/build/linux/$arch/release/bundle';
     case 'windows':
       final arch = find(
         '$appDir\\build\\windows',
         (e) => e is Directory,
       ).split(Platform.pathSeparator).last;
-      return '$appDir\\build\\windows\\$arch\\runner\\Profile';
+      return '$appDir\\build\\windows\\$arch\\runner\\Release';
   }
   throw StateError('unreachable');
 }
@@ -250,12 +248,21 @@ _Tools _resolveTools(String appDir) {
   if (impellerc == null) {
     // Platform.resolvedExecutable is <sdk>/bin/cache/dart-sdk/bin/dart when
     // run through the Flutter SDK's dart; walk back to the cache.
-    final segments = File(
-      Platform.resolvedExecutable,
-    ).absolute.uri.pathSegments;
-    final cutoff = segments.lastIndexOf('dart-sdk');
-    if (cutoff > 0) {
-      final cache = segments.sublist(0, cutoff).join('/');
+    // Walk parents rather than rebuilding a path from URI segments, which
+    // yields `/D:/...` on Windows.
+    Directory? cacheDir;
+    for (
+      var dir = File(Platform.resolvedExecutable).absolute.parent;
+      dir.parent.path != dir.path;
+      dir = dir.parent
+    ) {
+      if (dir.path.split(Platform.pathSeparator).last == 'dart-sdk') {
+        cacheDir = dir.parent;
+        break;
+      }
+    }
+    if (cacheDir != null) {
+      final cache = cacheDir.path;
       for (final host in const [
         'darwin-x64',
         'linux-x64',
@@ -263,7 +270,7 @@ _Tools _resolveTools(String appDir) {
         'windows-x64',
         'windows-arm64',
       ]) {
-        final candidate = '/$cache/artifacts/engine/$host/$exeName';
+        final candidate = '$cache/artifacts/engine/$host/$exeName';
         if (File(candidate).existsSync()) {
           impellerc = candidate;
           break;
@@ -484,19 +491,6 @@ void _packagePosixBundle(
   String platform,
 ) {
   _installTools('$bundle/bin', '$bundle/data', tools, manifest);
-  // Profile engines read switches from the environment; release ones do not
-  // (see the header comment), so the launcher is the supported entry point.
-  final launcher = File('$bundle/flutter_scene_editor.sh');
-  launcher.writeAsStringSync('''
-#!/usr/bin/env bash
-# Launches the editor with Impeller + Flutter GPU enabled.
-cd "\$(dirname "\$0")"
-export FLUTTER_ENGINE_SWITCHES=2
-export FLUTTER_ENGINE_SWITCH_1=enable-impeller=true
-export FLUTTER_ENGINE_SWITCH_2=enable-flutter-gpu=true
-exec ./flutter_scene_editor_app "\$@"
-''');
-  _run('chmod', ['+x', launcher.path]);
 
   final archive =
       '${_distDir(appDir)}/'
@@ -520,23 +514,22 @@ void _packageWindows(
   String version,
 ) {
   _installTools('$bundle\\bin', '$bundle\\data', tools, manifest);
-  File('$bundle\\flutter_scene_editor.bat').writeAsStringSync('''
-@echo off
-rem Launches the editor with Impeller + Flutter GPU enabled.
-cd /d "%~dp0"
-set FLUTTER_ENGINE_SWITCHES=2
-set FLUTTER_ENGINE_SWITCH_1=enable-impeller=true
-set FLUTTER_ENGINE_SWITCH_2=enable-flutter-gpu=true
-start "" flutter_scene_editor_app.exe %*
-''');
   final archive =
       '${_distDir(appDir)}\\'
       'flutter_scene_editor-$version-windows-${_arch()}.zip';
   if (File(archive).existsSync()) File(archive).deleteSync();
-  _run('powershell', [
-    '-NoProfile',
-    '-Command',
-    'Compress-Archive -Path "$bundle\\*" -DestinationPath "$archive"',
+  // Windows' own bsdtar, not Git's GNU tar (which cannot write zip) and not
+  // Compress-Archive (whose entry names use backslashes, against the spec).
+  final systemRoot = Platform.environment['SystemRoot'] ?? r'C:\Windows';
+  _run('$systemRoot\\System32\\tar.exe', [
+    '-a',
+    '-c',
+    '-f',
+    archive,
+    '-C',
+    bundle,
+    for (final entity in Directory(bundle).listSync())
+      entity.path.split(Platform.pathSeparator).last,
   ]);
   _printSha256(archive);
 }

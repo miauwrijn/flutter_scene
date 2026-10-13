@@ -14,7 +14,7 @@ dependencies:
   flutter:
     sdk: flutter
   flutter_gpu_shaders: ^0.5.1
-  flutter_scene: ^0.23.0
+  flutter_scene: ^0.24.0
   hooks: ^2.0.0
   vector_math: ^2.1.4
 
@@ -34,6 +34,24 @@ flutter:
     # Draco-compressed quads sampling KHR_texture_basisu KTX2 textures, for
     # the basisu_textures scene. Rebuilt by assets_gen/generate.sh.
     - assets/basisu_quads_draco.glb
+    # ETC1S KTX2 files (copies of flutter_scene's test fixtures), uploaded in
+    # every block format the device samples by the ETC1S upload test.
+    - assets/etc1s_srgb_mips_64.ktx2
+    - assets/etc1s_features_rgba_64.ktx2
     # Everything hook/build.dart generates, loaded by source path. Added by
     # `dart run flutter_scene:init`.
     - flutter_scene_generated/
+    - path: flutter_scene_generated/metal_ios/
+      platforms:
+        - ios
+    - path: flutter_scene_generated/metal_desktop/
+      platforms:
+        - macos
+    - path: flutter_scene_generated/opengl_es_vulkan/
+      platforms:
+        - android
+        - linux
+        - windows
+    - path: flutter_scene_generated/opengl_es/
+      platforms:
+        - web

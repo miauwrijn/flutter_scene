@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:convert';
 import 'dart:ui' as ui;
 
@@ -7,9 +8,21 @@ import 'package:flutter/rendering.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_scene/noise.dart';
 import 'package:flutter_scene/scene.dart';
+// ignore: implementation_imports
+import 'package:flutter_scene/src/render/env_prefilter.dart'
+    show radiancePrefilterPending;
+// ignore: implementation_imports
+import 'package:flutter_scene/src/render/frame_transients.dart'
+    show rendererSubmissions;
+// ignore: implementation_imports
+import 'package:flutter_scene/src/texture/basisu/basis_ktx2_loader.dart'
+    show StandardKtx2Upload;
 import 'package:flutter_test/flutter_test.dart';
 import 'package:integration_test/integration_test.dart';
 import 'package:smoke_render/smoke_scenes.dart';
+import 'package:vector_math/vector_math.dart' as vm;
+
+import 'capture_store.dart';
 
 const _expectedAndroidImpellerBackend = String.fromEnvironment(
   'SMOKE_EXPECTED_ANDROID_IMPELLER_BACKEND',
@@ -25,6 +38,18 @@ const _onlyScene = String.fromEnvironment('SMOKE_ONLY');
 void main() {
   final binding = IntegrationTestWidgetsFlutterBinding.ensureInitialized();
   final captures = <String, String>{};
+
+  // Android CI runs the app without a host driver and polls these instead.
+  var finished = 0;
+  tearDown(() => recordFinishedTests(++finished));
+  unawaited(
+    binding.allTestsPassed.future.then(
+      (passed) => storeSummary(passed, {
+        for (final failure in binding.failureMethodsDetails)
+          failure.methodName: failure.details ?? '',
+      }),
+    ),
+  );
 
   if (_expectedAndroidImpellerBackend.isNotEmpty) {
     testWidgets('Android requests the expected Impeller backend', (_) async {
@@ -43,6 +68,11 @@ void main() {
   for (final smoke in kSmokeScenes) {
     if (_onlyScene.isNotEmpty && smoke.id != _onlyScene) continue;
     testWidgets('${smoke.id} renders a sane frame', (tester) async {
+      if (await alreadyPassed(smoke.id)) {
+        // ignore: avoid_print
+        print('SMOKE ${smoke.id}: passed in an earlier attempt, skipped');
+        return;
+      }
       // Let Flutter render one ordinary frame before touching flutter_scene.
       // Android GLES can race GPU context setup if Scene initialization uploads
       // textures before the first frame has established the backend context.
@@ -57,7 +87,7 @@ void main() {
       // flutter_scene gates rendering on this future. Wait before building the
       // smoke scene: Geometry/Material constructors touch the shader bundle,
       // which must be loaded before SmokeSceneView constructs them.
-      await Scene.initializeStaticResources();
+      await Scene.preload(smaa: true);
       await smoke.preload?.call();
 
       await tester.pumpWidget(
@@ -87,11 +117,23 @@ void main() {
           smokeSceneKey.currentContext!.findRenderObject()
               as RenderRepaintBoundary;
 
+      // The build above painted the first frame; let it finish so no pump
+      // below is paced and every one renders.
+      await _settleGpu();
+      final scene = tester
+          .state<SmokeSceneViewState>(find.byType(SmokeSceneView))
+          .scene;
+      var paced = false;
       for (var i = 0; i < settleFrames; i++) {
-        if (i > 0) boundary.markNeedsPaint();
-        await tester.pump(settleStep);
-        await Future<void>.delayed(const Duration(milliseconds: 50));
+        paced = await _pumpSettled(
+          tester,
+          scene,
+          settleStep,
+          markNeedsPaint: i > 0 ? boundary.markNeedsPaint : null,
+        );
       }
+      await _drainRadianceFills(tester, scene, settleStep, boundary);
+      await _capturableFrame(tester, scene, settleStep, paced, boundary);
 
       final ui.Image image = await boundary.toImage(pixelRatio: 1.0);
       final png = (await image.toByteData(format: ui.ImageByteFormat.png))!;
@@ -101,17 +143,26 @@ void main() {
 
       // Hand the PNG to the host driver (writes it outside the app sandbox).
       // Platform is distinguished by the Argos build-name, not the filename.
-      captures['${smoke.id}.png'] = base64Encode(png.buffer.asUint8List());
+      final pngBytes = png.buffer.asUint8List();
+      captures['${smoke.id}.png'] = base64Encode(pngBytes);
+      await storeCapture('${smoke.id}.png', pngBytes);
 
       final stats = _frameStats(rgba, image.width, image.height);
+      final colorPass = _colorPassCounters(scene);
       // ignore: avoid_print
       print(
         'SMOKE ${smoke.id}: ${image.width}x${image.height} '
+        'paced=${scene.pacedFrameCount} '
+        'settleMaxMs=$_settleMaxMs settleTimeouts=$_settleTimeouts '
+        'repumps=$_repumps '
         'cornersClear=${stats.cornersClear} '
         'centerCoverage=${stats.centerNonClearFraction.toStringAsFixed(3)} '
         'fgLuma=${stats.foregroundMeanLuma.toStringAsFixed(1)} '
-        'colors=${stats.distinctColors}',
+        'colors=${stats.distinctColors} '
+        'draws=${colorPass?.draws} submitted=${colorPass?.submitted} '
+        'culled=${colorPass?.culled}',
       );
+      _settleMaxMs = _settleTimeouts = _repumps = 0;
 
       // Reference-free render-sanity checks (catch black screen / nothing /
       // unlit). The visual diff service catches subtler "renders, but changed".
@@ -145,6 +196,63 @@ void main() {
         greaterThan(8),
         reason: 'frame looks uniform; possible blank render',
       );
+      // A scene may bound the pixels its surfaces fight over (z-fighting).
+      final maxConflictPixels = smoke.maxDepthConflictPixels;
+      if (maxConflictPixels != null) {
+        final report = await scene.probeDepthConflicts(width: 256, height: 256);
+        // ignore: avoid_print
+        print(
+          'SMOKE ${smoke.id}: depthConflicts=${report.conflicts.length} '
+          'pixels=${report.conflictPixelCount}\n${report.describe(limit: 4)}',
+        );
+        expect(
+          report.conflictPixelCount,
+          lessThanOrEqualTo(maxConflictPixels),
+          reason: report.describe(limit: 4),
+        );
+      }
+      // A scene may pin counters instead of pixels.
+      final expectedCounters = smoke.colorPassCounters;
+      if (expectedCounters != null) {
+        expect(colorPass, isNotNull, reason: 'no ScenePass in the frame stats');
+        final actual = colorPass!.toJson();
+        for (final entry in expectedCounters.entries) {
+          expect(
+            actual[entry.key],
+            entry.value,
+            reason: 'ScenePass ${entry.key} for the captured frame',
+          );
+        }
+      }
+      if (smoke.id == 'depth_bias_rebind') {
+        // The hidden square is the only green in the frame.
+        var green = 0;
+        for (var p = 0; p < rgba.lengthInBytes; p += 4) {
+          if (rgba.getUint8(p + 1) > 128 && rgba.getUint8(p) < 100) green++;
+        }
+        expect(
+          green,
+          0,
+          reason: 'a draw after the full geometry bind kept its depth bias',
+        );
+      }
+      if (smoke.id == 'coverage_cutouts') {
+        // The magenta layer of the self-overlapping masked mesh is the only
+        // magenta in the frame, and lies wholly in front of its cyan layer.
+        var magenta = 0;
+        for (var p = 0; p < rgba.lengthInBytes; p += 4) {
+          final r = rgba.getUint8(p), g = rgba.getUint8(p + 1);
+          final b = rgba.getUint8(p + 2);
+          if (r > 100 && b > 100 && g < r ~/ 2 && g < b ~/ 2) magenta++;
+        }
+        // ignore: avoid_print
+        print('SMOKE coverage_cutouts: magenta=$magenta');
+        expect(
+          magenta,
+          greaterThan(image.width * image.height ~/ 200),
+          reason: 'a farther layer of a masked mesh hid its nearer layer',
+        );
+      }
       if (smoke.id == 'irradiance_field') {
         // Both colored walls are emissive and nothing else lights the scene,
         // so the floor's color is entirely bounce light carried by the probe
@@ -247,8 +355,125 @@ void main() {
               'ambient occlusion changes abruptly at the right viewport edge',
         );
       }
+      await markPassed(smoke.id);
     });
   }
+
+  testWidgets('ETC1S block uploads sample like their decoded pixels', (
+    tester,
+  ) async {
+    await tester.pumpWidget(
+      const MaterialApp(
+        debugShowCheckedModeBanner: false,
+        home: Scaffold(backgroundColor: kSmokeClear, body: SizedBox.expand()),
+      ),
+    );
+    await tester.pump();
+    await Scene.preload(smaa: true);
+    await loadEtc1sFixtures();
+
+    // Compared in-test, not uploaded to Argos: which formats run differs by
+    // device.
+    Future<ByteData?> render(({Scene scene, Camera camera})? setup) async {
+      if (setup == null) return null;
+      final boundaryKey = GlobalKey();
+      await tester.pumpWidget(
+        MaterialApp(
+          debugShowCheckedModeBanner: false,
+          home: Scaffold(
+            backgroundColor: kSmokeClear,
+            body: Center(
+              child: RepaintBoundary(
+                key: boundaryKey,
+                child: SizedBox(
+                  width: kSmokeSize.toDouble(),
+                  height: kSmokeSize.toDouble(),
+                  child: SceneView(setup.scene, camera: setup.camera),
+                ),
+              ),
+            ),
+          ),
+        ),
+      );
+      await _settleGpu();
+      const step = Duration(milliseconds: 50);
+      var paced = false;
+      for (var i = 0; i < 10; i++) {
+        paced = await _pumpSettled(tester, setup.scene, step);
+      }
+      await _capturableFrame(tester, setup.scene, step, paced, null);
+      final boundary =
+          boundaryKey.currentContext!.findRenderObject()
+              as RenderRepaintBoundary;
+      final image = await boundary.toImage(pixelRatio: 1.0);
+      return image.toByteData(format: ui.ImageByteFormat.rawRgba);
+    }
+
+    // ETC2 must match the rgba8 upload exactly; BC1/BC3 re-fit, so close.
+    const cases = [
+      (
+        'etc1s_srgb_mips_64',
+        [StandardKtx2Upload.etc2Rgb, StandardKtx2Upload.bc1],
+      ),
+      (
+        'etc1s_features_rgba_64',
+        [StandardKtx2Upload.etc2Rgba, StandardKtx2Upload.bc3],
+      ),
+    ];
+    var compared = 0;
+    for (final (name, uploads) in cases) {
+      final reference = (await render(
+        buildEtc1sUploadScene(name, StandardKtx2Upload.rgba8),
+      ))!;
+      // Coverage by alpha: an empty capture is transparent black.
+      var covered = 0;
+      for (var i = 3; i < reference.lengthInBytes; i += 4) {
+        if (reference.getUint8(i) > 0) covered++;
+      }
+      expect(
+        covered / (reference.lengthInBytes / 4),
+        greaterThan(0.5),
+        reason: '$name rgba8 upload drew nothing',
+      );
+      for (final upload in uploads) {
+        final frame = await render(buildEtc1sUploadScene(name, upload));
+        final label = '$name ${upload.name}';
+        if (frame == null) {
+          // ignore: avoid_print
+          print('SMOKE etc1s $label: not sampled on this device');
+          continue;
+        }
+        var total = 0;
+        var worst = 0;
+        var differing = 0;
+        for (var i = 0; i < frame.lengthInBytes; i += 4) {
+          var pixel = 0;
+          for (var c = 0; c < 4; c++) {
+            final d = (frame.getUint8(i + c) - reference.getUint8(i + c)).abs();
+            total += d;
+            if (d > pixel) pixel = d;
+          }
+          if (pixel > worst) worst = pixel;
+          if (pixel > 0) differing++;
+        }
+        final mean = total / frame.lengthInBytes;
+        // ignore: avoid_print
+        print(
+          'SMOKE etc1s $label: mean=${mean.toStringAsFixed(3)} '
+          'max=$worst differing=$differing',
+        );
+        if (upload == StandardKtx2Upload.etc2Rgb ||
+            upload == StandardKtx2Upload.etc2Rgba) {
+          expect(worst, 0, reason: '$label differs from the rgba8 upload');
+        } else {
+          expect(mean, lessThan(3.0), reason: '$label drifts from rgba8');
+        }
+        compared++;
+      }
+    }
+    // ignore: avoid_print
+    print('SMOKE etc1s: compared $compared block uploads');
+  });
 
   testWidgets('noise parity between CPU and GPU', (tester) async {
     // The probe evaluates all of noise.glsl's functions in one shader, so it
@@ -272,7 +497,7 @@ void main() {
       ),
     );
     await tester.pump();
-    await Scene.initializeStaticResources();
+    await Scene.preload(smaa: true);
     await loadSmokeMaterials();
 
     final setup = buildNoiseParityScene();
@@ -295,10 +520,23 @@ void main() {
         ),
       ),
     );
+    await _settleGpu();
+    final scene = setup.scene;
+    var paced = false;
     for (var i = 0; i < 20; i++) {
-      await tester.pump(const Duration(milliseconds: 50));
-      await Future<void>.delayed(const Duration(milliseconds: 50));
+      paced = await _pumpSettled(
+        tester,
+        scene,
+        const Duration(milliseconds: 50),
+      );
     }
+    await _capturableFrame(
+      tester,
+      scene,
+      const Duration(milliseconds: 50),
+      paced,
+      null,
+    );
 
     final boundary =
         boundaryKey.currentContext!.findRenderObject() as RenderRepaintBoundary;
@@ -489,6 +727,205 @@ void main() {
     }
   });
 
+  testWidgets('depth test survives switching MSAA off', (tester) async {
+    // Regression probe for a color target reused as an MSAA resolve
+    // destination and then as a direct target with a depth attachment. The
+    // GLES backend caches one framebuffer per color texture, so without a
+    // separate pooled texture per attachment setup the second frame draws
+    // with no depth buffer at all.
+    final msaaSupported = Scene.isAntiAliasingModeSupported(
+      AntiAliasingMode.msaa,
+    );
+    debugPrint('SMOKE depth_pairing: msaaSupported=$msaaSupported');
+    if (!msaaSupported) return;
+
+    await tester.pumpWidget(
+      const MaterialApp(
+        debugShowCheckedModeBanner: false,
+        home: Scaffold(backgroundColor: kSmokeClear, body: SizedBox.expand()),
+      ),
+    );
+    await tester.pump();
+    await Scene.preload(smaa: true);
+
+    final setup = buildDepthPairingScene();
+    final scene = setup.scene..antiAliasingMode = AntiAliasingMode.msaa;
+    final boundaryKey = GlobalKey();
+    await tester.pumpWidget(
+      MaterialApp(
+        debugShowCheckedModeBanner: false,
+        home: Scaffold(
+          backgroundColor: kSmokeClear,
+          body: Center(
+            child: RepaintBoundary(
+              key: boundaryKey,
+              child: SizedBox(
+                width: kSmokeSize.toDouble(),
+                height: kSmokeSize.toDouble(),
+                child: SceneView(scene, camera: setup.camera),
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
+
+    Future<void> pumpFrames() async {
+      await _settleGpu();
+      var paced = false;
+      for (var i = 0; i < 10; i++) {
+        paced = await _pumpSettled(
+          tester,
+          scene,
+          const Duration(milliseconds: 50),
+        );
+      }
+      await _capturableFrame(
+        tester,
+        scene,
+        const Duration(milliseconds: 50),
+        paced,
+        null,
+      );
+    }
+
+    Future<(int, int, int)> centerPixel() async {
+      final boundary =
+          boundaryKey.currentContext!.findRenderObject()
+              as RenderRepaintBoundary;
+      final ui.Image image = await boundary.toImage(pixelRatio: 1.0);
+      final rgba = (await image.toByteData(
+        format: ui.ImageByteFormat.rawRgba,
+      ))!;
+      final o = ((image.height ~/ 2) * image.width + image.width ~/ 2) * 4;
+      return (rgba.getUint8(o), rgba.getUint8(o + 1), rgba.getUint8(o + 2));
+    }
+
+    await pumpFrames();
+    final msaa = await centerPixel();
+    expect(msaa.$1, greaterThan(200), reason: 'msaa frame center $msaa');
+    expect(msaa.$2, lessThan(60), reason: 'msaa frame center $msaa');
+
+    scene.antiAliasingMode = AntiAliasingMode.none;
+    await pumpFrames();
+    final none = await centerPixel();
+    debugPrint('SMOKE depth_pairing: msaa=$msaa none=$none');
+    expect(none.$1, greaterThan(200), reason: 'no-AA frame center $none');
+    expect(none.$2, lessThan(60), reason: 'no-AA frame center $none');
+  });
+
+  testWidgets('a display-referred surface keeps its colours', (tester) async {
+    // Pixel-level guard for the display-referred layer (issue #382). A
+    // scene-referred quad is transformed by whatever tone curve is set; a
+    // display-referred one must arrive byte-exact under every one of them.
+    await tester.pumpWidget(
+      const MaterialApp(
+        debugShowCheckedModeBanner: false,
+        home: Scaffold(backgroundColor: kSmokeClear, body: SizedBox.expand()),
+      ),
+    );
+    await tester.pump();
+    await Scene.preload(smaa: true);
+
+    final material = UnlitMaterial()
+      ..alphaMode = AlphaMode.opaque
+      ..displayReferred = true;
+    final scene = Scene()..environment = EnvironmentMap.empty();
+    scene.add(
+      Node(mesh: Mesh(CuboidGeometry(vm.Vector3(4, 4, 0.01)), material)),
+    );
+
+    final boundaryKey = GlobalKey();
+    await tester.pumpWidget(
+      MaterialApp(
+        debugShowCheckedModeBanner: false,
+        home: Scaffold(
+          backgroundColor: kSmokeClear,
+          body: Center(
+            child: RepaintBoundary(
+              key: boundaryKey,
+              child: SizedBox(
+                width: kSmokeSize.toDouble(),
+                height: kSmokeSize.toDouble(),
+                child: SceneView(
+                  scene,
+                  camera: PerspectiveCamera(position: vm.Vector3(0, 0, 3)),
+                ),
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
+
+    // Android software rendering pays for every frame, so settle in fewer,
+    // longer steps there, matching the scene loop above.
+    final isAndroid =
+        !kIsWeb && defaultTargetPlatform == TargetPlatform.android;
+    final frames = isAndroid ? 2 : 10;
+    Future<int> render(int value, ToneMappingMode mode) async {
+      final pixels = Uint8List(4 * 4 * 4);
+      for (var i = 0; i < pixels.length; i += 4) {
+        pixels[i] = value;
+        pixels[i + 1] = value;
+        pixels[i + 2] = value;
+        pixels[i + 3] = 255;
+      }
+      material.baseColorTexture = Texture2D.fromPixels(pixels, 4, 4);
+      scene.toneMapping = mode;
+
+      await _settleGpu();
+      var paced = false;
+      for (var i = 0; i < frames; i++) {
+        paced = await _pumpSettled(
+          tester,
+          scene,
+          const Duration(milliseconds: 50),
+        );
+      }
+      await _capturableFrame(
+        tester,
+        scene,
+        const Duration(milliseconds: 50),
+        paced,
+        null,
+      );
+
+      final boundary =
+          boundaryKey.currentContext!.findRenderObject()
+              as RenderRepaintBoundary;
+      final ui.Image image = await boundary.toImage(pixelRatio: 1.0);
+      final rgba = (await image.toByteData(
+        format: ui.ImageByteFormat.rawRgba,
+      ))!;
+      final o = ((image.height ~/ 2) * image.width + image.width ~/ 2) * 4;
+      final red = rgba.getUint8(o);
+      image.dispose();
+      return red;
+    }
+
+    // Near-black is where the default operator's black-point term does its
+    // worst (27 resolves to 2 scene-referred), so it earns a row.
+    const inputs = [255, 128, 27];
+    final mismatches = <String>[];
+    for (final mode in ToneMappingMode.values) {
+      final row = <String>[];
+      for (final value in inputs) {
+        final out = await render(value, mode);
+        row.add('$value->$out');
+        if (out != value) mismatches.add('${mode.name} $value gave $out');
+      }
+      debugPrint('SMOKE display_referred ${mode.name}: ${row.join('  ')}');
+    }
+    expect(
+      mismatches,
+      isEmpty,
+      reason:
+          'a display-referred surface must reach the screen unchanged, '
+          'whatever the scene tone curve is',
+    );
+  });
+
   tearDownAll(() {
     binding.reportData = <String, dynamic>{...captures};
   });
@@ -545,3 +982,105 @@ _frameStats(ByteData rgba, int w, int h) {
     distinctColors: colors.length,
   );
 }
+
+/// The color pass's counters for the frame [scene] last rendered, or null
+/// when no frame has rendered or none of its passes is the color pass.
+RenderCounters? _colorPassCounters(Scene scene) {
+  final views = scene.renderStats.latest?.views;
+  if (views == null || views.isEmpty) return null;
+  for (final pass in views.first.passes) {
+    if (pass.name == 'ScenePass') return pass.counters;
+  }
+  return null;
+}
+
+/// Waits for the GPU to finish the frame the last pump submitted, so the next
+/// pump renders instead of re-presenting under `Scene.maxGpuFramesInFlight`
+/// and the capture is the frame the last pump drew. Bounded, since the
+/// immediate-execution web shim never holds work.
+Future<void> _settleGpu() async {
+  final start = DateTime.now();
+  final deadline = start.add(const Duration(seconds: 10));
+  while (rendererSubmissions.framesInFlight > 0 &&
+      DateTime.now().isBefore(deadline)) {
+    await Future<void>.delayed(const Duration(milliseconds: 5));
+  }
+  final waited = DateTime.now().difference(start).inMilliseconds;
+  if (waited > _settleMaxMs) _settleMaxMs = waited;
+  if (rendererSubmissions.framesInFlight > 0) _settleTimeouts++;
+  await Future<void>.delayed(const Duration(milliseconds: 50));
+}
+
+/// Pumps one frame and lets its GPU work finish. Returns whether the frame
+/// was paced (re-presented) rather than rendered.
+Future<bool> _pumpSettled(
+  WidgetTester tester,
+  Scene scene,
+  Duration step, {
+  void Function()? markNeedsPaint,
+}) async {
+  markNeedsPaint?.call();
+  final pacedBefore = scene.pacedFrameCount;
+  await tester.pump(step);
+  await _settleGpu();
+  return scene.pacedFrameCount != pacedBefore;
+}
+
+/// Makes sure the frame on screen is a rendered one. The Android emulator's
+/// Vulkan host signals some fences only when the next frame presents, so a
+/// pump right after such a frame is paced no matter how long the wait; pump
+/// again until one renders, bounded.
+/// Pumps until no environment is still filling its radiance.
+///
+/// A scene refines its radiance a roughness band per frame so one oversized
+/// prefilter cannot stall the display, which leaves an environment an
+/// approximation for its first few frames. These captures settle a single
+/// frame on Android (the emulator watchdog terminates sustained software
+/// rendering), so without this they would photograph the approximation there
+/// and the converged image everywhere else, then compare the two against one
+/// baseline.
+///
+/// Pumping is what the fill paces against, so this drives it rather than
+/// waiting on it. Forcing the prefilter into one submission instead puts back
+/// exactly the stall the pacing exists to avoid, which on the software Vulkan
+/// emulator is enough to time the device out.
+Future<void> _drainRadianceFills(
+  WidgetTester tester,
+  Scene scene,
+  Duration settleStep,
+  RenderRepaintBoundary boundary,
+) async {
+  // One pump per band, plus slack for an environment built during the drain.
+  const maxPumps = kPrefilterBandCount * 2;
+  for (var i = 0; i < maxPumps && radiancePrefilterPending; i++) {
+    await _pumpSettled(
+      tester,
+      scene,
+      settleStep,
+      markNeedsPaint: boundary.markNeedsPaint,
+    );
+  }
+}
+
+Future<void> _capturableFrame(
+  WidgetTester tester,
+  Scene scene,
+  Duration step,
+  bool lastPaced,
+  RenderRepaintBoundary? boundary,
+) async {
+  for (var tries = 0; lastPaced && tries < 4; tries++) {
+    _repumps++;
+    lastPaced = await _pumpSettled(
+      tester,
+      scene,
+      step,
+      markNeedsPaint: boundary?.markNeedsPaint,
+    );
+  }
+}
+
+// Per-scene diagnostics of the GPU waits, printed with the frame stats.
+int _settleMaxMs = 0;
+int _settleTimeouts = 0;
+int _repumps = 0;

@@ -49,8 +49,12 @@ uniform ResolveInfo {
 
   float bloom_enabled;
   float bloom_intensity;
-  float _pad6;
-  float _pad7;
+  // Surface debug view. x: 1 when a view is active, so its display-referred
+  // pixels copy through untouched (no exposure, tone mapping, or display
+  // encoding). y: the split as a fraction of the width, negative for the
+  // whole viewport; pixels at or right of it are the view.
+  float debug_view_active;
+  float debug_view_split;
 
   vec4 agx_params;
 
@@ -74,6 +78,29 @@ uniform sampler2D grading_lut;
 in vec2 v_uv;
 
 out vec4 frag_color;
+
+// Magnifies the coarse bloom texture with a cubic B-spline built from four
+// bilinear taps. Plain bilinear shows each bloom texel as a square blob.
+vec3 SampleBloom(vec2 uv) {
+  vec2 size = vec2(textureSize(bloom_color, 0));
+  vec2 p = uv * size - 0.5;
+  vec2 i = floor(p);
+  vec2 f = p - i;
+  vec2 f2 = f * f;
+  vec2 f3 = f2 * f;
+  vec2 w0 = (1.0 - 3.0 * f + 3.0 * f2 - f3) / 6.0;
+  vec2 w1 = (4.0 - 6.0 * f2 + 3.0 * f3) / 6.0;
+  vec2 w2 = (1.0 + 3.0 * f + 3.0 * f2 - 3.0 * f3) / 6.0;
+  vec2 w3 = f3 / 6.0;
+  vec2 g0 = w0 + w1;
+  vec2 g1 = w2 + w3;
+  vec2 c0 = (i - 0.5 + w1 / g0) / size;
+  vec2 c1 = (i + 1.5 + w3 / g1) / size;
+  return g0.y * (g0.x * texture(bloom_color, vec2(c0.x, c0.y)).rgb +
+                 g1.x * texture(bloom_color, vec2(c1.x, c0.y)).rgb) +
+         g1.y * (g0.x * texture(bloom_color, vec2(c0.x, c1.y)).rgb +
+                 g1.x * texture(bloom_color, vec2(c1.x, c1.y)).rgb);
+}
 
 #include <tone_mapping.glsl>
 
@@ -140,33 +167,21 @@ float GrainNoise(vec3 p) {
   return fract((p.x + p.y) * p.z);
 }
 
-void main() {
-  vec2 uv = resolve_info.flip_y > 0.5 ? vec2(v_uv.x, 1.0 - v_uv.y) : v_uv;
+// Alpha below which a pixel's color counts as light added over the content
+// behind the scene rather than as a surface covering it. Additive draws and
+// bloom leave light at zero alpha, which coverage alone cannot carry.
+// TODO(additive-coverage): additive light over a pixel covered above this
+// floor (fire inside a faint smoke sprite) folds into the surface and caps at
+// its alpha. Drawing additive translucents into their own target when the
+// background is transparent would keep that light separate.
+const float kCoverageFloor = 1.0 / 64.0;
+// Alpha at or above which a pixel hides everything behind the scene.
+const float kOpaque = 0.999;
 
-  // Sample the scene color. Chromatic aberration pulls the red and blue
-  // channels from offset positions that grow toward the edges.
-  vec3 color;
-  float alpha;
-  if (resolve_info.chromatic_aberration_enabled > 0.5) {
-    vec2 offset =
-        (uv - 0.5) * resolve_info.chromatic_aberration_intensity * 0.04;
-    vec4 center = texture(scene_color, uv);
-    color = vec3(Unpremultiply(texture(scene_color, uv + offset)).r,
-                 Unpremultiply(center).g,
-                 Unpremultiply(texture(scene_color, uv - offset)).b);
-    alpha = center.a;
-  } else {
-    vec4 hdr = texture(scene_color, uv);
-    color = Unpremultiply(hdr);
-    alpha = hdr.a;
-  }
-
-  // Bloom is computed in HDR by BloomPass and added back here.
-  if (resolve_info.bloom_enabled > 0.5) {
-    color += texture(bloom_color, uv).rgb * resolve_info.bloom_intensity;
-  }
-
-  color *= resolve_info.exposure * texture(exposure_factor, vec2(0.5, 0.5)).r;
+// Exposed linear HDR color to display-encoded color: grading, tone mapping,
+// vignette, optional film grain, sRGB encoding, then the grading LUT.
+vec3 Display(vec3 color, float exposure, bool grain) {
+  color *= exposure;
   if (resolve_info.grading_enabled > 0.5) {
     color = ApplyColorGrading(color);
   }
@@ -195,7 +210,7 @@ void main() {
   }
 
   // Film grain: animated per-pixel noise.
-  if (resolve_info.grain_enabled > 0.5) {
+  if (grain && resolve_info.grain_enabled > 0.5) {
     float n =
         GrainNoise(vec3(gl_FragCoord.xy, resolve_info.time * 60.0)) - 0.5;
     mapped = max(mapped + n * resolve_info.grain_intensity, vec3(0.0));
@@ -211,6 +226,81 @@ void main() {
     vec3 graded = ApplyGradingLut(mapped, resolve_info.lut_params.y);
     mapped = mix(mapped, graded, resolve_info.lut_params.x);
   }
+  return mapped;
+}
 
-  frag_color = vec4(mapped * alpha, alpha);
+void main() {
+  vec2 uv = resolve_info.flip_y > 0.5 ? vec2(v_uv.x, 1.0 - v_uv.y) : v_uv;
+
+  // A surface debug view wrote display-referred pixels; hand them through so
+  // the value on screen is the value the material saw. Left of a split the
+  // lit half still resolves normally.
+  bool debug_pixel = resolve_info.debug_view_active > 0.5 &&
+                     (resolve_info.debug_view_split < 0.0 ||
+                      v_uv.x >= resolve_info.debug_view_split);
+  if (debug_pixel) {
+    // Debug surfaces wrote opaque display-referred color; where nothing drew
+    // the target is still clear, and that transparency must survive so the
+    // widget behind the scene shows through as it does for the lit image.
+    frag_color = texture(scene_color, uv);
+    return;
+  }
+
+  // Sample the scene color, both as the covering surface's color and as the
+  // premultiplied light in the pixel. Chromatic aberration pulls the red and
+  // blue channels from offset positions that grow toward the edges.
+  vec4 hdr = texture(scene_color, uv);
+  vec3 color;
+  vec3 light;
+  float alpha = hdr.a;
+  if (resolve_info.chromatic_aberration_enabled > 0.5) {
+    vec2 offset =
+        (uv - 0.5) * resolve_info.chromatic_aberration_intensity * 0.04;
+    vec4 red = texture(scene_color, uv + offset);
+    vec4 blue = texture(scene_color, uv - offset);
+    color = vec3(Unpremultiply(red).r, Unpremultiply(hdr).g,
+                 Unpremultiply(blue).b);
+    light = vec3(red.r, hdr.g, blue.b);
+  } else {
+    color = Unpremultiply(hdr);
+    light = hdr.rgb;
+  }
+
+  // Bloom is computed in HDR by BloomPass and added back here.
+  vec3 bloom = vec3(0.0);
+  if (resolve_info.bloom_enabled > 0.5) {
+    bloom = SampleBloom(uv) * resolve_info.bloom_intensity;
+  }
+
+  float exposure =
+      resolve_info.exposure * texture(exposure_factor, vec2(0.5, 0.5)).r;
+
+  // The covered part of the pixel resolves its surface color with alpha
+  // weighting, so antialiased edges composite exactly. Near zero alpha the
+  // color fades over to the added light below.
+  float coverage = clamp(alpha / kCoverageFloor, 0.0, 1.0);
+  vec3 resolved = vec3(0.0);
+  if (alpha > 0.0) {
+    resolved = alpha * Display(color * coverage + bloom, exposure, true);
+  }
+
+  // The uncovered part shows light added over the content behind the scene
+  // (bloom, additive draws): its display-encoded increment over black,
+  // which the premultiplied composite adds to that content.
+  if (alpha < kOpaque) {
+    vec3 added = bloom + light * ((1.0 - coverage) / (1.0 - alpha));
+    if (max(added.r, max(added.g, added.b)) > 0.0) {
+      vec3 increment = Display(added, exposure, false);
+      // Grading and the LUT can lift black, which must not tint the
+      // content behind the scene.
+      if (resolve_info.grading_enabled > 0.5 ||
+          resolve_info.lut_params.x > 0.0) {
+        increment =
+            max(increment - Display(vec3(0.0), exposure, false), vec3(0.0));
+      }
+      resolved += (1.0 - alpha) * increment;
+    }
+  }
+
+  frag_color = vec4(resolved, alpha);
 }

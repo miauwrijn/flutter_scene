@@ -3,6 +3,8 @@ import 'dart:typed_data';
 
 import 'package:vector_math/vector_math.dart' as vm;
 
+import 'package:flutter_scene/src/render/depth_raster.dart';
+import 'package:flutter_scene/src/render/projection_params.dart';
 import 'package:flutter_scene/src/geometry/geometry.dart';
 import 'package:flutter_scene/src/geometry/vertex_layout.dart';
 import 'package:flutter_scene/src/gpu/gpu.dart' as gpu;
@@ -13,6 +15,7 @@ import 'package:flutter_scene/src/splats/splat_data.dart';
 import 'package:flutter_scene/src/splats/splat_sort_service.dart';
 import 'package:flutter_scene/src/splats/splat_sorter.dart';
 import 'package:flutter_scene/src/render/frame_transients.dart';
+import 'package:flutter_scene/src/render/uniform_slots.dart';
 
 /// How a crop box filters the splats of a `SplatComponent`.
 /// {@category Gaussian splatting}
@@ -40,6 +43,9 @@ enum SplatCropMode {
 /// Pair with a `SplatMaterial` and attach through a `SplatComponent`.
 /// {@category Geometry}
 class SplatGeometry extends Geometry {
+  @override
+  bool get emitsStandardVaryings => false;
+
   /// Creates geometry for [splats].
   SplatGeometry(this.splats) {
     setVertexShaderName('SplatsVertex');
@@ -286,10 +292,28 @@ class SplatGeometry extends Geometry {
     final mvp = cameraTransform * modelTransform;
 
     // The MVP's w row measures view depth per unit of local position, so its
-    // xyz is the local-space sort direction. Ordering along a direction is
-    // unaffected by camera translation, so only rotation triggers a re-sort.
+    // xyz is the local-space sort direction. An orthographic w row is
+    // constant; its depth gradient is the camera forward carried into local
+    // space (the model's linear part transposed). Ordering along a direction
+    // is unaffected by camera translation, so only rotation triggers a
+    // re-sort.
     final storage = mvp.storage;
-    final sortDir = vm.Vector3(storage[3], storage[7], storage[11]);
+    final orthographic = isOrthographicTransform(cameraTransform);
+    final vm.Vector3 sortDir;
+    vm.Vector3? orthographicWorldForward;
+    if (orthographic) {
+      final forward = orthographicWorldForward = orthographicForward(
+        cameraTransform,
+      );
+      final m = modelTransform.storage;
+      sortDir = vm.Vector3(
+        m[0] * forward.x + m[1] * forward.y + m[2] * forward.z,
+        m[4] * forward.x + m[5] * forward.y + m[6] * forward.z,
+        m[8] * forward.x + m[9] * forward.y + m[10] * forward.z,
+      );
+    } else {
+      sortDir = vm.Vector3(storage[3], storage[7], storage[11]);
+    }
     if (sortDir.length2 > 1e-12) {
       sortDir.normalize();
       final last = _lastSortDir;
@@ -311,20 +335,20 @@ class SplatGeometry extends Geometry {
     );
 
     pass.bindTexture(
-      vertexShader.getUniformSlot('splat_params_texture'),
+      vertexShader.cachedUniformSlot('splat_params_texture'),
       splats.paramsTexture,
       sampler: _dataSampler,
     );
     // The SH slot must always be bound; a set with no rest coefficients
     // binds the params texture as a placeholder (degree 0 never samples it).
     pass.bindTexture(
-      vertexShader.getUniformSlot('splat_sh_texture'),
+      vertexShader.cachedUniformSlot('splat_sh_texture'),
       splats.shTexture ?? splats.paramsTexture,
       sampler: _dataSampler,
     );
 
     final viewport = currentSceneEncoderViewport;
-    final frameInfo = Float32List(72);
+    final frameInfo = _frameInfoScratch..fillRange(0, 80, 0.0);
     frameInfo.setRange(0, 16, mvp.storage);
     frameInfo.setRange(16, 32, modelTransform.storage);
     final cropInverse = _cropInverse;
@@ -357,9 +381,21 @@ class SplatGeometry extends Geometry {
     frameInfo[69] = tint.y;
     frameInfo[70] = tint.z;
     frameInfo[71] = tint.w;
+    // view_direction: under an orthographic camera every view ray runs along
+    // the camera's forward axis.
+    final forward = orthographicWorldForward;
+    if (forward != null) {
+      frameInfo[72] = forward.x;
+      frameInfo[73] = forward.y;
+      frameInfo[74] = forward.z;
+      frameInfo[75] = 1.0;
+    }
+    frameInfo[76] = currentDrawDepthOffset[0];
+    frameInfo[77] = currentDrawDepthOffset[1];
+    frameInfo[78] = currentRasterFarClipDepth;
     pass.bindUniform(
-      vertexShader.getUniformSlot('FrameInfo'),
-      transientsBuffer.emplace(ByteData.sublistView(frameInfo)),
+      vertexShader.cachedUniformSlot('FrameInfo'),
+      transientsBuffer.emplace(scratchBytesOf(frameInfo)),
     );
   }
 
@@ -396,3 +432,6 @@ final VertexLayoutDescriptor _kSplatLayout = VertexLayoutDescriptor(
     ),
   ],
 );
+
+// Shared by every draw; emplace copies it out.
+final Float32List _frameInfoScratch = Float32List(80);

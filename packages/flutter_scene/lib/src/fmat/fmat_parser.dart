@@ -563,7 +563,9 @@ FmatMaterial _build(
     'blending',
     'culling',
     'depth_write',
+    'effects_depth',
     'depth_test',
+    'depth_layer',
     'depth_offset',
     'parameters',
     'varyings',
@@ -572,6 +574,9 @@ FmatMaterial _build(
     'requires',
     'engine_inputs',
     'scene_color_reach',
+    'environment_lighting',
+    'directional_light',
+    'alpha_to_coverage',
   };
   for (final key in tree.keys) {
     if (!knownKeys.contains(key)) {
@@ -613,6 +618,71 @@ FmatMaterial _build(
     throw FmatException('`depth_write` must be a boolean.', fileName: fileName);
   }
   final depthWrite = depthWriteValue as bool? ?? false;
+  final effectsDepthValue = tree['effects_depth'];
+  if (effectsDepthValue != null && effectsDepthValue is! bool) {
+    throw FmatException(
+      '`effects_depth` must be a boolean.',
+      fileName: fileName,
+    );
+  }
+  final effectsDepth = effectsDepthValue as bool? ?? false;
+  if (effectsDepth && blending == FmatBlending.opaque) {
+    throw FmatException(
+      '`effects_depth` is for translucent materials; opaque ones already '
+      'write depth.',
+      fileName: fileName,
+    );
+  }
+
+  final environmentLightingValue = tree['environment_lighting'];
+  if (environmentLightingValue != null && environmentLightingValue is! bool) {
+    throw FmatException(
+      '`environment_lighting` must be a boolean.',
+      fileName: fileName,
+    );
+  }
+  final environmentLighting = environmentLightingValue as bool? ?? true;
+  if (!environmentLighting && shadingModel != FmatShadingModel.lit) {
+    throw FmatException(
+      '`environment_lighting: false` is only supported with '
+      '`shading_model: lit`.',
+      fileName: fileName,
+    );
+  }
+
+  final alphaToCoverageValue = tree['alpha_to_coverage'];
+  if (alphaToCoverageValue != null && alphaToCoverageValue is! bool) {
+    throw FmatException(
+      '`alpha_to_coverage` must be a boolean.',
+      fileName: fileName,
+    );
+  }
+  final alphaToCoverage = alphaToCoverageValue as bool? ?? false;
+  if (alphaToCoverage &&
+      (blending != FmatBlending.opaque ||
+          shadingModel == FmatShadingModel.shadowCatcher)) {
+    throw FmatException(
+      '`alpha_to_coverage` needs `blending: opaque`; blended materials '
+      'already use their alpha.',
+      fileName: fileName,
+    );
+  }
+
+  final directionalLightValue = tree['directional_light'];
+  if (directionalLightValue != null && directionalLightValue is! bool) {
+    throw FmatException(
+      '`directional_light` must be a boolean.',
+      fileName: fileName,
+    );
+  }
+  final directionalLight = directionalLightValue as bool? ?? true;
+  if (!directionalLight && shadingModel != FmatShadingModel.lit) {
+    throw FmatException(
+      '`directional_light: false` is only supported with '
+      '`shading_model: lit`.',
+      fileName: fileName,
+    );
+  }
 
   // `depth_test` picks the translucent pass's depth comparison. `always` is for
   // a projection volume whose own faces sit behind the surface it shades.
@@ -636,6 +706,22 @@ FmatMaterial _build(
       '`blending: alpha` or `blending: additive`.',
       fileName: fileName,
     );
+  }
+
+  // `depth_layer` orders this surface against coplanar ones (see
+  // `Material.depthLayer`).
+  final depthLayerValue = tree['depth_layer'];
+  var depthLayer = 0;
+  if (depthLayerValue != null) {
+    if (depthLayerValue is! num ||
+        depthLayerValue != depthLayerValue.roundToDouble() ||
+        depthLayerValue.abs() > 8) {
+      throw FmatException(
+        '`depth_layer` must be a whole number from -8 to 8.',
+        fileName: fileName,
+      );
+    }
+    depthLayer = depthLayerValue.toInt();
   }
 
   // `depth_offset` lets `Surface()` say where its surface really is, in metres
@@ -857,7 +943,9 @@ FmatMaterial _build(
     blending: blending,
     culling: culling,
     depthWrite: depthWrite,
+    effectsDepth: effectsDepth,
     depthTest: depthTest,
+    depthLayer: depthLayer,
     depthOffset: depthOffset,
     parameters: parameters,
     fragmentSource: body.content,
@@ -869,6 +957,9 @@ FmatMaterial _build(
     instanceAttributes: instanceAttributes,
     engineInputs: engineInputs,
     sceneColorReach: sceneColorReach,
+    environmentLighting: environmentLighting,
+    directionalLight: directionalLight,
+    alphaToCoverage: alphaToCoverage,
   );
 }
 
