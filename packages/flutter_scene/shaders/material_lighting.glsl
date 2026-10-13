@@ -431,7 +431,7 @@ highp vec4 EvaluateLighting(MaterialInputs material) {
   if (frag_info.ssao_params.x > 1e30) {
     occlusion = texture(ssao_texture, vec2(0.0)).r;
   }
-#ifndef FLUTTER_SCENE_SHADOW_CATCHER
+#ifdef FLUTTER_SCENE_WEATHER_OCCLUSION
   // Likewise weather_occlusion: the lean entries compile the weather out
   // (a frame with weather draws the full tier) but the engine binds it.
   if (frag_info.ssao_params.x > 1e30) {

@@ -745,12 +745,15 @@ class EngineLightingUniforms {
       );
     }
     // What stands overhead, for the weather. Packed data, so nearest; the
-    // placeholder is never read (weather_occ_range.z is 0 then).
-    pass.bindTexture(
-      shader.getUniformSlot('weather_occlusion'),
-      Material.whitePlaceholder(lighting.weather?.occlusionMap),
-      sampler: _nearestClampSampler,
-    );
+    // placeholder is never read (weather_occ_range.z is 0 then). A material
+    // without the engine's environment lighting declares no such sampler.
+    if (bindEnvironment) {
+      pass.bindTexture(
+        shader.cachedUniformSlot('weather_occlusion'),
+        Material.whitePlaceholder(lighting.weather?.occlusionMap),
+        sampler: _nearestClampSampler,
+      );
+    }
   }
 
   /// Binds the engine samplers a shadow-catcher fragment shader declares.
