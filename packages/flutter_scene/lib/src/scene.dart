@@ -663,6 +663,18 @@ base class Scene implements SceneGraph {
   /// {@category Lighting and environment}
   bool punctualLightClustering = true;
 
+  /// Whether the [RenderStage.afterScene] custom passes read translucent
+  /// depth-writing surfaces (glass, fish) in [RenderInput.depth].
+  ///
+  /// When true (the default), the translucent depth patch runs before those
+  /// passes, so they see the nearest visible surface. When false it runs after
+  /// them, as it once did: they read the opaque scene (what is seen through a
+  /// pane), and the patch serves only depth of field and the later stages. An
+  /// app whose after-scene passes light, fog or cloud the scene behind its
+  /// windows wants false, and reads the pane itself, where it needs it, from
+  /// [RenderInput.translucentSurface].
+  bool afterScenePassesSeeTranslucentDepth = true;
+
   /// How many frames of GPU work may be outstanding before a screen view
   /// presents its previous image again instead of encoding a new frame.
   ///
@@ -3242,7 +3254,11 @@ base class Scene implements SceneGraph {
     final patchTranslucentDepth =
         wantDof ||
         _renderPasses.any(
-          (pass) => pass.enabled && pass.inputs.contains(RenderInput.depth),
+          (pass) =>
+              pass.enabled &&
+              pass.inputs.contains(RenderInput.depth) &&
+              (afterScenePassesSeeTranslucentDepth ||
+                  pass.stage != RenderStage.afterScene),
         );
     final enableMsaa = effectiveAa == AntiAliasingMode.msaa;
     final enableFxaa = effectiveAa == AntiAliasingMode.fxaa && !debugActive;
@@ -3573,8 +3589,13 @@ base class Scene implements SceneGraph {
         !debugActive &&
         projectionValid &&
         screenSpaceReflections.enabled;
-    // A custom pass may request depth/normals; normals imply depth.
-    final wantCustomNormals = customInputs.contains(RenderInput.normals);
+    // A custom pass may request depth/normals; normals imply depth, and so
+    // does the translucent surface, which writes them for the panes.
+    final wantTranslucentSurface =
+        projectionValid &&
+        customInputs.contains(RenderInput.translucentSurface);
+    final wantCustomNormals =
+        wantTranslucentSurface || customInputs.contains(RenderInput.normals);
     final wantCustomDepth =
         wantCustomNormals || customInputs.contains(RenderInput.depth);
     // Flutter GPU does not expose whether a stored depth/stencil attachment is
@@ -3655,6 +3676,7 @@ base class Scene implements SceneGraph {
             // not a translucent surface qualifies.
             keepDepthStencil:
                 patchTranslucentDepth ||
+                wantTranslucentSurface ||
                 (enableTaa && temporalAntiAliasing.objectMotion),
             cameraRight: cameraRight,
             cameraUp: cameraUp,
@@ -3663,6 +3685,21 @@ base class Scene implements SceneGraph {
             primaryView: viewIndex >= 0,
           ),
         );
+        if (wantTranslucentSurface) {
+          graph.addPass(
+            TranslucentSurfacePass(
+              camera: camera,
+              renderScene: renderScene,
+              cameraForward: cameraForward,
+              cameraRight: cameraRight,
+              cameraUp: cameraUp,
+              farDepth: projection.far,
+              layerMask: view.layerMask,
+              cullingPlanes: view.cullingPlanes,
+              primaryView: viewIndex >= 0,
+            ),
+          );
+        }
       }
       if (enableTaa && temporalAntiAliasing.objectMotion) {
         final prevViewProj =
@@ -3886,7 +3923,7 @@ base class Scene implements SceneGraph {
       );
     }
 
-    if (patchTranslucentDepth) {
+    void addTranslucentDepthPatch() {
       graph.addPass(
         TranslucentDepthPatchPass(
           camera: camera,
@@ -3897,6 +3934,10 @@ base class Scene implements SceneGraph {
           primaryView: viewIndex >= 0,
         ),
       );
+    }
+
+    if (patchTranslucentDepth && afterScenePassesSeeTranslucentDepth) {
+      addTranslucentDepthPatch();
     }
 
     // Custom HDR passes right after the scene is drawn.
@@ -3911,6 +3952,9 @@ base class Scene implements SceneGraph {
       view.layerMask,
       postTime,
     );
+    if (patchTranslucentDepth && !afterScenePassesSeeTranslucentDepth) {
+      addTranslucentDepthPatch();
+    }
 
     // Depth of field on the linear HDR scene color, before the custom
     // effects and bloom so both act on the defocused image (bokeh highlights
