@@ -1,3 +1,4 @@
+import 'dart:math' as math;
 import 'dart:typed_data';
 
 import 'package:flutter_scene/src/gpu/gpu.dart' as gpu;
@@ -22,6 +23,33 @@ import 'package:flutter_scene/src/render/uniform_slots.dart';
 /// from here.
 const String kShadowMapBlackboardKey = 'directional_shadow_map';
 
+/// Where tile `i` of the shared shadow atlas sits: tiles wrap
+/// [columns] to a row, so the atlas is at most `4 * tileResolution` wide
+/// and grows downward with the lamps. One strip of every tile overran the
+/// GPU's texture limit as soon as a few lamps cast (4 cascades + 6 lamp
+/// tiles at 2048 asked for a 20480-wide texture). Mirrored by
+/// `ShadowAtlasUv` in material_shadow_sampling.glsl and by the post passes
+/// that read the atlas.
+/// {@category Rendering}
+class ShadowAtlasLayout {
+  const ShadowAtlasLayout(this.totalTiles, this.tileResolution);
+
+  /// Tiles per row. The four cascades fill the first row.
+  static const int columns = 4;
+
+  final int totalTiles;
+  final int tileResolution;
+
+  int get width => tileResolution * math.min(totalTiles, columns);
+  int get height => tileResolution * ((totalTiles + columns - 1) ~/ columns);
+
+  /// Texel x of tile [i]'s left edge.
+  int x(int i) => (i % columns) * tileResolution;
+
+  /// Texel y of tile [i]'s top edge (the atlas is stored top-down).
+  int y(int i) => (i ~/ columns) * tileResolution;
+}
+
 /// Blackboard key for the frame's [SpotShadowInfo], set when spots cast.
 const String kSpotShadowInfoBlackboardKey = 'spot_shadow_info';
 
@@ -44,7 +72,7 @@ class SpotShadowInfo {
   /// Atlas tile index of slot 0; slot `i` is tile `firstTile + i`.
   final int firstTile;
 
-  /// Tiles across the atlas (its width is `totalTiles * tileResolution`).
+  /// Tiles in the atlas, laid out by [ShadowAtlasLayout].
   final int totalTiles;
 
   /// Edge length of a tile in texels.
@@ -143,6 +171,7 @@ class ShadowPass extends RenderGraphPass {
       ? _cascadeReceiverPlanes[cascade]
       : const [];
   final int _tileResolution;
+  ShadowAtlasLayout? _layout;
   final ShadowCasterFaces _casterFaces;
 
   // The directional light's shadow-caster channels. Applies to the cascade
@@ -210,23 +239,24 @@ class ShadowPass extends RenderGraphPass {
     final pointCount = _pointShadows?.casters.length ?? 0;
     final totalTiles =
         _cascades.length + spotCount + pointCount * kPointShadowTilesPerLight;
-    final atlasWidth = _tileResolution * totalTiles;
+    final layout = ShadowAtlasLayout(totalTiles, _tileResolution);
+    _layout = layout;
     // fp32 (not fp16): the far cascade's orthographic depth range spans
     // hundreds of world units, and fp16's ~11-bit mantissa quantizes
     // window-space depth into steps coarser than the shadow depth bias.
     // That made the flat distant ground self-shadow in moire bands.
     final color = context.texturePool.acquire(
       TransientTextureDescriptor.color(
-        width: atlasWidth,
-        height: _tileResolution,
+        width: layout.width,
+        height: layout.height,
         format: gpu.PixelFormat.r32Float,
         debugName: 'directional_shadow_map',
       ),
     );
     final depth = context.texturePool.acquire(
       TransientTextureDescriptor.depth(
-        width: atlasWidth,
-        height: _tileResolution,
+        width: layout.width,
+        height: layout.height,
         format: gpu.gpuContext.defaultDepthStencilFormat,
         debugName: 'directional_shadow_map_depth',
       ),
@@ -258,8 +288,8 @@ class ShadowPass extends RenderGraphPass {
     }) {
       renderPass.setViewport(
         gpu.Viewport(
-          x: tile * _tileResolution,
-          y: 0,
+          x: layout.x(tile),
+          y: layout.y(tile),
           width: _tileResolution,
           height: _tileResolution,
         ),
@@ -294,8 +324,8 @@ class ShadowPass extends RenderGraphPass {
         _encodeTileCopy(renderPass, c, plan.entries[c].tile!);
         renderPass.setViewport(
           gpu.Viewport(
-            x: c * _tileResolution,
-            y: 0,
+            x: layout.x(c),
+            y: layout.y(c),
             width: _tileResolution,
             height: _tileResolution,
           ),
@@ -349,8 +379,8 @@ class ShadowPass extends RenderGraphPass {
           final q = f % 4;
           renderPass.setViewport(
             gpu.Viewport(
-              x: tile * _tileResolution + (q & 1) * half,
-              y: (q >> 1) * half,
+              x: layout.x(tile) + (q & 1) * half,
+              y: layout.y(tile) + (q >> 1) * half,
               width: half,
               height: half,
             ),
@@ -455,10 +485,11 @@ class ShadowPass extends RenderGraphPass {
   /// writing the stored depth to both the color channel and the fragment
   /// depth so the dynamic casters drawn after depth-test against it.
   void _encodeTileCopy(gpu.RenderPass pass, int tile, gpu.Texture source) {
+    final layout = _layout!;
     pass.setViewport(
       gpu.Viewport(
-        x: tile * _tileResolution,
-        y: 0,
+        x: layout.x(tile),
+        y: layout.y(tile),
         width: _tileResolution,
         height: _tileResolution,
       ),

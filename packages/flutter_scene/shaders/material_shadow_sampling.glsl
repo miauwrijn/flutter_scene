@@ -8,6 +8,25 @@
 // material_engine_lighting.glsl.
 
 #ifndef FLUTTER_SCENE_SKIP_SHADOWS
+// The shadow atlas wraps its tiles four to a row (ShadowAtlasLayout in
+// shadow_pass.dart): tile `tile` of `total`, at `local` -- the tile's own
+// UV, stored top-down (v = 0 at the tile's top row) -- in atlas UV.
+highp vec2 ShadowAtlasUvTopDown(highp float tile, highp vec2 local,
+                                highp float total) {
+  highp float cols = min(total, 4.0);
+  highp float rows = ceil(total / 4.0);
+  highp float row = floor((tile + 0.5) / 4.0);
+  highp float col = tile - row * 4.0;
+  return vec2((col + local.x) / cols, (row + local.y) / rows);
+}
+
+// The same from NDC-oriented tile UV (proj.xy * 0.5 + 0.5, v = 1 at the
+// top): the atlas is a render target stored top-down, so V flips. That is
+// intrinsic to the storage, not a backend Y-flip workaround.
+highp vec2 ShadowAtlasUv(highp float tile, highp vec2 uv, highp float total) {
+  return ShadowAtlasUvTopDown(tile, vec2(uv.x, 1.0 - uv.y), total);
+}
+
 // One rotated Poisson-disk PCF tap into a cascade's atlas tile.
 // Samples the caster depth for the soft-shadow blocker search, with the
 // same tile mapping as ShadowTap and no comparison. Returned relative to the
@@ -15,13 +34,12 @@
 // centre's depth.
 highp float ShadowTapDepth(vec2 p, float ca, float sa, highp float radius,
                            highp vec2 uv,
-                           int cascade, highp float inv_count,
+                           int cascade, highp float total,
                            highp vec2 slope) {
   highp vec2 offset = vec2(p.x * ca - p.y * sa, p.x * sa + p.y * ca) * radius;
   highp vec2 cuv = clamp(uv + offset, vec2(frag_info.shadow_texel_size),
                    vec2(1.0 - frag_info.shadow_texel_size));
-  highp vec2 atlas_uv = vec2((float(cascade) + cuv.x) * inv_count, cuv.y);
-  atlas_uv.y = 1.0 - atlas_uv.y;
+  highp vec2 atlas_uv = ShadowAtlasUv(float(cascade), cuv, total);
   return textureLod(shadow_map, atlas_uv, 0.0).r - dot(slope, offset);
 }
 
@@ -30,19 +48,14 @@ highp float ShadowTapDepth(vec2 p, float ca, float sa, highp float radius,
 // under it, not the kernel centre's depth, so a wide kernel on a tilted
 // receiver does not shadow itself.
 float ShadowTap(vec2 p, float ca, float sa, highp float radius, highp vec2 uv,
-                int cascade, highp float inv_count, highp float receiver_depth,
+                int cascade, highp float total, highp float receiver_depth,
                 highp vec2 slope) {
   highp vec2 offset = vec2(p.x * ca - p.y * sa, p.x * sa + p.y * ca) * radius;
   // Keep samples a texel inside this cascade's tile. This also protects the
   // boundary if a custom backend applies filtering to the atlas.
   highp vec2 cuv = clamp(uv + offset, vec2(frag_info.shadow_texel_size),
                    vec2(1.0 - frag_info.shadow_texel_size));
-  highp vec2 atlas_uv = vec2((float(cascade) + cuv.x) * inv_count, cuv.y);
-  // The shadow atlas is a render-to-texture target stored top-down. NDC->UV
-  // (proj.xy * 0.5 + 0.5) maps NDC-top to v=1, but a top-down texture's top row
-  // is v=0, so flip V to sample the matching row. This is intrinsic to the
-  // top-down storage (not a backend Y-flip workaround), so it is unconditional.
-  atlas_uv.y = 1.0 - atlas_uv.y;
+  highp vec2 atlas_uv = ShadowAtlasUv(float(cascade), cuv, total);
   highp float caster_depth = textureLod(shadow_map, atlas_uv, 0.0).r;
   return receiver_depth + dot(slope, offset) <= caster_depth ? 1.0 : 0.0;
 }
@@ -51,7 +64,7 @@ float ShadowTap(vec2 p, float ca, float sa, highp float radius, highp vec2 uv,
 // shadow texels and continuously interpolates the depth tests across fractional
 // texels, producing smooth analog penumbras without noise rotation or stepping.
 float ShadowTapBilinear(vec2 p, highp float radius, highp vec2 uv, int cascade,
-                        highp float inv_count, highp float receiver_depth,
+                        highp float total, highp float receiver_depth,
                         highp vec2 slope) {
   highp vec2 offset = p * radius;
   receiver_depth += dot(slope, offset);
@@ -62,9 +75,9 @@ float ShadowTapBilinear(vec2 p, highp float radius, highp vec2 uv, int cascade,
   highp vec2 base = floor(tile_tex);
   highp vec2 f = tile_tex - base;
   highp vec2 cuv00 = (base + vec2(0.5)) * frag_info.shadow_texel_size;
-  highp vec2 atlas_uv00 = vec2((float(cascade) + cuv00.x) * inv_count, cuv00.y);
-  highp vec2 step_uv = vec2(frag_info.shadow_texel_size * inv_count,
-                      frag_info.shadow_texel_size);
+  highp vec2 atlas_uv00 = ShadowAtlasUvTopDown(float(cascade), cuv00, total);
+  highp vec2 step_uv = vec2(frag_info.shadow_texel_size / min(total, 4.0),
+                      frag_info.shadow_texel_size / ceil(total / 4.0));
 
   highp float d00 = textureLod(shadow_map, atlas_uv00, 0.0).r;
   highp float d10 = textureLod(shadow_map, atlas_uv00 + vec2(step_uv.x, 0.0), 0.0).r;
@@ -156,7 +169,7 @@ float SampleCascade(int cascade, int count, highp vec3 proj, highp float box,
 
   // The atlas also holds spot-shadow tiles after the cascades, so normalize the
   // atlas-x by the total tile count. Spot count 0 leaves this at 1 / cascades.
-  highp float inv_count = 1.0 / (float(count) + frag_info.spot_shadow_params.x);
+  highp float total = float(count) + frag_info.spot_shadow_params.x;
 
   // Select the tap positions without duplicating the texture samples in both
   // branches. Duplicating both kernels here expands to 33 samples per cascade
@@ -192,7 +205,7 @@ float SampleCascade(int cascade, int count, highp vec3 proj, highp float box,
     float blocker_count = 0.0;
     for (int i = 0; i < 9; i++) {
       highp float caster = ShadowTapDepth(PoissonShadowTap(i), ca, sa, search_radius,
-                                    uv, cascade, inv_count, slope);
+                                    uv, cascade, total, slope);
       float hit = step(caster, receiver_depth);
       blocker_sum += caster * hit;
       blocker_count += hit;
@@ -216,15 +229,15 @@ float SampleCascade(int cascade, int count, highp vec3 proj, highp float box,
   bool settled = false;
   if (filter_index < 1.5 || filter_index > 2.5) {
     float probe =
-        ShadowTap(vec2(0.0), ca, sa, radius, uv, cascade, inv_count,
+        ShadowTap(vec2(0.0), ca, sa, radius, uv, cascade, total,
                   receiver_depth, slope) +
-        ShadowTap(vec2(-1.0, -1.0), ca, sa, radius, uv, cascade, inv_count,
+        ShadowTap(vec2(-1.0, -1.0), ca, sa, radius, uv, cascade, total,
                   receiver_depth, slope) +
-        ShadowTap(vec2(1.0, -1.0), ca, sa, radius, uv, cascade, inv_count,
+        ShadowTap(vec2(1.0, -1.0), ca, sa, radius, uv, cascade, total,
                   receiver_depth, slope) +
-        ShadowTap(vec2(-1.0, 1.0), ca, sa, radius, uv, cascade, inv_count,
+        ShadowTap(vec2(-1.0, 1.0), ca, sa, radius, uv, cascade, total,
                   receiver_depth, slope) +
-        ShadowTap(vec2(1.0, 1.0), ca, sa, radius, uv, cascade, inv_count,
+        ShadowTap(vec2(1.0, 1.0), ca, sa, radius, uv, cascade, total,
                   receiver_depth, slope);
     settled = probe < 0.5 || probe > 4.5;
     shadow = probe * 0.2;
@@ -236,13 +249,13 @@ float SampleCascade(int cascade, int count, highp vec3 proj, highp float box,
     // 16-sample budget), producing continuous analog filtering with zero
     // noise rotation or stepped banding.
     float lit = ShadowTapBilinear(vec2(-0.7071, -0.7071), radius, uv, cascade,
-                                  inv_count, receiver_depth, slope) +
+                                  total, receiver_depth, slope) +
                 ShadowTapBilinear(vec2(0.7071, -0.7071), radius, uv, cascade,
-                                  inv_count, receiver_depth, slope) +
+                                  total, receiver_depth, slope) +
                 ShadowTapBilinear(vec2(-0.7071, 0.7071), radius, uv, cascade,
-                                  inv_count, receiver_depth, slope) +
+                                  total, receiver_depth, slope) +
                 ShadowTapBilinear(vec2(0.7071, 0.7071), radius, uv, cascade,
-                                  inv_count, receiver_depth, slope);
+                                  total, receiver_depth, slope);
     shadow = lit * 0.25;
   } else {
     int sample_count = fixed_filter > 0.5 ? 17 : 16;
@@ -250,7 +263,7 @@ float SampleCascade(int cascade, int count, highp vec3 proj, highp float box,
     for (int i = 0; i < 17; i++) {
       if (i >= sample_count) break;
       vec2 tap = mix(PoissonShadowTap(i), FixedShadowTap(i), fixed_filter);
-      lit += ShadowTap(tap, ca, sa, radius, uv, cascade, inv_count,
+      lit += ShadowTap(tap, ca, sa, radius, uv, cascade, total,
                        receiver_depth, slope);
     }
     shadow = lit / float(sample_count);
@@ -450,8 +463,7 @@ highp vec2 PunctualLightSlice() {
 // bleed once it stays in-tile).
 float SpotShadowTap(highp vec2 uv, highp float tile, highp float total,
                     highp float receiver) {
-  highp vec2 atlas_uv = vec2((tile + clamp(uv.x, 0.0, 1.0)) / total,
-                       1.0 - clamp(uv.y, 0.0, 1.0));
+  highp vec2 atlas_uv = ShadowAtlasUv(tile, clamp(uv, 0.0, 1.0), total);
   return receiver <= textureLod(shadow_map, atlas_uv, 0.0).r ? 1.0 : 0.0;
 }
 
@@ -522,7 +534,7 @@ float PointShadowTap(highp vec2 uv, highp float tile, highp float qx,
                      highp float receiver) {
   highp vec2 cuv = clamp(uv, vec2(half_texel), vec2(1.0 - half_texel));
   highp vec2 tile_uv = vec2(qx, 1.0 - qy) * 0.5 + cuv * 0.5;
-  highp vec2 atlas_uv = vec2((tile + tile_uv.x) / total, 1.0 - tile_uv.y);
+  highp vec2 atlas_uv = ShadowAtlasUv(tile, tile_uv, total);
   return receiver <= textureLod(shadow_map, atlas_uv, 0.0).r ? 1.0 : 0.0;
 }
 
