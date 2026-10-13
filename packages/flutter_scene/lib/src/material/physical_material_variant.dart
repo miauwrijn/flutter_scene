@@ -20,6 +20,7 @@ import '../generated_assets/generated_assets.dart';
 import '../gpu/gpu.dart' as gpu;
 import '../render/frame_transients.dart';
 import 'engine_lighting.dart';
+import 'material.dart' show Material;
 import 'physical_material.dart';
 import 'physically_based_material.dart' show AlphaMode, TextureTransform;
 import 'preprocessed_material.dart';
@@ -319,7 +320,11 @@ class PhysicalMaterialVariant extends PreprocessedMaterial {
     name = descriptor.name;
     doubleSided = descriptor.doubleSided;
     _reflectionRoughnessTexture = descriptor.metallicRoughnessTexture;
-    _reflectionRoughnessFactor = descriptor.roughness;
+    _reflectionRoughnessFactor = Material.coatedReflectionRoughness(
+      descriptor.roughness,
+      descriptor.clearcoat,
+      descriptor.clearcoatRoughness,
+    );
     _isOpaque =
         !transmissive &&
         descriptor.alphaMode != AlphaMode.blend &&
