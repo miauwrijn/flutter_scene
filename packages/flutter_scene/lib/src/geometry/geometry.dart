@@ -264,6 +264,28 @@ abstract class Geometry {
     _vertexCount = vertexCount;
   }
 
+  /// The vertex streams currently bound, for a geometry that wants to draw
+  /// the same vertices with indices of its own (see
+  /// `MeshGeometry.sharingVertices`).
+  @internal
+  List<gpu.BufferView> get vertexStreams => _vertexStreams;
+
+  /// The vertex count the bound streams hold.
+  @internal
+  int get boundVertexCount => _vertexCount;
+
+  /// Binds [source]'s custom attribute streams as this geometry's own, for a
+  /// geometry drawing [source]'s vertices (see `MeshGeometry.sharingVertices`):
+  /// a material that reads a custom attribute must find it on the shared draw
+  /// too, instead of reading zero.
+  @internal
+  void shareCustomAttributesOf(Geometry source) {
+    _customAttributes
+      ..clear()
+      ..addAll(source._customAttributes);
+    _resolved.clear();
+  }
+
   // Extra per-vertex attribute streams a material's custom `attributes` read,
   // keyed by the shader `in` name. Bound after the base vertex streams, as the
   // draw's vertex shader declares them (see [useVertexAttributes]). Populated

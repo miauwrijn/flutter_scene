@@ -1,3 +1,15 @@
+## Unreleased (miauwrijn fork)
+
+Patches this fork carries on top of upstream master.
+
+* `MeshGeometry.sharingVertices` draws another geometry's vertices with indices of its own — nothing is uploaded but the indices. For one mesh drawn several times with a different subset of itself each time (a level-of-detail cut per instance, a culled subset per view, a sorted slice per pass): each draw needs its own index buffer and none of them needs its own copy of the vertices, which on a large asset placed many times is the whole of the memory.
+* `MeshGeometry.setIndexData` replaces the index buffer in place, keeping every vertex stream, for geometry whose vertices are fixed and whose topology is chosen per frame (a level-of-detail cut, a culled subset, a sorted transparency pass). `rebuild` re-uploads every attribute stream, which a static multi-megabyte vertex buffer cannot afford; this writes only the indices, into a ring of host-visible buffers so the GPU keeps reading the previously bound one. Works on fixed storage, which then keeps its single vertex upload and gains only the index ring.
+* `InstancedMesh.instanceTransforms` reads the instance transforms without the `@internal` mutable list.
+* `AmbientOcclusionSettings.quarterResolution` (and `EnvironmentSettings.ambientOcclusionQuarterResolution`) runs SSAO at a quarter of the render size.
+* `Material.coatedReflectionRoughness`: reflections see a clear coat's roughness blended in by its strength, so a lacquered floor reflects.
+* TAA sharpens in tone-mapped space, so sub-pixel HDR glints no longer grow black fringes.
+* WebGL uploads set `UNPACK_ALIGNMENT` to 1, so single-byte textures of any width upload instead of being rejected.
+
 ## 0.24.4
 
 * Additive sprites and `.fmat` materials, bloom, and lens flares show over the content behind a scene with a transparent background, adding light to it. They were discarded wherever nothing opaque was drawn.
