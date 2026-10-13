@@ -10,6 +10,7 @@ library;
 
 export 'package:scene/scene.dart'
     show writeFsceneb, readFsceneb, kFscenebVersion, FscenebFormatException;
+export 'src/fscene/fsceneb_async.dart' show readFscenebAsync;
 export 'package:scene/scene.dart'
     show
         applyPrefabOverride,
@@ -40,6 +41,7 @@ export 'package:scene/scene.dart'
         Matrix4Value,
         NodeRefValue,
         PropertyValue,
+        UnknownValue,
         QuaternionValue,
         ResourceRefValue,
         StringValue,

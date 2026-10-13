@@ -1,28 +1,20 @@
+/// The web GPU shim: flutter_gpu's API over a browser backend chosen per
+/// build, WebGL2 by default or WebGPU with `--dart-define=flutter_scene.webgpu=true`.
 library;
 
 import 'dart:async';
-import 'dart:convert';
-import 'dart:js_interop';
 import 'dart:typed_data';
 import 'dart:ui' as ui;
-import 'dart:ui_web' as ui_web;
 
-import 'package:flutter/foundation.dart' show debugPrint;
-import 'package:flutter/services.dart' show rootBundle;
 import 'package:vector_math/vector_math.dart' as vm;
-import 'package:web/web.dart' as web;
 
-import '../shared/glsl_transpile.dart';
-import 'shader_bundle_generated.dart' as fb;
+import '../shared/encoded_image_types.dart';
+import '../shared/gpu_capabilities.dart';
+import '../webgpu/webgpu_backend.dart' show createWebGpuBackend;
+import 'webgl/_webgl.dart' show createWebGlBackend;
 
-part 'buffer.dart';
-part 'command_buffer.dart';
+part 'backend.dart';
 part 'formats.dart';
-part 'gpu_context.dart';
-part 'render_pass.dart';
-part 'render_pipeline.dart';
-part 'shader.dart';
-part 'shader_library.dart';
-part 'surface.dart';
-part 'texture.dart';
+part 'host_buffer.dart';
+part 'types.dart';
 part 'vertex_layout.dart';

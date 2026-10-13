@@ -13,12 +13,71 @@ import 'package:flutter_scene/src/render/shadow_encoder.dart';
 import 'package:flutter_scene/src/render/frame_transients.dart';
 import 'package:flutter_scene/src/render/spot_shadow.dart';
 import 'package:flutter_scene/src/shaders.dart';
-import 'package:flutter_scene/src/scene_encoder.dart' show resolvePipeline;
+import 'package:flutter_scene/src/scene_encoder.dart'
+    show deferredPipelineBuilds, resolvePipeline;
+import 'package:flutter_scene/src/render/uniform_slots.dart';
 
 /// Render-graph blackboard key under which [ShadowPass] publishes the shadow
 /// map atlas (a depth-in-`.r` fp32 texture). The downstream scene pass reads it
 /// from here.
 const String kShadowMapBlackboardKey = 'directional_shadow_map';
+
+/// Blackboard key for the frame's [SpotShadowInfo], set when spots cast.
+const String kSpotShadowInfoBlackboardKey = 'spot_shadow_info';
+
+/// Where the frame's spot shadows live in the shared shadow atlas (the
+/// texture under [kShadowMapBlackboardKey]): one square tile per casting spot,
+/// after the directional cascades, holding window-space depth in red.
+/// {@category Rendering}
+class SpotShadowInfo {
+  /// Creates the layout record for one frame's spot shadows.
+  const SpotShadowInfo({
+    required this.matrices,
+    required this.firstTile,
+    required this.totalTiles,
+    required this.tileResolution,
+  });
+
+  /// World to clip matrix of each casting spot, in shadow slot order.
+  final List<Matrix4> matrices;
+
+  /// Atlas tile index of slot 0; slot `i` is tile `firstTile + i`.
+  final int firstTile;
+
+  /// Tiles across the atlas (its width is `totalTiles * tileResolution`).
+  final int totalTiles;
+
+  /// Edge length of a tile in texels.
+  final int tileResolution;
+}
+
+/// Forces every view to render its own spot and point shadow tiles, so
+/// parity tests can render the same frame with and without sharing.
+bool debugDisableSharedShadowTiles = false;
+
+/// One frame's spot and point shadow tiles, shared by its texture views and
+/// its screen view.
+///
+/// The casters are drawn once, from [cameraPosition] (the screen view's
+/// camera), so a mirror or render texture shows the shadows the screen view
+/// sees. The first view to render its [ShadowPass] fills this and later
+/// views publish the same atlas. Only frames without directional cascades
+/// share, since cascades fit each view.
+// TODO(shared-shadow-opt-out): let a texture view that needs shadows drawn
+// from its own camera (a distant monitor view, say) render its own tiles.
+class SharedShadowAtlas {
+  /// Creates an empty atlas whose casters are drawn from [cameraPosition].
+  SharedShadowAtlas(this.cameraPosition);
+
+  /// The camera position every sharing view's casters are drawn from.
+  final Vector3 cameraPosition;
+
+  /// The atlas the first view rendered, or null before any view has.
+  gpu.Texture? atlas;
+
+  /// The spot layout published with [atlas].
+  SpotShadowInfo? spotInfo;
+}
 
 /// Render-graph blackboard key under which [ShadowPass] publishes the packed
 /// shadow uniform (the `PostShadowInfo` std140 block: per-cascade world->light
@@ -49,14 +108,18 @@ class ShadowPass extends RenderGraphPass {
     required int tileResolution,
     required Vector3 cameraPosition,
     List<ShadowCascade> cascades = const [],
+    List<List<Plane>> cascadeReceiverPlanes = const [],
     ShadowCasterFaces casterFaces = ShadowCasterFaces.front,
     int casterChannelMask = 0xFF,
     SpotShadowFrame? spotShadows,
     PointShadowFrame? pointShadows,
     ByteData? shadowUniform,
     ShadowCachePlan? cachePlan,
-  }) : _renderScene = renderScene,
+    SharedShadowAtlas? shared,
+  }) : assert(shared == null || cascades.isEmpty),
+       _renderScene = renderScene,
        _cascades = cascades,
+       _cascadeReceiverPlanes = cascadeReceiverPlanes,
        _tileResolution = tileResolution,
        _casterFaces = casterFaces,
        _casterChannelMask = casterChannelMask,
@@ -64,10 +127,21 @@ class ShadowPass extends RenderGraphPass {
        _spotShadows = spotShadows,
        _pointShadows = pointShadows,
        _shadowUniform = shadowUniform,
-       _cachePlan = cachePlan;
+       _cachePlan = cachePlan,
+       _shared = shared;
 
   final RenderScene _renderScene;
   final List<ShadowCascade> _cascades;
+
+  // Per-cascade receiver culling planes (see shadowReceiverCullingPlanes).
+  // Empty, or shorter than the cascades, for no receiver culling. Cached
+  // static tiles outlive the frame's view, so they never use these.
+  final List<List<Plane>> _cascadeReceiverPlanes;
+
+  List<Plane> _receiverPlanesFor(int cascade) =>
+      cascade < _cascadeReceiverPlanes.length
+      ? _cascadeReceiverPlanes[cascade]
+      : const [];
   final int _tileResolution;
   final ShadowCasterFaces _casterFaces;
 
@@ -77,6 +151,10 @@ class ShadowPass extends RenderGraphPass {
   final SpotShadowFrame? _spotShadows;
   final PointShadowFrame? _pointShadows;
   final ShadowCachePlan? _cachePlan;
+  final SharedShadowAtlas? _shared;
+
+  Vector3 get _casterCameraPosition =>
+      _shared?.cameraPosition ?? _cameraPosition;
 
   // The packed PostShadowInfo block, published for depth-aware custom passes.
   final ByteData? _shadowUniform;
@@ -112,6 +190,17 @@ class ShadowPass extends RenderGraphPass {
 
   @override
   void execute(RenderGraphContext context) {
+    final shared = _shared;
+    final sharedAtlas = shared?.atlas;
+    if (sharedAtlas != null) {
+      context.blackboard.set(kShadowMapBlackboardKey, sharedAtlas);
+      final info = shared!.spotInfo;
+      if (info != null) {
+        context.blackboard.set(kSpotShadowInfoBlackboardKey, info);
+      }
+      return;
+    }
+    final deferredBefore = deferredPipelineBuilds;
     final plan = _cachePlan;
     if (plan != null) {
       _renderStaticTiles(context, plan);
@@ -165,6 +254,7 @@ class ShadowPass extends RenderGraphPass {
       ShadowCasterFaces faces, {
       ShadowCasterFilter filter = ShadowCasterFilter.all,
       int casterChannelMask = 0xFF,
+      List<Plane> receiverPlanes = const [],
     }) {
       renderPass.setViewport(
         gpu.Viewport(
@@ -178,12 +268,17 @@ class ShadowPass extends RenderGraphPass {
         renderPass,
         context.transientsBuffer,
         matrix,
-        _cameraPosition,
+        _casterCameraPosition,
         faces,
         filter: filter,
         casterChannelMask: casterChannelMask,
+        receiverPlanes: receiverPlanes,
       );
-      _renderScene.cull(encoder.frustum, encoder.submitCulled);
+      _renderScene.cull(
+        encoder.frustum,
+        encoder.submitCulled,
+        additionalPlanes: receiverPlanes,
+      );
       encoder.flush();
     }
 
@@ -213,6 +308,7 @@ class ShadowPass extends RenderGraphPass {
           _casterFaces,
           filter: ShadowCasterFilter.dynamicOnly,
           casterChannelMask: _casterChannelMask,
+          receiverPlanes: _receiverPlanesFor(c),
         );
         for (final item in _renderScene.items) {
           encoder.submit(item);
@@ -224,6 +320,7 @@ class ShadowPass extends RenderGraphPass {
           _cascades[c].lightSpaceMatrix,
           _casterFaces,
           casterChannelMask: _casterChannelMask,
+          receiverPlanes: _receiverPlanesFor(c),
         );
       }
     }
@@ -262,7 +359,7 @@ class ShadowPass extends RenderGraphPass {
             renderPass,
             context.transientsBuffer,
             pointFrame.faceMatrix(s, f),
-            _cameraPosition,
+            _casterCameraPosition,
             pointFrame.casterFaces,
             casterChannelMask: pointFrame.casterChannelMasks[s],
           );
@@ -274,6 +371,27 @@ class ShadowPass extends RenderGraphPass {
 
     rendererSubmissions.submit(commandBuffer);
     context.blackboard.set(kShadowMapBlackboardKey, color);
+    final spotFrame = _spotShadows;
+    SpotShadowInfo? spotInfo;
+    if (spotFrame != null) {
+      spotInfo = SpotShadowInfo(
+        matrices: spotFrame.matrices,
+        firstTile: _cascades.length,
+        totalTiles: totalTiles,
+        tileResolution: _tileResolution,
+      );
+      context.blackboard.set(kSpotShadowInfoBlackboardKey, spotInfo);
+    }
+    // The pooled texture stays intact for the rest of the frame: its pool is
+    // this view's, which renders nothing else until its next frame, and the
+    // GPU runs the frame's command buffers in submission order.
+    // An atlas missing deferred draws is not shared, so every later view
+    // renders its own and counts its own deferred draws.
+    if (shared != null && deferredPipelineBuilds == deferredBefore) {
+      shared
+        ..atlas = color
+        ..spotInfo = spotInfo;
+    }
     final shadowUniform = _shadowUniform;
     if (shadowUniform != null) {
       context.blackboard.set(kShadowUniformBlackboardKey, shadowUniform);
@@ -294,16 +412,14 @@ class ShadowPass extends RenderGraphPass {
         _tileResolution,
         format: gpu.PixelFormat.r32Float,
       );
-      // The depth attachment only backs this pass's depth test; the same
-      // pooled texture serves every refresh this frame (passes run in order
-      // and each clears it).
-      final depth = context.texturePool.acquire(
-        TransientTextureDescriptor.depth(
-          width: _tileResolution,
-          height: _tileResolution,
-          format: gpu.gpuContext.defaultDepthStencilFormat,
-          debugName: 'static_shadow_tile_depth',
-        ),
+      // Every refresh clears it, so one texture serves all the tiles.
+      final depth = plan.cache.tileDepth ??= gpu.gpuContext.createTexture(
+        gpu.StorageMode.deviceTransient,
+        _tileResolution,
+        _tileResolution,
+        format: gpu.gpuContext.defaultDepthStencilFormat,
+        enableRenderTargetUsage: true,
+        enableShaderReadUsage: false,
       );
       final target = gpu.RenderTarget.singleColor(
         gpu.ColorAttachment(
@@ -325,9 +441,13 @@ class ShadowPass extends RenderGraphPass {
         filter: ShadowCasterFilter.staticOnly,
         casterChannelMask: _casterChannelMask,
       );
+      final deferred = deferredPipelineBuilds;
       _renderScene.cull(encoder.frustum, encoder.submitCulled);
       encoder.flush();
       rendererSubmissions.submit(commandBuffer);
+      // A sliced warm-up skipped some of its casters, so render it again on
+      // the next frame rather than reuse it.
+      if (deferredPipelineBuilds > deferred) entry.hasContent = false;
     }
   }
 
@@ -352,7 +472,7 @@ class ShadowPass extends RenderGraphPass {
     pass.setDepthCompareOperation(gpu.CompareFunction.always);
     bindVertexBufferCompat(pass, _quadView, 6);
     pass.bindTexture(
-      _copyFragmentShader.getUniformSlot('source_texture'),
+      _copyFragmentShader.cachedUniformSlot('source_texture'),
       source,
     );
     drawCompat(pass, 6);

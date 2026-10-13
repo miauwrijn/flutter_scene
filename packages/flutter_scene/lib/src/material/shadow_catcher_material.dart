@@ -10,13 +10,14 @@ import 'package:flutter_scene/src/light.dart';
 import 'package:flutter_scene/src/material/material.dart';
 import 'package:flutter_scene/src/material/physical_material_variant.dart';
 import 'package:flutter_scene/src/material/preprocessed_material.dart';
+import 'package:flutter_scene/src/material/vertex_attributes.dart';
 import 'package:flutter_scene/src/render/frame_transients.dart';
 
 /// How a [ShadowCatcherMaterial] evaluates its shadow term each frame.
 /// {@category Materials}
 enum ShadowCatcherMode {
-  /// The shadow atlas (cascades plus spot tiles) is sampled per fragment
-  /// every frame. Always correct, including moving lights and casters.
+  /// The shadow atlas (cascades plus spot and point tiles) is sampled per
+  /// fragment every frame. Always correct, including moving lights and casters.
   live,
 
   /// The atlas shadow is rendered once into a low-resolution footprint
@@ -39,11 +40,11 @@ enum ShadowCatcherMode {
 /// aoStrength * (1 - occlusion)) * radial fade`.
 ///
 /// The shadow term samples the same aggregate the lit path shades with, the
-/// directional light's cascades, every shadow-casting spot's atlas tile, and
-/// the sun contact term marched by the occlusion chain, so the catcher's
-/// shadow always matches what lit geometry receives. The occlusion term
-/// samples the screen-space ambient-occlusion chain and therefore needs the
-/// scene's ambient occlusion enabled to contribute (the contact term needs
+/// directional light's cascades, the atlas tiles of every shadow-casting spot
+/// and point light, and the sun contact term marched by the occlusion chain,
+/// so the catcher's shadow always matches what lit geometry receives. The
+/// occlusion term samples the screen-space ambient-occlusion chain and needs
+/// the scene's ambient occlusion enabled to contribute (the contact term needs
 /// `DirectionalLight.contactShadows`); with both off, only the mapped shadow
 /// term draws.
 ///
@@ -78,6 +79,9 @@ enum ShadowCatcherMode {
 /// bundled catcher shader, which loads there.
 /// {@category Materials}
 class ShadowCatcherMaterial extends Material {
+  @override
+  bool get participatesInDebugViews => true;
+
   /// Creates a shadow catcher. All parameters can be reassigned later.
   ShadowCatcherMaterial({
     Color shadowColor = const Color(0xFF000000),
@@ -93,7 +97,10 @@ class ShadowCatcherMaterial extends Material {
        _softness = softness,
        _fadeStart = fadeStart,
        _fadeEnd = fadeEnd,
-       _mode = mode;
+       _mode = mode {
+    // The catcher's shader rides the physical bundle, so start it loading now.
+    requestPhysicalMaterialResources();
+  }
 
   Color _shadowColor;
   double _shadowIntensity;
@@ -247,8 +254,15 @@ class ShadowCatcherMaterial extends Material {
   @override
   bool get depthPrepassParticipates => true;
 
+  // Without the physical bundle there is no shader to draw with, so the
+  // catcher stays out of every pass until it loads (or for good if it failed).
   @override
-  bool get drawsNothing => _shadowIntensity == 0;
+  bool get drawsNothing =>
+      _shadowIntensity == 0 || !physicalMaterialResourcesReady;
+
+  @internal
+  @override
+  bool get awaitsDeferredResources => !physicalMaterialResourcesReady;
 
   @override
   gpu.Shader get fragmentShader => _prepared.fragmentShader;
@@ -260,6 +274,9 @@ class ShadowCatcherMaterial extends Material {
   @override
   gpu.Shader? materialVertexShader(String variant) =>
       _prepared.materialVertexShader(variant);
+
+  @override
+  VertexAttributeSchema? get vertexAttributes => _prepared.vertexAttributes;
 
   @override
   void bindVertexStage(
@@ -277,6 +294,7 @@ class ShadowCatcherMaterial extends Material {
     final prepared = _prepared
       ..name = name
       ..depthBias = depthBias
+      ..depthLayer = depthLayer
       ..lodFade = lodFade
       ..lightListOffset = lightListOffset
       ..lightListCount = lightListCount;

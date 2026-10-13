@@ -31,8 +31,8 @@ import 'package:flutter_scene/src/render/lod.dart';
 ///   another's.
 /// - Hardware-instanced draws are not supported here; a [LodComponent]
 ///   draws a single mesh, so it picks one level for the whole node.
-/// - A non-perspective camera disables the metric and draws the
-///   highest-detail level.
+/// - Under an orthographic camera the metric is the sphere's fraction of the
+///   view height, which does not change with distance.
 ///
 /// ```dart
 /// node.addComponent(LodComponent([
@@ -48,7 +48,8 @@ class LodComponent extends MeshComponent {
   /// [blendRange] above `0` cross-fades adjacent levels with a screen-space
   /// dither across a band that wide (as a fraction of each threshold) instead
   /// of hard-switching, removing the pop. Cross-fade is honored by the
-  /// built-in lit and unlit materials.
+  /// built-in lit and unlit materials; a translucent level fades its opacity
+  /// instead of dithering.
   LodComponent(
     List<LodLevel> levels, {
     double lodBias = 1.0,

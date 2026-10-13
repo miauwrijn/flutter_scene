@@ -4,8 +4,8 @@ import 'dart:math' as math;
 // ignore: implementation_imports
 import 'package:scene/scene.dart';
 // ignore: implementation_imports
-import 'package:flutter/material.dart';
-// Not re-exported through material.dart on 3.47 stable.
+import 'package:material_ui/material_ui.dart';
+// Not re-exported through material_ui.
 import 'package:flutter/rendering.dart' show ScrollCacheExtent;
 import 'package:flutter/services.dart';
 
@@ -306,7 +306,7 @@ List<LocalId> _dragGroup(EditorController c, LocalId dragged) {
 void _handleTap(EditorController c, LocalId id) {
   final keys = HardwareKeyboard.instance;
   if (keys.isMetaPressed || keys.isControlPressed) {
-    c.selection.toggle(id);
+    c.select([id], mode: 'toggle');
     return;
   }
   final primary = c.selection.primary;
@@ -316,7 +316,7 @@ void _handleTap(EditorController c, LocalId id) {
     final b = flat.indexOf(id);
     if (a >= 0 && b >= 0) {
       final range = flat.sublist(math.min(a, b), math.max(a, b) + 1);
-      c.selection.set([
+      c.select([
         for (final e in range)
           if (e != primary) e,
         primary,
@@ -324,7 +324,7 @@ void _handleTap(EditorController c, LocalId id) {
       return;
     }
   }
-  c.selection.selectOnly(id);
+  c.selectOnly(id);
 }
 
 /// A thin drop target between rows. Dropping a dragged node here moves it into

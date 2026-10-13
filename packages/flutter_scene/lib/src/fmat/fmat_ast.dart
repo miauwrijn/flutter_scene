@@ -1,6 +1,27 @@
 // Abstract syntax tree for the `.fmat` custom-material format and the error
 // type the parser, validator, and emitter throw.
 
+/// A depth-pass fragment a cutout material supplies itself, so the depth
+/// prepass and shadow maps cut it by its own surface alpha.
+enum DepthSurfaceKind {
+  /// The camera depth prepass (planar view depth).
+  linearDepth('DepthSurface', 'linear_depth'),
+
+  /// The camera depth prepass that also writes the view normal and roughness.
+  linearDepthNormal('DepthNormalSurface', 'linear_depth_normal'),
+
+  /// A shadow map.
+  shadow('ShadowSurface', 'shadow');
+
+  const DepthSurfaceKind(this.suffix, this.sidecarKey);
+
+  /// Appended to the material name for the bundle entry.
+  final String suffix;
+
+  /// The key in the sidecar's `depth_surface` map.
+  final String sidecarKey;
+}
+
 /// Which rendering contract a `.fmat` targets.
 enum FmatDomain {
   /// A surface material: the author writes `void Surface(inout MaterialInputs)`
@@ -262,7 +283,9 @@ class FmatMaterial {
     required this.blending,
     required this.culling,
     this.depthWrite = false,
+    this.effectsDepth = false,
     this.depthTest = FmatDepthTest.lessEqual,
+    this.depthLayer = 0,
     this.depthOffset = false,
     required this.parameters,
     required this.fragmentSource,
@@ -274,9 +297,31 @@ class FmatMaterial {
     this.instanceAttributes = const [],
     this.engineInputs = const [],
     this.sceneColorReach,
+    this.environmentLighting = true,
+    this.directionalLight = true,
+    this.alphaToCoverage = false,
   });
 
   final String name;
+
+  /// Whether a lit material receives the engine's image-based lighting
+  /// (`environment_lighting:`, default true). False compiles out the
+  /// environment, BRDF LUT, SH, and SSAO samplers; the material then supplies
+  /// its indirect light itself through `Composite()`.
+  final bool environmentLighting;
+
+  /// Whether a lit material receives the scene's directional light
+  /// (`directional_light:`, default true). False compiles out the light, its
+  /// cascaded shadows, and its contact shadow, so the material shades as if
+  /// the scene had none. Worth it for a material that never sees one, since
+  /// the light's term inlines a second copy of `Light()` that some drivers
+  /// take many times longer to compile.
+  final bool directionalLight;
+
+  /// Whether an opaque material turns its surface alpha into MSAA coverage
+  /// (`alpha_to_coverage:`, default false), for crisp, sort-free cutouts
+  /// such as foliage cards.
+  final bool alphaToCoverage;
 
   /// The rendering contract this `.fmat` targets (surface material or sky).
   final FmatDomain domain;
@@ -290,9 +335,21 @@ class FmatMaterial {
   final FmatCulling culling;
   final bool depthWrite;
 
+  /// Whether a translucent material counts as the visible surface for
+  /// depth-reading effects (`effects_depth:`, default false): depth of field
+  /// and custom passes that read depth see it, cut where `Surface()` alpha
+  /// is below one half, while the color pass still writes no depth. For
+  /// soft cutouts such as fins, which must blur and fog with what they are
+  /// attached to without hiding what is behind them.
+  final bool effectsDepth;
+
   /// The depth test used in the translucent pass (`depth_test:`).
   final FmatDepthTest depthTest;
 
+  /// The initial `Material.depthLayer` of materials built from this file
+  /// (`depth_layer:`, default 0): which surface wins where it and another lie
+  /// in one plane.
+  final int depthLayer;
   /// Whether `Surface()` writes its own fragment depth (`depth_offset: true`).
   ///
   /// The generated fragment gains a `depth_offset` field on [MaterialInputs]

@@ -1,6 +1,7 @@
 /// A shader bundle is only valid for the engine that consumes it, so every
 /// compiled output records which engine compiled it and is rebuilt when that
 /// changes. One shared pub cache across two Flutter versions depends on this.
+@TestOn('vm')
 library;
 
 import 'dart:io';
@@ -146,8 +147,10 @@ void main() {
           'message',
           allOf(
             contains('writable'),
-            contains('data assets'),
             contains('buildEngineAssets'),
+            // Engine bundles always go to the tree, so data assets are not a
+            // way out of a read-only one.
+            isNot(contains('data assets')),
           ),
         ),
       ),

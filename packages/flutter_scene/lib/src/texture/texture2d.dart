@@ -6,6 +6,8 @@ import 'package:flutter/services.dart';
 import '../asset_helpers.dart';
 import '../gpu/gpu.dart' as gpu;
 import '../render/mip_sampling_probe.dart';
+import 'encoded_image.dart';
+import 'mip_upload_web.dart' if (dart.library.io) 'mip_upload_native.dart';
 import 'mipmap.dart';
 
 /// Something a material can sample: it yields the GPU texture to sample for the
@@ -164,6 +166,12 @@ class Texture2D implements TextureSource {
     sampling.toSamplerOptions(),
   );
 
+  /// This texture's GPU image sampled with [sampler] instead (for example a
+  /// glTF sampler's wrap and filter modes). The GPU texture is shared.
+  @internal
+  Texture2D withSampler(gpu.SamplerOptions sampler) =>
+      Texture2D._(_texture, sampler);
+
   /// Wraps an already-uploaded GPU [texture] with [sampling] (the KTX2 load
   /// paths, whose mip chains come from the file rather than the generator).
   @internal
@@ -173,11 +181,31 @@ class Texture2D implements TextureSource {
   }) => Texture2D._(texture, sampling.toSamplerOptions());
 
   /// Builds a texture from a decoded [image].
+  ///
+  /// Set [opaque] when every pixel of [image] is fully opaque. A texture that
+  /// then needs no mip chain wraps the image's own GPU texture instead of
+  /// reading it back and uploading it again. The wrapper keeps the image's
+  /// storage alive, so [image] may still be disposed. It is opt-in because the
+  /// image's texture is premultiplied and the readback is straight alpha, which
+  /// only agree where alpha is 1. Backends that cannot wrap the image (the web)
+  /// read it back regardless.
   static Future<Texture2D> fromImage(
     ui.Image image, {
     TextureContent content = TextureContent.color,
     TextureSampling sampling = const TextureSampling(),
+    bool opaque = false,
   }) async {
+    if (opaque && !(sampling.mipmaps && mipChainsAreSampled)) {
+      gpu.Texture? wrapped;
+      try {
+        wrapped = gpu.Texture.fromImage(gpu.gpuContext, image);
+      } on Object {
+        wrapped = null;
+      }
+      if (wrapped != null) {
+        return Texture2D._(wrapped, sampling.toSamplerOptions());
+      }
+    }
     final bytes = await image.toByteData(
       format: ui.ImageByteFormat.rawStraightRgba,
     );
@@ -193,20 +221,50 @@ class Texture2D implements TextureSource {
     );
   }
 
-  /// Loads, decodes, and uploads the image asset at [assetPath].
-  static Future<Texture2D> fromAsset(
-    String assetPath, {
+  /// Decodes and uploads an encoded image (PNG, JPEG, and whatever else the
+  /// platform reads) from [bytes].
+  ///
+  /// Where the backend decodes for itself (the web, whose browser decodes off
+  /// the main thread and whose mip chain is built on the GPU) the pixels never
+  /// pass through Dart; elsewhere the platform codec decodes them. [maxSize]
+  /// caps the longest side, scaling a larger image down as it decodes, so an
+  /// app can bound texture memory without holding the full-size pixels.
+  static Future<Texture2D> fromEncodedBytes(
+    Uint8List bytes, {
     TextureContent content = TextureContent.color,
     TextureSampling sampling = const TextureSampling(),
-    AssetBundle? bundle,
+    int? maxSize,
   }) async {
-    final image = await imageFromAsset(assetPath, bundle: bundle);
+    final direct = await gpuTextureFromEncodedBytes(
+      bytes,
+      content: content,
+      mipmaps: sampling.mipmaps,
+      maxMipmapLevels: sampling.maxMipmapLevels,
+      maxSize: maxSize,
+    );
+    if (direct != null) return Texture2D._(direct, sampling.toSamplerOptions());
+    final image = await decodeEncodedImage(bytes, maxSize: maxSize);
     try {
       return await fromImage(image, content: content, sampling: sampling);
     } finally {
       image.dispose();
     }
   }
+
+  /// Loads, decodes, and uploads the image asset at [assetPath], as
+  /// [fromEncodedBytes] does.
+  static Future<Texture2D> fromAsset(
+    String assetPath, {
+    TextureContent content = TextureContent.color,
+    TextureSampling sampling = const TextureSampling(),
+    AssetBundle? bundle,
+    int? maxSize,
+  }) async => fromEncodedBytes(
+    await bytesFromAsset(assetPath, bundle: bundle),
+    content: content,
+    sampling: sampling,
+    maxSize: maxSize,
+  );
 }
 
 /// Uploads a prebuilt mip chain ([levels], base first) as a texture of
@@ -234,8 +292,6 @@ gpu.Texture uploadMipLevels(
     height,
     mipLevelCount: capped.length,
   );
-  for (var i = 0; i < capped.length; i++) {
-    texture.overwrite(ByteData.sublistView(capped[i].pixels), mipLevel: i);
-  }
+  uploadLevelsInto(texture, capped);
   return texture;
 }

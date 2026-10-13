@@ -1,13 +1,76 @@
+import 'dart:math' as math;
 import 'dart:typed_data';
 
+import 'package:flutter/foundation.dart';
 import 'package:vector_math/vector_math.dart' as vm;
 
+import 'package:flutter_scene/src/render/depth_raster.dart';
 import 'package:flutter_scene/src/geometry/geometry.dart';
 import 'package:flutter_scene/src/geometry/vertex_layout.dart';
 import 'package:flutter_scene/src/gpu/gpu.dart' as gpu;
 import 'package:flutter_scene/src/gpu/render_pass_compat.dart';
 import 'package:flutter_scene/src/shaders.dart';
 import 'package:flutter_scene/src/render/frame_transients.dart';
+import 'package:flutter_scene/src/render/uniform_slots.dart';
+
+/// Axes scaled below this fraction of the largest count as flattened and do
+/// not size billboards.
+const double _kFlatAxisFraction = 0.01;
+
+/// The factor a node's [transform] applies to billboard sizes: its smallest
+/// basis-vector length, ignoring flattened axes.
+@visibleForTesting
+double billboardSizeScale(vm.Matrix4 transform) {
+  final s = transform.storage;
+  final x = math.sqrt(s[0] * s[0] + s[1] * s[1] + s[2] * s[2]);
+  final y = math.sqrt(s[4] * s[4] + s[5] * s[5] + s[6] * s[6]);
+  final z = math.sqrt(s[8] * s[8] + s[9] * s[9] + s[10] * s[10]);
+  final floor = math.max(x, math.max(y, z)) * _kFlatAxisFraction;
+  var scale = double.infinity;
+  if (x >= floor && x < scale) scale = x;
+  if (y >= floor && y < scale) scale = y;
+  if (z >= floor && z < scale) scale = z;
+  return scale;
+}
+
+/// The local bounds of the first [count] instances in [data] for a node
+/// whose basis vectors have lengths [axisScales] and which draws sizes times
+/// [sizeScale], or null when there are none. Each center is padded by the
+/// instance's half-diagonal in world units, divided per axis by that axis's
+/// scale so the node's transform maps the pad back to its world extent.
+@visibleForTesting
+vm.Aabb3? billboardLocalBounds(
+  Float32List data,
+  int count,
+  vm.Vector3 axisScales,
+  double sizeScale,
+) {
+  if (count == 0) return null;
+  final padX = sizeScale / math.max(axisScales.x, 1e-6);
+  final padY = sizeScale / math.max(axisScales.y, 1e-6);
+  final padZ = sizeScale / math.max(axisScales.z, 1e-6);
+  var minX = double.infinity, minY = double.infinity, minZ = double.infinity;
+  var maxX = double.negativeInfinity,
+      maxY = double.negativeInfinity,
+      maxZ = double.negativeInfinity;
+  for (var i = 0; i < count; i++) {
+    final o = i * BillboardGeometry.floatsPerInstance;
+    // The half-diagonal keeps a rotated quad inside the box.
+    final r = 0.5 * (data[o + 3].abs() + data[o + 4].abs());
+    final rx = r * padX, ry = r * padY, rz = r * padZ;
+    final x = data[o], y = data[o + 1], z = data[o + 2];
+    if (x - rx < minX) minX = x - rx;
+    if (y - ry < minY) minY = y - ry;
+    if (z - rz < minZ) minZ = z - rz;
+    if (x + rx > maxX) maxX = x + rx;
+    if (y + ry > maxY) maxY = y + ry;
+    if (z + rz > maxZ) maxZ = z + rz;
+  }
+  return vm.Aabb3.minMax(
+    vm.Vector3(minX, minY, minZ),
+    vm.Vector3(maxX, maxY, maxZ),
+  );
+}
 
 /// How a billboard quad orients itself toward the camera.
 /// {@category Geometry}
@@ -31,9 +94,14 @@ enum BillboardFacing {
 ///
 /// Each instance carries a center, a size, an in-plane rotation, a linear
 /// RGBA color, a flipbook frame, and a velocity (used only by
-/// [BillboardFacing.velocityStretched]). The center is in the geometry's
-/// local space; the owning node's transform places and orients the whole
-/// batch. Pair it with a `SpriteMaterial` (or any material whose fragment
+/// [BillboardFacing.velocityStretched]). Centers are in the geometry's local
+/// space and the owning node's transform places and orients the whole batch.
+/// Sizes scale with the node too, unless [scaleSizesWithNode] is off. Under a
+/// non-uniform scale they take the smallest axis scale, ignoring flattened
+/// axes, so quads stay square to the camera, stretching a node to widen a
+/// spawn area does not enlarge its sprites, and flattening one into a disc
+/// does not shrink them. A batch sizes to one node, so give each node its
+/// own. Pair it with a `SpriteMaterial` (or any material whose fragment
 /// shader reads `v_uv` and `v_color`).
 ///
 /// Write instance data into [instanceData] (a flat [Float32List] of
@@ -42,6 +110,9 @@ enum BillboardFacing {
 /// particle sprite renderer.
 /// {@category Geometry}
 class BillboardGeometry extends Geometry {
+  @override
+  bool get emitsStandardVaryings => false;
+
   /// Creates a billboard batch sized for up to [capacity] instances.
   BillboardGeometry({this.capacity = 256})
     : assert(capacity > 0),
@@ -82,7 +153,22 @@ class BillboardGeometry extends Geometry {
   /// the nearest cell, so low-rate flipbooks still animate smoothly.
   bool flipbookBlend = false;
 
-  /// World units of extra length added per unit of speed in
+  /// Whether instance sizes scale with the owning node (the default). When
+  /// false, sizes are in world units whatever the node's scale.
+  bool get scaleSizesWithNode => _scaleSizesWithNode;
+  bool _scaleSizesWithNode = true;
+  set scaleSizesWithNode(bool value) {
+    if (value == _scaleSizesWithNode) return;
+    _scaleSizesWithNode = value;
+    _recomputeBounds(_instanceCount);
+  }
+
+  // The owning node's basis-vector lengths and size scale, which the bounds
+  // padding depends on. Updated before culling by [coverWorldTransform].
+  final vm.Vector3 _nodeAxisScales = vm.Vector3.all(1.0);
+  double _nodeSizeScale = 1.0;
+
+  /// Extra length added per unit of world-space speed in
   /// [BillboardFacing.velocityStretched].
   double velocityStretch = 0.0;
 
@@ -135,33 +221,37 @@ class BillboardGeometry extends Geometry {
     _recomputeBounds(count);
   }
 
+  @internal
+  @override
+  void coverWorldTransform(vm.Matrix4 worldTransform) {
+    final s = worldTransform.storage;
+    final x = math.sqrt(s[0] * s[0] + s[1] * s[1] + s[2] * s[2]);
+    final y = math.sqrt(s[4] * s[4] + s[5] * s[5] + s[6] * s[6]);
+    final z = math.sqrt(s[8] * s[8] + s[9] * s[9] + s[10] * s[10]);
+    final sizeScale = billboardSizeScale(worldTransform);
+    final axes = _nodeAxisScales;
+    if (x == axes.x &&
+        y == axes.y &&
+        z == axes.z &&
+        sizeScale == _nodeSizeScale) {
+      return;
+    }
+    axes.setValues(x, y, z);
+    _nodeSizeScale = sizeScale;
+    _recomputeBounds(_instanceCount);
+  }
+
   void _recomputeBounds(int count) {
-    if (count == 0) {
+    final aabb = billboardLocalBounds(
+      _instanceData,
+      count,
+      _nodeAxisScales,
+      _scaleSizesWithNode ? _nodeSizeScale : 1.0,
+    );
+    if (aabb == null) {
       setLocalBounds(null, null);
       return;
     }
-    var minX = double.infinity, minY = double.infinity, minZ = double.infinity;
-    var maxX = double.negativeInfinity,
-        maxY = double.negativeInfinity,
-        maxZ = double.negativeInfinity;
-    final d = _instanceData;
-    for (var i = 0; i < count; i++) {
-      final o = i * floatsPerInstance;
-      // Pad each center by the instance's half-diagonal so a rotated quad
-      // stays inside the box.
-      final r = 0.5 * (d[o + 3].abs() + d[o + 4].abs());
-      final x = d[o], y = d[o + 1], z = d[o + 2];
-      if (x - r < minX) minX = x - r;
-      if (y - r < minY) minY = y - r;
-      if (z - r < minZ) minZ = z - r;
-      if (x + r > maxX) maxX = x + r;
-      if (y + r > maxY) maxY = y + r;
-      if (z + r > maxZ) maxZ = z + r;
-    }
-    final aabb = vm.Aabb3.minMax(
-      vm.Vector3(minX, minY, minZ),
-      vm.Vector3(maxX, maxY, maxZ),
-    );
     final center = (aabb.min + aabb.max) * 0.5;
     final radius = (aabb.max - aabb.min).length * 0.5;
     setLocalBounds(aabb, vm.Sphere.centerRadius(center, radius));
@@ -206,13 +296,15 @@ class BillboardGeometry extends Geometry {
       pass.bindVertexBuffer(instanceTransients.emplace(liveBytes), slot: 1);
     }
 
-    final frameInfo = Float32List(44);
+    final frameInfo = _frameInfoScratch..fillRange(0, 48, 0.0);
     frameInfo.setRange(0, 16, cameraTransform.storage);
     frameInfo.setRange(16, 32, modelTransform.storage);
     frameInfo[32] = cameraPosition.x;
     frameInfo[33] = cameraPosition.y;
     frameInfo[34] = cameraPosition.z;
-    // [35] padding
+    frameInfo[35] = _scaleSizesWithNode
+        ? billboardSizeScale(modelTransform)
+        : 1.0;
     frameInfo[36] = worldUp.x;
     frameInfo[37] = worldUp.y;
     frameInfo[38] = worldUp.z;
@@ -221,9 +313,11 @@ class BillboardGeometry extends Geometry {
     frameInfo[41] = flipbookColumns.toDouble();
     frameInfo[42] = flipbookRows.toDouble();
     frameInfo[43] = velocityStretch;
+    frameInfo[44] = currentDrawDepthOffset[0];
+    frameInfo[45] = currentDrawDepthOffset[1];
     pass.bindUniform(
-      vertexShader.getUniformSlot('FrameInfo'),
-      transientsBuffer.emplace(ByteData.sublistView(frameInfo)),
+      vertexShader.cachedUniformSlot('FrameInfo'),
+      transientsBuffer.emplace(scratchBytesOf(frameInfo)),
     );
   }
 
@@ -333,3 +427,6 @@ final VertexLayoutDescriptor _kBillboardLayout = VertexLayoutDescriptor(
     ),
   ],
 );
+
+// Shared by every draw; emplace copies it out.
+final Float32List _frameInfoScratch = Float32List(48);

@@ -30,8 +30,13 @@ struct VertexInputs {
   vec2 uv1;
   vec4 color;
   // Read-only frame data the engine fills in before calling Vertex(). The
-  // world-space camera position is available in every variant.
+  // world-space camera position is available in every variant; spot and point
+  // shadow maps shared by a frame's views get its screen view's camera.
   vec3 camera_position;
+  // Read-only: the object-to-world transform (node and instance) the engine
+  // applied to produce world_position, so Vertex() can build geometry in the
+  // object's own space and place it itself.
+  mat4 model_transform;
 };
 
 // The engine's standard vertex outputs, consumed by the fragment stage's
@@ -40,7 +45,7 @@ struct VertexInputs {
 // vertex and fragment stages assign matching interpolant locations. The body
 // includes (flutter_scene_*_body.glsl) write these in main().
 out vec3 v_position; // world-space position
-out vec3 v_normal; // world-space normal, not normalized
+out vec3 v_normal; // world-space normal, unit length per vertex
 out vec3 v_viewvector; // camera_position - vertex_position (world space)
 out vec2 v_texture_coords;
 out vec2 v_texture_coords_1;

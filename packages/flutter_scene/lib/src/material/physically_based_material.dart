@@ -13,6 +13,7 @@ import 'package:flutter_scene/src/texture/texture2d.dart';
 import 'package:vector_math/vector_math.dart';
 import 'package:flutter_scene/src/render/custom_render_pass.dart';
 import 'package:flutter_scene/src/render/frame_transients.dart';
+import 'package:flutter_scene/src/render/uniform_slots.dart';
 
 /// How a [PhysicallyBasedMaterial]'s alpha channel is interpreted,
 /// matching glTF's `alphaMode`.
@@ -82,6 +83,9 @@ class TextureTransform {
 /// [baseColorFactor]'s alpha component.
 /// {@category Materials}
 class PhysicallyBasedMaterial extends Material {
+  @override
+  bool get participatesInDebugViews => true;
+
   /// Creates a PBR material with the given textures.
   ///
   /// All textures are optional; missing textures are replaced with
@@ -100,23 +104,24 @@ class PhysicallyBasedMaterial extends Material {
        _normalTexture = normalTexture,
        _emissiveTexture = emissiveTexture,
        _occlusionTexture = occlusionTexture {
-    setFragmentShaderName(
-      'StandardFragment',
-      cubeName: 'StandardCubeFragment',
-      noShadowName: 'StandardNoShadowFragment',
-      noShadowCubeName: 'StandardNoShadowCubeFragment',
-    );
+    _setStandardShaderNames(lightmapped: false);
   }
 
   /// Creates a material from normalized imported properties.
+  ///
+  /// Waits for the physical shader bundle only when the descriptor uses an
+  /// extension; a plain metallic-roughness material draws with the base
+  /// bundle's standard shader.
   @internal
   static Future<PhysicallyBasedMaterial> fromDescriptor(
     PhysicalMaterialDescriptor descriptor,
   ) async {
-    await initializeStaticResources();
     final material = PhysicallyBasedMaterial();
     material._applyDescriptor(descriptor);
-    material._ensurePreparedVariant();
+    if (material._usesPhysicalVariant) {
+      await initializeStaticResources();
+      material._ensurePreparedVariant();
+    }
     return material;
   }
 
@@ -990,6 +995,7 @@ class PhysicallyBasedMaterial extends Material {
     final previousTransmission = _usesTransmissionVariant;
     _variantKey = _computeVariantKey();
     _updateStandardShaderNames();
+    _requestPhysicalAssetsIfNeeded();
     if (previousTransmission != _usesTransmissionVariant) {
       markMaterialSceneInputsChanged();
     }
@@ -1071,6 +1077,19 @@ class PhysicallyBasedMaterial extends Material {
 
   bool get _usesPhysicalVariant => (_variantKey & 0x7f) != 0;
 
+  // Starts the physical bundle loading as soon as a feature needs it, usually
+  // during setup, so it is in before the first frame.
+  void _requestPhysicalAssetsIfNeeded() {
+    if (_usesPhysicalVariant && !physicalMaterialResourcesReady) {
+      requestPhysicalMaterialResources();
+    }
+  }
+
+  @internal
+  @override
+  bool get awaitsDeferredResources =>
+      _usesPhysicalVariant && !physicalMaterialResourcesReady;
+
   /// The bit [variantKey] sets when a baked lightmap is bound.
   @internal
   @visibleForTesting
@@ -1111,25 +1130,41 @@ class PhysicallyBasedMaterial extends Material {
     final lightmapped = _usesLightmapVariant;
     if (lightmapped == _standardShaderNamesLightmapped) return;
     _standardShaderNamesLightmapped = lightmapped;
+    _setStandardShaderNames(lightmapped: lightmapped);
+  }
+
+  void _setStandardShaderNames({required bool lightmapped}) {
+    final prefix = lightmapped ? 'StandardLightmap' : 'Standard';
     setFragmentShaderName(
-      lightmapped ? 'StandardLightmapFragment' : 'StandardFragment',
-      cubeName: lightmapped
-          ? 'StandardLightmapCubeFragment'
-          : 'StandardCubeFragment',
-      noShadowName: lightmapped
-          ? 'StandardLightmapNoShadowFragment'
-          : 'StandardNoShadowFragment',
-      noShadowCubeName: lightmapped
-          ? 'StandardLightmapNoShadowCubeFragment'
-          : 'StandardNoShadowCubeFragment',
+      '${prefix}Fragment',
+      cubeName: '${prefix}CubeFragment',
+      noShadowName: '${prefix}NoShadowFragment',
+      noShadowCubeName: '${prefix}NoShadowCubeFragment',
+    );
+    setLeanFragmentShaderNames(
+      '${prefix}LeanFragment',
+      cubeName: '${prefix}LeanCubeFragment',
+      noShadowName: '${prefix}LeanNoShadowFragment',
+      noShadowCubeName: '${prefix}LeanNoShadowCubeFragment',
     );
   }
+
+  @override
+  EnvironmentMap drawEnvironment(Lighting lighting) =>
+      environment ?? lighting.environmentMap;
 
   void _ensurePreparedVariant() {
     if (!_materialDataDirty) return;
     if (!_usesPhysicalVariant) {
       _preparedVariant = null;
       _materialDataDirty = false;
+      return;
+    }
+    if (!physicalMaterialResourcesReady) {
+      // Draws with the standard shader until the bundle arrives. A scene holds
+      // its frames while the load is in flight, so this shows only if the load
+      // failed or a capture runs during it. Stays dirty to prepare later.
+      requestPhysicalMaterialResources();
       return;
     }
     final lightmapped = _usesLightmapVariant;
@@ -1347,6 +1382,7 @@ class PhysicallyBasedMaterial extends Material {
     doubleSided = descriptor.doubleSided;
     _variantKey = _computeVariantKey();
     _updateStandardShaderNames();
+    _requestPhysicalAssetsIfNeeded();
     _materialDataDirty = true;
   }
 
@@ -1489,9 +1525,17 @@ class PhysicallyBasedMaterial extends Material {
         super.fragmentShaderForLighting(lighting);
   }
 
+  // The filtered pyramid is only sampled when the lod fraction is nonzero
+  // (a rough surface behind a refractive index), so smooth glass declares
+  // the sharp capture alone and skips the per-batch filter passes.
   @override
   Set<RenderInput> get sceneInputs => transmission > 0.0
-      ? const {RenderInput.opaqueSceneColor, RenderInput.filteredSceneColor}
+      ? sceneColorSampleFilterLodFraction > 0.0
+            ? const {
+                RenderInput.opaqueSceneColor,
+                RenderInput.filteredSceneColor,
+              }
+            : const {RenderInput.opaqueSceneColor}
       : const {};
 
   @override
@@ -1532,6 +1576,7 @@ class PhysicallyBasedMaterial extends Material {
         ..name = name
         ..doubleSided = doubleSided
         ..depthBias = depthBias
+        ..depthLayer = depthLayer
         ..lodFade = lodFade
         ..lightListOffset = lightListOffset
         ..lightListCount = lightListCount
@@ -1549,7 +1594,7 @@ class PhysicallyBasedMaterial extends Material {
     // [fragmentShader] when the bound environment picks the cube radiance
     // layout. Slots must come from the shader actually drawn with.
     final shader = fragmentShaderForLighting(lighting);
-    final EnvironmentMap env = environment ?? lighting.environmentMap;
+    final env = drawEnvironment(lighting);
 
     // FragInfo std140 layout (624 bytes / 156 floats). EngineLightingUniforms
     // packs the shared engine lighting, image-based-lighting, and shadow
@@ -1594,7 +1639,9 @@ class PhysicallyBasedMaterial extends Material {
     fragInfo[122] = roughnessFactor;
     fragInfo[123] = normalTexture != null ? 1.0 : 0.0;
     fragInfo[124] = normalScale;
-    fragInfo[125] = occlusionStrength;
+    // Without a texture the occlusion is 1 at any strength; 0 lets the shader
+    // skip the read.
+    fragInfo[125] = occlusionTexture != null ? occlusionStrength : 0.0;
     fragInfo[132] = alphaMode.index.toDouble();
     fragInfo[133] = alphaCutoff;
     fragInfo[138] = specularAntiAliasingVariance;
@@ -1618,7 +1665,7 @@ class PhysicallyBasedMaterial extends Material {
     fragInfo[162] = lightListCount.toDouble();
     fragInfo[163] = lightListOffset.toDouble();
     pass.bindUniform(
-      shader.getUniformSlot("FragInfo"),
+      shader.cachedUniformSlot("FragInfo"),
       transientsBuffer.emplace(_fragInfoBytes),
     );
 
@@ -1670,8 +1717,8 @@ class PhysicallyBasedMaterial extends Material {
         occlusionTextureTexCoord != 0;
     textureTransforms[7] = transformedUvs ? 1.0 : 0.0;
     pass.bindUniform(
-      shader.getUniformSlot('TextureTransforms'),
-      transientsBuffer.emplace(ByteData.sublistView(textureTransforms)),
+      shader.cachedUniformSlot('TextureTransforms'),
+      transientsBuffer.emplace(scratchBytesOf(textureTransforms)),
     );
 
     _bindSlot(pass, shader, 'base_color_texture', baseColorTexture);
@@ -1715,6 +1762,12 @@ class PhysicallyBasedMaterial extends Material {
       );
     }
     EngineLightingUniforms.bindFog(pass, shader, transientsBuffer, lighting);
+    EngineLightingUniforms.bindViewInfo(
+      pass,
+      shader,
+      transientsBuffer,
+      lighting,
+    );
   }
 
   static final Float32List _fragInfoScratch = Float32List(
@@ -1758,7 +1811,7 @@ class PhysicallyBasedMaterial extends Material {
   }) {
     final resolved = resolveTextureSource(source);
     pass.bindTexture(
-      shader.getUniformSlot(name),
+      shader.cachedUniformSlot(name),
       normal
           ? Material.normalPlaceholder(resolved)
           : Material.whitePlaceholder(resolved),
@@ -1783,10 +1836,17 @@ class PhysicallyBasedMaterial extends Material {
       textureSourceSampler(metallicRoughnessTexture);
 
   @override
-  double get reflectionRoughnessFactor => roughnessFactor;
+  double get reflectionRoughnessFactor => Material.coatedReflectionRoughness(
+    roughnessFactor,
+    clearcoat,
+    clearcoatRoughness,
+  );
 
   @override
   bool get depthAlphaMasked => alphaMode == AlphaMode.mask;
+
+  @override
+  bool get lodCrossFades => true;
 
   @override
   void bindDepthAlphaMask(
@@ -1807,11 +1867,11 @@ class PhysicallyBasedMaterial extends Material {
       baseColorTextureTexCoord,
     );
     pass.bindUniform(
-      shader.getUniformSlot('MaskInfo'),
+      shader.cachedUniformSlot('MaskInfo'),
       transientsBuffer.emplace(ByteData.sublistView(params)),
     );
     pass.bindTexture(
-      shader.getUniformSlot('mask_texture'),
+      shader.cachedUniformSlot('mask_texture'),
       Material.whitePlaceholder(resolveTextureSource(baseColorTexture)),
       sampler: textureSourceSampler(baseColorTexture) ?? _repeatSampler,
     );

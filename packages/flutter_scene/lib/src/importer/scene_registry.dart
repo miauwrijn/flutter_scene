@@ -3,6 +3,7 @@ import 'package:flutter/services.dart';
 
 import 'package:scene/scene.dart';
 
+import '../fscene/fsceneb_async.dart';
 import '../fscene/realize/component_codec.dart';
 import '../generated_assets/generated_asset_lookup.dart';
 import '../generated_assets/generated_assets.dart';
@@ -542,7 +543,9 @@ final class SceneRegistry {
     // Evict so a hot reload re-reads the changed asset.
     bundle.evict(key);
     final data = await bundle.load(key);
-    return readFsceneb(
+    // Inflating a texture-heavy container takes hundreds of milliseconds, so
+    // keep it off the frames on screen.
+    return readFscenebAsync(
       data.buffer.asUint8List(data.offsetInBytes, data.lengthInBytes),
     );
   }

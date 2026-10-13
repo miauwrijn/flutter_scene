@@ -9,23 +9,29 @@
 #include <material_scene_inputs.glsl>
 
 // The per-draw model scale (see FragInfo.model_scale).
-vec3 GetModelScale() { return frag_info.model_scale.xyz; }
+highp vec3 GetModelScale() { return frag_info.model_scale.xyz; }
 
 // FLUTTER_SCENE_SHADOW_CATCHER compiles out the image-based-lighting
 // samplers: a shadow catcher never evaluates the lighting, and a declared
 // sampler stays in the binding surface whether or not any live code reads it
 // (backends disagree on the liveness of dead declarations), so the runtime
 // would otherwise have to bind environment textures the shader cannot use.
-#ifndef FLUTTER_SCENE_SHADOW_CATCHER
+// FLUTTER_SCENE_CUSTOM_AMBIENT (a lit material with `environment_lighting:
+// false`) supplies its own indirect light, so the environment, BRDF LUT, SH,
+// and crossfade samplers are not declared and the runtime binds none of them.
+#if !defined(FLUTTER_SCENE_SHADOW_CATCHER) && !defined(FLUTTER_SCENE_CUSTOM_AMBIENT)
 // The prefiltered radiance in whichever layout this backend builds, a
 // roughness-mip cubemap or the 2D equirect atlas (see RadianceSampler).
 uniform RadianceSampler prefiltered_radiance;
 uniform sampler2D brdf_lut;
 #endif
+// Data samplers are highp. A texture read takes its sampler's precision, and
+// the `<impeller/...>` includes default sampler2D to mediump, which fp16 GPUs
+// and llvmpipe honor.
 #ifndef FLUTTER_SCENE_SKIP_SHADOWS
-uniform sampler2D shadow_map;
+uniform highp sampler2D shadow_map;
 #endif
-#ifndef FLUTTER_SCENE_SHADOW_CATCHER
+#if !defined(FLUTTER_SCENE_SHADOW_CATCHER) && !defined(FLUTTER_SCENE_CUSTOM_AMBIENT)
 // The environment's diffuse SH coefficients and, when the world-space
 // irradiance field is on, that field's probe atlas. Coefficient i sits at
 // texel (i, row), row 0 the primary environment and row 1 the cross-fade
@@ -53,31 +59,38 @@ uniform RadianceSampler prefiltered_radiance_b;
 #ifndef FLUTTER_SCENE_SKIP_SSAO
 uniform sampler2D ssao_texture;
 #endif
-#ifndef FLUTTER_SCENE_SHADOW_CATCHER
+#if !defined(FLUTTER_SCENE_SHADOW_CATCHER) && \
+    !defined(FLUTTER_SCENE_CUSTOM_AMBIENT)
 // What stands overhead, per cell (SceneWeather.occlusionMap): where rain and
-// snow reach. rg a 16-bit height, b 1 where something stands.
+// snow reach. rg a 16-bit height, b 1 where something stands. A material with
+// its own ambient (environment_lighting: false) spends the engine's sampler
+// budget on its own textures, so it weathers as if open to the sky.
+#define FLUTTER_SCENE_WEATHER_OCCLUSION
 uniform sampler2D weather_occlusion;
 #endif
 // A shadow catcher's no-shadow variant compiles its spot loop out, leaving
 // the punctual textures with no live reference, so it declares neither.
 #if !defined(FLUTTER_SCENE_SHADOW_CATCHER) || !defined(FLUTTER_SCENE_SKIP_SHADOWS)
 // The additional analytic lights (point, spot, and directional lights past the
-// first) as an RGBA32F data texture: one light per row, eight texels wide. Read
+// first) as an RGBA32F data texture: one light per row, nine texels wide. Read
 // by computed UV (not a dynamically-indexed uniform array, which older GLSL
 // forbids in a fragment shader). frag_info.radiance_blend.z is the row count; a
 // white placeholder is bound and never read when it is zero. Column layout:
 //   0: position.xyz, type (0 directional, 1 point, 2 spot, 3 area)
 //   1: color.rgb * intensity, inverse range (0 = infinite)
 //   2: direction.xyz, spot angular scale
-//   3: spot angular offset, shadow slot (-1 = none), falloff exponent, unused
+//   3: spot angular offset, shadow slot (-1 = none), falloff exponent,
+//      source radius
 //   4-7: a shadow-casting spot's world -> clip matrix, or a shadow-casting
 //        point light's face-depth mapping and sampling parameters
-uniform sampler2D punctual_lights;
+//   8: photometric profile row (-1 = none), a point light's profile axis.xyz
+// Photometric profiles follow the light rows, 64 samples over two rows.
+uniform highp sampler2D punctual_lights;
 // The per-object light-index buffer: a 2D RGBA32F texture whose texels (row
 // major, index in .r) are light rows into punctual_lights. Each object shades
 // the slice [radiance_blend.w, radiance_blend.w + radiance_blend.z). Read by
 // computed UV (punctual_dims.yz give its width/height). A white placeholder is
 // bound and never read when the per-object count is 0.
-uniform sampler2D punctual_index;
+uniform highp sampler2D punctual_index;
 #endif
 

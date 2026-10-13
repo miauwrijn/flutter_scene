@@ -1,6 +1,6 @@
 import 'dart:io';
 
-import 'package:flutter/material.dart';
+import 'package:material_ui/material_ui.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_scene/scene.dart' show Scene;
 import 'package:forui/forui.dart';
@@ -22,6 +22,7 @@ import '../viewport/viewport_camera_handle.dart';
 import '../viewport/viewport_panel.dart';
 import 'command_palette.dart';
 import 'dock_layout.dart';
+import 'editor_ui_handle.dart';
 import 'docking_shell.dart';
 import 'editor_theme.dart';
 import 'editor_dialog.dart';
@@ -116,6 +117,7 @@ class EditorShell extends StatefulWidget {
     required this.onControllerReplaced,
     this.viewportRepaintBoundaryKey,
     this.viewportCameraHandle,
+    this.uiHandle,
     this.dockLayoutJson,
     this.onDockLayoutChanged,
     this.menuBarLeadingInset = 8,
@@ -129,6 +131,8 @@ class EditorShell extends StatefulWidget {
     this.onSaveNamedLayout,
     this.onDeleteNamedLayout,
     this.onShowSettings,
+    this.onShowAbout,
+    this.onOpenDocumentation,
     this.projectName,
     this.projectRootDirectory,
     this.onOpenProject,
@@ -149,6 +153,12 @@ class EditorShell extends StatefulWidget {
   /// Opens the host's settings window (Flutter installations, ...); null
   /// hides the menu item.
   final VoidCallback? onShowSettings;
+
+  /// Opens the host's About dialog; null hides the menu item.
+  final VoidCallback? onShowAbout;
+
+  /// Opens the documentation site; null hides the menu item.
+  final VoidCallback? onOpenDocumentation;
 
   /// The open project's display name, or null with no project open.
   final String? projectName;
@@ -194,6 +204,10 @@ class EditorShell extends StatefulWidget {
   /// Optional remote control attached to the primary viewport's camera (the
   /// MCP camera tools).
   final ViewportCameraHandle? viewportCameraHandle;
+
+  /// Lets commands drive the editor's own interface, the viewport tool and
+  /// the panels.
+  final EditorUiHandle? uiHandle;
 
   /// Shared component-gizmo visibility preferences, forwarded to every
   /// viewport; the host persists them with the editor settings. Null gives
@@ -320,6 +334,19 @@ class _EditorShellState extends State<EditorShell> with WidgetsBindingObserver {
       if (anchor != null) {
         _dockLayout.dock(id, anchor, DockZone.right);
       } else {
+        _dockLayout.showPanel(id);
+      }
+    });
+    widget.onDockLayoutChanged?.call(_dockLayout.toJsonString());
+  }
+
+  List<String> _panelIdsForHost() => [..._panelIds, ..._extraViewportIds];
+
+  void _showPanelForHost(String id, {required bool focus}) {
+    setState(() {
+      if (focus) {
+        _dockLayout.focusPanel(id);
+      } else if (!_dockLayout.isVisible(id)) {
         _dockLayout.showPanel(id);
       }
     });
@@ -547,10 +574,18 @@ class _EditorShellState extends State<EditorShell> with WidgetsBindingObserver {
   void initState() {
     super.initState();
     _ctrl.lastError.addListener(_showError);
+    _ctrl.session.addDirtyListener(_onDirtyChanged);
+    widget.uiHandle?.attachPanels(_panelIdsForHost, _showPanelForHost);
     // The Render Graph panel and viewport debug modes need the engine's
     // capture hooks; opting in editor-wide keeps shipping apps unaffected.
     Scene.debugAllowRenderGraphCapture = true;
     WidgetsBinding.instance.addObserver(this);
+  }
+
+  // The title's unsaved mark is the only thing reading dirtiness, and nothing
+  // else rebuilds the shell when it flips.
+  void _onDirtyChanged() {
+    if (mounted) setState(() {});
   }
 
   @override
@@ -565,7 +600,9 @@ class _EditorShellState extends State<EditorShell> with WidgetsBindingObserver {
     super.didUpdateWidget(old);
     if (old.controller != widget.controller) {
       old.controller.lastError.removeListener(_showError);
+      old.controller.session.removeDirtyListener(_onDirtyChanged);
       _ctrl.lastError.addListener(_showError);
+      _ctrl.session.addDirtyListener(_onDirtyChanged);
     }
     // The host is the path's source of truth (it can save/open externally,
     // over MCP for example).
@@ -578,6 +615,8 @@ class _EditorShellState extends State<EditorShell> with WidgetsBindingObserver {
   void dispose() {
     WidgetsBinding.instance.removeObserver(this);
     _ctrl.lastError.removeListener(_showError);
+    _ctrl.session.removeDirtyListener(_onDirtyChanged);
+    widget.uiHandle?.detachPanels(_panelIdsForHost);
     super.dispose();
   }
 
@@ -746,6 +785,7 @@ class _EditorShellState extends State<EditorShell> with WidgetsBindingObserver {
             body: Column(
               children: [
                 _EditorMenuBar(
+                  isDirty: _ctrl.session.isDirty,
                   controller: _ctrl,
                   currentPath: _currentPath,
                   onNew: _newScene,
@@ -774,6 +814,8 @@ class _EditorShellState extends State<EditorShell> with WidgetsBindingObserver {
                   onNewViewport: _newViewport,
                   onShowToolchain: _showToolchain,
                   onShowSettings: widget.onShowSettings,
+                  onShowAbout: widget.onShowAbout,
+                  onOpenDocumentation: widget.onOpenDocumentation,
                   projectName: widget.projectName,
                   onOpenProject: widget.onOpenProject,
                   onNewProject: widget.onNewProject,
@@ -806,6 +848,7 @@ class _EditorShellState extends State<EditorShell> with WidgetsBindingObserver {
                               repaintBoundaryKey:
                                   widget.viewportRepaintBoundaryKey,
                               cameraHandle: widget.viewportCameraHandle,
+                              uiHandle: widget.uiHandle,
                               gizmoPreferences: widget.gizmoPreferences,
                             ),
                           ),
@@ -1047,7 +1090,7 @@ class _EditorShellState extends State<EditorShell> with WidgetsBindingObserver {
     final nodeId = _ctrl.document.nodes.keys.firstWhere(
       (id) => !beforeNodes.contains(id),
     );
-    _ctrl.selection.selectOnly(nodeId);
+    _ctrl.selectAfterEdit([nodeId]);
     _ctrl.revealInOutliner(nodeId);
   }
 
@@ -1085,7 +1128,7 @@ class _EditorShellState extends State<EditorShell> with WidgetsBindingObserver {
       });
       _dialogHistory.rememberPrefab(path);
       final instanceId = tx.records.first.targetId;
-      _ctrl.selection.selectOnly(instanceId);
+      _ctrl.selectAfterEdit([instanceId]);
       _ctrl.revealInOutliner(instanceId);
     } catch (e) {
       // Realizing the instance failed (for example the prefab could not be
@@ -1139,7 +1182,7 @@ class _EditorShellState extends State<EditorShell> with WidgetsBindingObserver {
     });
 
     // Select the new node and bring its outliner row into view.
-    _ctrl.selection.selectOnly(nodeId);
+    _ctrl.selectAfterEdit([nodeId]);
     _ctrl.revealInOutliner(nodeId);
   }
 }
@@ -1202,6 +1245,7 @@ class _EditorMenuBar extends StatelessWidget {
   const _EditorMenuBar({
     required this.controller,
     required this.currentPath,
+    required this.isDirty,
     required this.onNew,
     required this.onOpen,
     required this.recentScenePaths,
@@ -1228,6 +1272,8 @@ class _EditorMenuBar extends StatelessWidget {
     required this.onNewViewport,
     required this.onShowToolchain,
     this.onShowSettings,
+    this.onShowAbout,
+    this.onOpenDocumentation,
     this.projectName,
     this.onOpenProject,
     this.onNewProject,
@@ -1246,6 +1292,9 @@ class _EditorMenuBar extends StatelessWidget {
 
   final EditorController controller;
   final String? currentPath;
+
+  /// Whether the document has unsaved changes (the title marks it).
+  final bool isDirty;
   final VoidCallback onNew;
   final VoidCallback onOpen;
   final List<String> recentScenePaths;
@@ -1272,6 +1321,8 @@ class _EditorMenuBar extends StatelessWidget {
   final VoidCallback onNewViewport;
   final VoidCallback onShowToolchain;
   final VoidCallback? onShowSettings;
+  final VoidCallback? onShowAbout;
+  final VoidCallback? onOpenDocumentation;
   final String? projectName;
   final VoidCallback? onOpenProject;
   final VoidCallback? onNewProject;
@@ -1456,6 +1507,19 @@ class _EditorMenuBar extends StatelessWidget {
                 _MenuItem(label: 'Shader Toolchain…', onTap: onShowToolchain),
               ],
             ),
+            if (onOpenDocumentation != null || onShowAbout != null)
+              _Menu(
+                label: 'Help',
+                items: [
+                  if (onOpenDocumentation != null)
+                    _MenuItem(
+                      label: 'Documentation',
+                      onTap: onOpenDocumentation,
+                    ),
+                  if (onShowAbout != null)
+                    _MenuItem(label: 'About Scene Editor…', onTap: onShowAbout),
+                ],
+              ),
             _MenuButton(label: 'Commands', onTap: onPaletteOpen),
             const Spacer(),
             ...trailing,
@@ -1467,12 +1531,15 @@ class _EditorMenuBar extends StatelessWidget {
   }
 
   String _title() {
+    // A leading dot is the usual "unsaved" mark, and it keeps the title from
+    // jumping as the flag flips.
+    final mark = isDirty ? '• ' : '';
     final scene = currentPath?.split(Platform.pathSeparator).last;
     final project = projectName;
-    if (project != null && scene != null) return '$project · $scene';
-    if (project != null) return 'Scene Editor  ($project)';
-    if (scene != null) return 'Scene Editor  ($scene)';
-    return 'Scene Editor';
+    if (project != null && scene != null) return '$mark$project · $scene';
+    if (project != null) return '${mark}Scene Editor  ($project)';
+    if (scene != null) return '${mark}Scene Editor  ($scene)';
+    return '${mark}Scene Editor';
   }
 }
 

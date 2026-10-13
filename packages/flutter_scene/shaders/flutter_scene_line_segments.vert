@@ -9,8 +9,13 @@ uniform FrameInfo {
   vec4 camera_position;  // world-space camera position (xyz)
   // x: half width in world units. yzw: unused.
   vec4 params;
+  // The material's depth-layer offset (xy), see ApplyDepthOffset.
+  vec4 depth_offset;
 }
 frame_info;
+
+#include <view_vector.glsl>
+#include <depth_bias.glsl>
 
 // Per-vertex unit quad (slot 0): x selects the endpoint (0 start, 1 end),
 // y is the side of the ribbon (-1 or +1).
@@ -37,7 +42,8 @@ void main() {
   // ribbon always faces the camera. A segment pointing at the eye (or a
   // degenerate segment) collapses the cross product; it stays a hairline.
   vec3 dir = world_end - world_start;
-  vec3 view = frame_info.camera_position.xyz - pos;
+  vec3 view = DirectionToViewer(frame_info.camera_transform,
+                                frame_info.camera_position.xyz, pos);
   vec3 perp = cross(dir, view);
   float perp_len = length(perp);
   perp = perp_len > 1e-12 ? perp / perp_len : vec3(0.0);
@@ -56,8 +62,11 @@ void main() {
   vec3 n = dir_len > 1e-12 ? cross(dir / dir_len, perp) : vec3(0.0, 0.0, 1.0);
 
   v_position = pos;
-  gl_Position = frame_info.camera_transform * vec4(pos, 1.0);
-  v_viewvector = view;
+  vec4 clip_position = frame_info.camera_transform * vec4(pos, 1.0);
+  gl_Position = ApplyDepthOffset(
+      clip_position, vec4(frame_info.depth_offset.xy, 0.0, 0.0), vec3(0.0),
+      frame_info.camera_transform, pos, frame_info.camera_position.xyz);
+  v_viewvector = frame_info.camera_position.xyz - pos;
   v_normal = n;
   // u runs along the segment, v across the ribbon.
   v_texture_coords = vec2(corner.x, corner.y * 0.5 + 0.5);

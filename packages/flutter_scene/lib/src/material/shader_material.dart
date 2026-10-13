@@ -1,7 +1,7 @@
 import 'dart:typed_data';
 
 import 'package:flutter/foundation.dart'
-    show debugPrint, setEquals, visibleForTesting;
+    show debugPrint, internal, setEquals, visibleForTesting;
 
 import 'package:flutter_scene/src/gpu/gpu.dart' as gpu;
 
@@ -9,12 +9,16 @@ import 'package:flutter_scene/src/light.dart';
 import 'package:flutter_scene/src/material/engine_lighting.dart';
 import 'package:flutter_scene/src/material/instance_attributes.dart';
 import 'package:flutter_scene/src/material/material.dart';
+import 'package:flutter_scene/src/material/shader_interface.dart';
 import 'package:flutter_scene/src/material/shader_stage.dart';
 import 'package:flutter_scene/src/fmat/fmat_ast.dart' show FmatType;
 import 'package:flutter_scene/src/render/custom_render_pass.dart'
     show RenderInput;
 import 'package:flutter_scene/src/texture/texture2d.dart';
 import 'package:flutter_scene/src/render/frame_transients.dart';
+import 'package:flutter_scene/src/render/uniform_slots.dart';
+import 'package:flutter_scene/src/shader_uniform_bindings.dart'
+    show PackedFloatBlocks, defaultSamplerOptions, linearClampSamplerOptions;
 
 /// Scalar/vector type supplied once per instance to a raw shader pair.
 /// {@category Materials}
@@ -146,6 +150,7 @@ class ShaderMaterial extends Material {
     this.isOpaqueOverride = true,
     Set<RenderInput> sceneInputs = const {},
     List<ShaderInstanceAttribute> instanceAttributes = const [],
+    this.debugViews = false,
   }) : _sceneInputs = _normalizeSceneInputs(sceneInputs),
        _instanceAttributes = _buildInstanceAttributes(instanceAttributes) {
     // A material constructed with inputs is not in the frame's cached summary
@@ -164,6 +169,25 @@ class ShaderMaterial extends Material {
     setVertexShader(depthVertexShader, variant: MeshVariant.depth);
   }
 
+  // Reads the stage interfaces of the libraries this material's shaders came
+  // from, so the pipeline build can check them. The scene holds its frames
+  // until that lands rather than drawing a pairing it has not checked.
+  @override
+  void setFragmentShader(gpu.Shader shader) {
+    super.setFragmentShader(shader);
+    requestStageInterfaces([shader]);
+  }
+
+  @override
+  void setRadianceCubeFragmentShader(gpu.Shader? shader) {
+    super.setRadianceCubeFragmentShader(shader);
+    requestStageInterfaces([shader]);
+  }
+
+  @internal
+  @override
+  bool get awaitsDeferredResources => stageInterfacesPending;
+
   /// Whether the engine should bind the active environment's IBL textures
   /// (`prefiltered_radiance`, `brdf_lut`) when the fragment shader
   /// declares them. Defaults to `false`.
@@ -177,6 +201,17 @@ class ShaderMaterial extends Material {
   /// project model-space Counter-Clockwise (CCW) front faces on the Y-down
   /// rasterizer.
   gpu.WindingOrder windingOrder;
+
+  /// Whether the fragment shader defines `FLUTTER_SCENE_DEBUG_VIEWS`,
+  /// includes `material_debug.glsl`, and selects its output through
+  /// `DebugViewOutput()`, so the scene's surface debug views can show its
+  /// resolved surface. Defaults to `false`, in which case an active view draws
+  /// this material through the engine's fallback debug shader (geometry and
+  /// identity channels only).
+  final bool debugViews;
+
+  @override
+  bool get participatesInDebugViews => debugViews;
 
   /// Whether this material participates in the opaque pass.
   ///
@@ -264,6 +299,8 @@ class ShaderMaterial extends Material {
   final Map<String, ByteData> _uniformBlocks = {};
   final Map<String, _BoundTexture> _textures = {};
   final Map<String, ByteData> _vertexUniformBlocks = {};
+  final PackedFloatBlocks _packed = PackedFloatBlocks();
+  final PackedFloatBlocks _vertexPacked = PackedFloatBlocks();
   final Map<String, _BoundTexture> _vertexTextures = {};
   final Map<MeshVariant, gpu.Shader> _vertexShaders = {};
   final InstanceAttributeSchema? _instanceAttributes;
@@ -306,6 +343,9 @@ class ShaderMaterial extends Material {
   @override
   InstanceAttributeSchema? get instanceAttributes => _instanceAttributes;
 
+  PackedFloatBlocks _packedFor(ShaderStage stage) =>
+      stage == ShaderStage.vertex ? _vertexPacked : _packed;
+
   Map<String, ByteData> _blocksFor(ShaderStage stage) =>
       stage == ShaderStage.vertex ? _vertexUniformBlocks : _uniformBlocks;
 
@@ -335,6 +375,7 @@ class ShaderMaterial extends Material {
       return;
     }
     _vertexShaders[variant] = shader;
+    requestStageInterfaces([shader]);
   }
 
   /// The vertex shader assigned for [variant], or null when the engine's
@@ -409,6 +450,7 @@ class ShaderMaterial extends Material {
     ByteData? bytes, {
     ShaderStage stage = ShaderStage.fragment,
   }) {
+    _packedFor(stage).release(name);
     final blocks = _blocksFor(stage);
     if (bytes == null) {
       blocks.remove(name);
@@ -425,11 +467,8 @@ class ShaderMaterial extends Material {
     List<double> floats, {
     ShaderStage stage = ShaderStage.fragment,
   }) {
-    setUniformBlock(
-      name,
-      ByteData.sublistView(Float32List.fromList(floats)),
-      stage: stage,
-    );
+    final blocks = _blocksFor(stage);
+    blocks[name] = _packedFor(stage).pack(name, blocks[name], floats);
   }
 
   /// Read back a previously-set uniform block, or `null` when none
@@ -437,7 +476,10 @@ class ShaderMaterial extends Material {
   ByteData? getUniformBlock(
     String name, {
     ShaderStage stage = ShaderStage.fragment,
-  }) => _blocksFor(stage)[name];
+  }) {
+    _packedFor(stage).release(name);
+    return _blocksFor(stage)[name];
+  }
 
   /// All currently-bound fragment uniform block names, in insertion order.
   Iterable<String> get uniformBlockNames => _uniformBlocks.keys;
@@ -511,29 +553,20 @@ class ShaderMaterial extends Material {
     // cube-layout twin and the bound environment uses that layout.
     final shader = fragmentShaderForLighting(lighting);
 
-    for (final entry in _uniformBlocks.entries) {
-      final slot = shader.getUniformSlot(entry.key);
-      assert(_checkBlock(slot, entry.key, entry.value, ShaderStage.fragment));
-      pass.bindUniform(slot, transientsBuffer.emplace(entry.value));
-    }
-
-    for (final entry in _textures.entries) {
-      // An empty render texture (no completed frame yet) binds the white
-      // placeholder so the sampler slot is never left dangling.
-      final resolved = _resolveShaderTexture(entry.value.source);
-      pass.bindTexture(
-        shader.getUniformSlot(entry.key),
-        Material.whitePlaceholder(resolved),
-        sampler:
-            entry.value.sampler ??
-            _shaderTextureSampler(entry.value.source) ??
-            gpu.SamplerOptions(),
-      );
-    }
+    _bindStage(pass, shader, transientsBuffer, ShaderStage.fragment);
 
     if (useEnvironment) {
       _bindEnvironmentTextures(pass, shader, lighting);
     }
+
+    // A shader that includes material_varyings.glsl and reads
+    // GetViewDirection declares this block.
+    EngineLightingUniforms.bindViewInfo(
+      pass,
+      shader,
+      transientsBuffer,
+      lighting,
+    );
 
     if (_sceneInputs.isNotEmpty) {
       EngineLightingUniforms.bindSceneInputTextures(
@@ -557,20 +590,36 @@ class ShaderMaterial extends Material {
     gpu.Shader vertexShader,
     TransientWriter transientsBuffer,
   ) {
-    for (final entry in _vertexUniformBlocks.entries) {
-      final slot = vertexShader.getUniformSlot(entry.key);
-      assert(_checkBlock(slot, entry.key, entry.value, ShaderStage.vertex));
-      pass.bindUniform(slot, transientsBuffer.emplace(entry.value));
+    _bindStage(pass, vertexShader, transientsBuffer, ShaderStage.vertex);
+  }
+
+  void _bindStage(
+    gpu.RenderPass pass,
+    gpu.Shader shader,
+    TransientWriter transientsBuffer,
+    ShaderStage stage,
+  ) {
+    final blocks = _blocksFor(stage);
+    // Keys and a lookup, since iterating `entries` allocates a MapEntry each.
+    for (final name in blocks.keys) {
+      final bytes = blocks[name]!;
+      final slot = shader.cachedUniformSlot(name);
+      assert(_checkBlock(slot, name, bytes, stage));
+      pass.bindUniform(slot, transientsBuffer.emplace(bytes));
     }
-    for (final entry in _vertexTextures.entries) {
-      final resolved = _resolveShaderTexture(entry.value.source);
+    final textures = _texturesFor(stage);
+    for (final name in textures.keys) {
+      final bound = textures[name]!;
+      // An empty render texture (no completed frame yet) binds the white
+      // placeholder so the sampler slot is never left dangling.
+      final resolved = _resolveShaderTexture(bound.source);
       pass.bindTexture(
-        vertexShader.getUniformSlot(entry.key),
+        shader.cachedUniformSlot(name),
         Material.whitePlaceholder(resolved),
         sampler:
-            entry.value.sampler ??
-            _shaderTextureSampler(entry.value.source) ??
-            gpu.SamplerOptions(),
+            bound.sampler ??
+            _shaderTextureSampler(bound.source) ??
+            defaultSamplerOptions,
       );
     }
   }
@@ -587,14 +636,9 @@ class ShaderMaterial extends Material {
       cubeShader: usesRadianceCubeVariant(lighting),
     );
     pass.bindTexture(
-      shader.getUniformSlot('brdf_lut'),
+      shader.cachedUniformSlot('brdf_lut'),
       Material.getBrdfLutTexture(),
-      sampler: gpu.SamplerOptions(
-        minFilter: gpu.MinMagFilter.linear,
-        magFilter: gpu.MinMagFilter.linear,
-        widthAddressMode: gpu.SamplerAddressMode.clampToEdge,
-        heightAddressMode: gpu.SamplerAddressMode.clampToEdge,
-      ),
+      sampler: linearClampSamplerOptions,
     );
   }
 }

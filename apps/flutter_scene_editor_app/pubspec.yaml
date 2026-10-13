@@ -3,7 +3,7 @@ description: The standalone Flutter Scene Editor desktop application.
 publish_to: none
 
 # Tracks the flutter_scene release this build pairs with.
-version: 0.23.0
+version: 0.24.0
 
 resolution: workspace
 
@@ -18,15 +18,19 @@ dependencies:
     sdk: flutter
   data_assets: ^0.20.0
   file_selector: ^1.0.0
-  flutter_scene: ^0.23.0
-  scene: ^0.3.0
+  flutter_scene: ^0.24.0
+  scene: ^0.4.0
+  vector_math: ^2.1.4
   flutter_scene_codegen:
     path: ../../packages/flutter_scene_codegen
   flutter_scene_editor:
     path: ../../packages/flutter_scene_editor
+  flutter_scene_editor_core:
+    path: ../../packages/flutter_scene_editor_core
   flutter_scene_mcp:
     path: ../../packages/flutter_scene_mcp
   hooks: ^2.0.0
+  material_ui: ^1.0.0
 
 dev_dependencies:
   flutter_lints: ^5.0.0
@@ -37,3 +41,19 @@ flutter:
     # Everything hook/build.dart generates, loaded by source path. Added
     # by `dart run flutter_scene:init`.
     - flutter_scene_generated/
+    - path: flutter_scene_generated/metal_ios/
+      platforms:
+        - ios
+    - path: flutter_scene_generated/metal_desktop/
+      platforms:
+        - macos
+    - path: flutter_scene_generated/opengl_es_vulkan/
+      platforms:
+        - android
+        - linux
+        - windows
+    - path: flutter_scene_generated/opengl_es/
+      platforms:
+        - web
+    # Sponsors baked into this build, see assets/sponsors/README.md.
+    - assets/sponsors/

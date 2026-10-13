@@ -8,12 +8,15 @@ import 'package:flutter_scene/src/light.dart';
 import 'package:flutter_scene/src/material/engine_lighting.dart';
 import 'package:flutter_scene/src/material/environment.dart';
 import 'package:flutter_scene/src/material/instance_attributes.dart';
+import 'package:flutter_scene/src/material/vertex_attributes.dart';
 import 'package:flutter_scene/src/material/material.dart';
 import 'package:flutter_scene/src/material/material_parameters.dart';
 import 'package:flutter_scene/src/material/physically_based_material.dart';
 import 'package:flutter_scene/src/render/custom_render_pass.dart';
 import 'package:flutter_scene/src/render/frame_transients.dart';
 import 'package:flutter_scene/src/texture/texture2d.dart';
+import 'package:vector_math/vector_math.dart' show Vector3;
+import 'package:flutter_scene/src/render/uniform_slots.dart';
 
 /// A material driven by a `.fmat` custom-material shader and its sidecar
 /// metadata (produced at build time by `buildMaterials`).
@@ -32,6 +35,9 @@ import 'package:flutter_scene/src/texture/texture2d.dart';
 /// comes from the material's metadata.
 /// {@category Materials}
 class PreprocessedMaterial extends Material implements HotReloadableFmat {
+  @override
+  bool get participatesInDebugViews => true;
+
   PreprocessedMaterial({
     required gpu.Shader fragmentShader,
     required Map<String, Object?> metadata,
@@ -42,9 +48,12 @@ class PreprocessedMaterial extends Material implements HotReloadableFmat {
        _blending = _parseBlending(metadata['blending']),
        _culling = _parseCulling(metadata['culling']),
        _depthWrite = metadata['depth_write'] == true,
+       _effectsDepth = metadata['effects_depth'] == true,
        _depthCompare = _parseDepthCompare(metadata['depth_test']),
        _sceneInputs = _parseSceneInputs(metadata['engine_inputs']),
+       _environmentLighting = metadata['environment_lighting'] != false,
        _instanceAttributes = InstanceAttributeSchema.fromMetadata(metadata),
+       _vertexAttributes = VertexAttributeSchema.fromMetadata(metadata),
        _usesPlanarReflection = parsePlanarReflectionInput(
          metadata['engine_inputs'],
        ),
@@ -52,7 +61,21 @@ class PreprocessedMaterial extends Material implements HotReloadableFmat {
        _vertexShaders = vertexShaders,
        parameters = MaterialParameters.fromMetadata(fragmentShader, metadata) {
     setFragmentShader(fragmentShader);
+    _declaredDepthLayer = _parseDepthLayer(metadata['depth_layer']);
+    depthLayer = _declaredDepthLayer;
   }
+
+  // The `.fmat`'s `depth_layer:`, reapplied on reload only when it changes so
+  // a layer set at runtime survives an unrelated edit.
+  int _declaredDepthLayer = 0;
+
+  /// The `depth_layer:` this material's `.fmat` declares, the [depthLayer]
+  /// it starts with.
+  @internal
+  int get declaredDepthLayer => _declaredDepthLayer;
+
+  static int _parseDepthLayer(Object? value) =>
+      value is num ? value.toInt() : 0;
 
   /// Parses the sidecar's `engine_inputs` list into requested render inputs.
   static Set<RenderInput> _parseSceneInputs(Object? value) {
@@ -82,6 +105,10 @@ class PreprocessedMaterial extends Material implements HotReloadableFmat {
       value is num ? value.toDouble() : null;
 
   Set<RenderInput> _sceneInputs;
+
+  // False when the material supplies its own indirect light
+  // (`environment_lighting: false`), so the engine IBL samplers are absent.
+  bool _environmentLighting;
   bool _usesPlanarReflection;
   double? _sceneColorReach;
   gpu.Shader? _shadowFragmentShader;
@@ -101,6 +128,104 @@ class PreprocessedMaterial extends Material implements HotReloadableFmat {
   void setRadianceCubeFragmentShaders(gpu.Shader shader, {gpu.Shader? shadow}) {
     _cubeFragmentShader = shader;
     _cubeShadowFragmentShader = shadow;
+  }
+
+  Map<DepthSurfaceKind, gpu.Shader>? _depthSurfaceShaders;
+
+  /// Sets the depth-pass fragments named by a sidecar's `depth_surface` map,
+  /// looking each entry up with [shaderFor]. Missing entries leave the
+  /// engine's depth shaders in place for that pass.
+  @internal
+  void setDepthSurfaceShadersFromMetadata(
+    Map<String, Object?> metadata,
+    gpu.Shader? Function(String entryName) shaderFor,
+  ) {
+    final meta = metadata['depth_surface'];
+    if (meta is! Map) {
+      setDepthSurfaceShaders(null);
+      return;
+    }
+    setDepthSurfaceShaders({
+      for (final kind in DepthSurfaceKind.values)
+        if (meta[kind.sidecarKey] case final String entry)
+          if (shaderFor(entry) case final gpu.Shader shader) kind: shader,
+    });
+  }
+
+  /// Sets the material's own depth-pass fragments (see
+  /// [Material.depthSurfaceShader]), resolved by the loader from the
+  /// sidecar's `depth_surface` map.
+  @internal
+  void setDepthSurfaceShaders(Map<DepthSurfaceKind, gpu.Shader>? shaders) {
+    _depthSurfaceShaders = shaders == null || shaders.isEmpty ? null : shaders;
+  }
+
+  @override
+  @internal
+  gpu.Shader? depthSurfaceShader(DepthSurfaceKind kind) =>
+      _depthSurfaceShaders?[kind];
+
+  @override
+  @internal
+  void bindDepthSurface(
+    gpu.RenderPass pass,
+    gpu.Shader shader,
+    TransientWriter transientsBuffer, {
+    required Vector3 cameraPosition,
+    required Vector3 cameraForward,
+  }) {
+    // Surface() may read the camera through either engine block, which the
+    // variant always keeps (FragInfo exists only in lit shaders). Both are
+    // zero apart from the camera.
+    if (shadingModel != FmatShadingModel.unlit) {
+      _bindCameraBlock(
+        pass,
+        shader,
+        transientsBuffer,
+        'FragInfo',
+        cameraPosition,
+        cameraForward,
+      );
+    }
+    _bindCameraBlock(
+      pass,
+      shader,
+      transientsBuffer,
+      'ViewInfo',
+      cameraPosition,
+      cameraForward,
+    );
+    parameters.bind(pass, shader, transientsBuffer);
+    pass.bindUniform(
+      shader.cachedUniformSlot('FragmentKeepAlive'),
+      transientsBuffer.emplace(_zeroKeepAlive),
+    );
+  }
+
+  static void _bindCameraBlock(
+    gpu.RenderPass pass,
+    gpu.Shader shader,
+    TransientWriter transientsBuffer,
+    String name,
+    Vector3 position,
+    Vector3 forward,
+  ) {
+    final slot = shader.cachedUniformSlot(name);
+    final size = slot.sizeInBytes;
+    if (size == null || size == 0) return;
+    final data = ByteData(size);
+    void put(String member, Vector3 v) {
+      final offset = slot.getMemberOffsetInBytes(member);
+      if (offset == null || offset + 12 > size) return;
+      data
+        ..setFloat32(offset, v.x, Endian.little)
+        ..setFloat32(offset + 4, v.y, Endian.little)
+        ..setFloat32(offset + 8, v.z, Endian.little);
+    }
+
+    put('camera_position', position);
+    put('camera_forward', forward);
+    pass.bindUniform(slot, transientsBuffer.emplace(data));
   }
 
   @override
@@ -187,6 +312,8 @@ class PreprocessedMaterial extends Material implements HotReloadableFmat {
   /// The material's parameters, set by name. See [MaterialParameters].
   final MaterialParameters parameters;
 
+  bool _depthMasked = false;
+
   // --- Surface-content object masks --------------------------------------------
   //
   // A custom pass that shades with the surface's own albedo (a surface-cache
@@ -263,7 +390,7 @@ class PreprocessedMaterial extends Material implements HotReloadableFmat {
       normalTransform: normalTransform,
       // A cut-out (configureDepthAlphaMask) is cut out of its masks too,
       // at the same coverage the depth passes use.
-      alphaCutoff: _depthMaskTexture != null
+      alphaCutoff: _depthMasked
           ? _depthMaskCutoff / math.max(_depthMaskAlpha, 1e-3)
           : 0.0,
       vertexAlphaWeight: maskVertexColorWeight.clamp(0.0, 1.0),
@@ -295,18 +422,22 @@ class PreprocessedMaterial extends Material implements HotReloadableFmat {
   double _depthMaskAlpha = 1.0;
   int _depthMaskTexCoord = 0;
 
-  /// Configures cutout coverage for the camera-depth and shadow passes.
+  /// Configures cutout coverage for the depth-writing passes: the camera
+  /// depth, the shadow maps, and the main pass's coverage pre-draw, which is
+  /// what cuts the surface out on screen.
   ///
-  /// Call with null [texture] to disable masked depth. The color shader must
-  /// apply the same cutoff to produce matching coverage.
+  /// [masked] defaults to whether a [texture] is given; pass true to mask by
+  /// the constant and vertex-color alpha alone (sampling white).
   @protected
   void configureDepthAlphaMask({
+    bool? masked,
     required TextureSource? texture,
     TextureTransform? transform,
     int texCoord = 0,
     double cutoff = 0.5,
     double alpha = 1.0,
   }) {
+    _depthMasked = masked ?? texture != null;
     _depthMaskTexture = texture;
     _depthMaskTransform = transform ?? TextureTransform();
     _depthMaskTexCoord = texCoord.clamp(0, 1);
@@ -327,6 +458,11 @@ class PreprocessedMaterial extends Material implements HotReloadableFmat {
 
   @override
   InstanceAttributeSchema? get instanceAttributes => _instanceAttributes;
+
+  VertexAttributeSchema? _vertexAttributes;
+
+  @override
+  VertexAttributeSchema? get vertexAttributes => _vertexAttributes;
 
   /// Replaces the generated vertex variants after a shader-library refresh (a
   /// hot-reloaded `.fmat` gaining, losing, or recompiling its `vertex { }`
@@ -357,7 +493,7 @@ class PreprocessedMaterial extends Material implements HotReloadableFmat {
     // so the optimizer cannot strip a declared attribute when a Vertex() hook
     // replaces the outputs, and zero makes it invisible.
     pass.bindUniform(
-      vertexShader.getUniformSlot('VertexKeepAlive'),
+      vertexShader.cachedUniformSlot('VertexKeepAlive'),
       transientsBuffer.emplace(_zeroKeepAlive),
     );
   }
@@ -369,6 +505,7 @@ class PreprocessedMaterial extends Material implements HotReloadableFmat {
   FmatBlending _blending;
   FmatCulling _culling;
   bool _depthWrite;
+  bool _effectsDepth;
   gpu.CompareFunction _depthCompare;
 
   /// Re-reads the render state and parameters from a regenerated [fragmentShader]
@@ -387,15 +524,23 @@ class PreprocessedMaterial extends Material implements HotReloadableFmat {
     _blending = _parseBlending(metadata['blending']);
     _culling = _parseCulling(metadata['culling']);
     _depthWrite = metadata['depth_write'] == true;
+    _effectsDepth = metadata['effects_depth'] == true;
     _depthCompare = _parseDepthCompare(metadata['depth_test']);
     _sceneInputs = _parseSceneInputs(metadata['engine_inputs']);
+    _environmentLighting = metadata['environment_lighting'] != false;
     // A reloaded declaration is a new schema object, which invalidates the
     // widened vertex layouts and instance buffers keyed on the old one.
     _instanceAttributes = InstanceAttributeSchema.fromMetadata(metadata);
+    _vertexAttributes = VertexAttributeSchema.fromMetadata(metadata);
     _usesPlanarReflection = parsePlanarReflectionInput(
       metadata['engine_inputs'],
     );
     _sceneColorReach = _parseSceneColorReach(metadata['scene_color_reach']);
+    final declaredDepthLayer = _parseDepthLayer(metadata['depth_layer']);
+    if (declaredDepthLayer != _declaredDepthLayer) {
+      _declaredDepthLayer = declaredDepthLayer;
+      depthLayer = declaredDepthLayer;
+    }
     markMaterialSceneInputsChanged();
     setFragmentShader(fragmentShader);
     parameters.updateFromMetadata(fragmentShader, metadata);
@@ -418,7 +563,7 @@ class PreprocessedMaterial extends Material implements HotReloadableFmat {
     if (shadingModel == FmatShadingModel.shadowCatcher) {
       _packEngineFragInfo(lighting, lighting.environmentMap);
       pass.bindUniform(
-        shader.getUniformSlot('FragInfo'),
+        shader.cachedUniformSlot('FragInfo'),
         transientsBuffer.emplace(_fragInfoBytes),
       );
       // The catcher's generated fragment samples only the shadow atlas, the
@@ -438,7 +583,7 @@ class PreprocessedMaterial extends Material implements HotReloadableFmat {
       if (lit || _sceneInputs.isNotEmpty) {
         _packEngineFragInfo(lighting, env);
         pass.bindUniform(
-          shader.getUniformSlot('FragInfo'),
+          shader.cachedUniformSlot('FragInfo'),
           transientsBuffer.emplace(_fragInfoBytes),
         );
         if (_sceneInputs.isNotEmpty) {
@@ -458,7 +603,10 @@ class PreprocessedMaterial extends Material implements HotReloadableFmat {
           shader,
           lighting,
           env,
-          bindSsao: !_sceneInputs.contains(RenderInput.filteredSceneColor),
+          bindSsao:
+              _environmentLighting &&
+              !_sceneInputs.contains(RenderInput.filteredSceneColor),
+          bindEnvironment: _environmentLighting,
           bindShadows: lighting.shadowMap != null,
           bindDiffuseSh: !usesLightmapVariant,
           cubeShader: usesRadianceCubeVariant(lighting),
@@ -481,6 +629,14 @@ class PreprocessedMaterial extends Material implements HotReloadableFmat {
         );
       }
     }
+    // Every shading model's Surface() and debug hook may read
+    // GetViewDirection.
+    EngineLightingUniforms.bindViewInfo(
+      pass,
+      shader,
+      transientsBuffer,
+      lighting,
+    );
 
     parameters.bind(pass, shader, transientsBuffer);
     // Bind the fragment keep-alive block (name matches kFragmentKeepAliveBlock
@@ -495,7 +651,7 @@ class PreprocessedMaterial extends Material implements HotReloadableFmat {
         _sceneInputs.isNotEmpty ||
         _usesPlanarReflection) {
       pass.bindUniform(
-        shader.getUniformSlot('FragmentKeepAlive'),
+        shader.cachedUniformSlot('FragmentKeepAlive'),
         transientsBuffer.emplace(_zeroKeepAlive),
       );
     }
@@ -527,11 +683,11 @@ class PreprocessedMaterial extends Material implements HotReloadableFmat {
       info[16] = 1.0;
     }
     pass.bindUniform(
-      shader.getUniformSlot('PlanarReflectionInfo'),
+      shader.cachedUniformSlot('PlanarReflectionInfo'),
       transientsBuffer.emplace(ByteData.sublistView(info)),
     );
     pass.bindTexture(
-      shader.getUniformSlot('planar_reflection'),
+      shader.cachedUniformSlot('planar_reflection'),
       frame?.texture ?? Material.getBlackPlaceholderTexture(),
       sampler: _planarReflectionSampler,
     );
@@ -542,7 +698,7 @@ class PreprocessedMaterial extends Material implements HotReloadableFmat {
 
   @override
   @internal
-  bool get depthAlphaMasked => _depthMaskTexture != null;
+  bool get depthAlphaMasked => _depthMasked;
 
   static final gpu.SamplerOptions _depthMaskSampler = gpu.SamplerOptions(
     minFilter: gpu.MinMagFilter.linear,
@@ -573,12 +729,12 @@ class PreprocessedMaterial extends Material implements HotReloadableFmat {
       ..[9] = math.sin(rotation)
       ..[10] = _depthMaskTexCoord.toDouble();
     pass.bindUniform(
-      shader.getUniformSlot('MaskInfo'),
+      shader.cachedUniformSlot('MaskInfo'),
       transientsBuffer.emplace(ByteData.sublistView(values)),
     );
     final source = _depthMaskTexture;
     pass.bindTexture(
-      shader.getUniformSlot('mask_texture'),
+      shader.cachedUniformSlot('mask_texture'),
       Material.whitePlaceholder(resolveTextureSource(source)),
       sampler: textureSourceSampler(source) ?? _depthMaskSampler,
     );
@@ -600,6 +756,10 @@ class PreprocessedMaterial extends Material implements HotReloadableFmat {
   @override
   @internal
   bool get translucentDepthWrite => _depthWrite;
+
+  @override
+  @internal
+  bool get translucentEffectsDepth => _depthWrite || _effectsDepth;
 
   @override
   @internal

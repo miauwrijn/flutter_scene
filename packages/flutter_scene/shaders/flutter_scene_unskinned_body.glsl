@@ -8,6 +8,12 @@ uniform FrameInfo {
   mat4 camera_transform;
   vec3 camera_position;
   float depth_bias;
+  // The draw's depth-layer offset (xy) and one instance tie-break rank's
+  // (zw), see ApplyDepthOffset.
+  vec4 depth_offset;
+  // The same as slope-scaled offsets: x the draw's layer, z its tie-break
+  // rank, y one instance rank's. See ApplySlopedDepthOffset.
+  vec4 depth_slope;
 }
 frame_info;
 
@@ -72,18 +78,25 @@ void main() {
   vertex.uv1 = texture_coords_1;
   vertex.color = color * instance_color;
   vertex.camera_position = frame_info.camera_position;
+  vertex.model_transform = model_transform;
   Vertex(vertex);
 
   v_position = vertex.world_position;
   vec3 draw_position = ApplyDepthBias(
-      vertex.world_position, frame_info.camera_position, frame_info.depth_bias);
-  gl_Position = frame_info.camera_transform * vec4(draw_position, 1.0);
+      vertex.world_position, frame_info.camera_transform,
+      frame_info.camera_position, frame_info.depth_bias);
+  vec4 clip_position = frame_info.camera_transform * vec4(draw_position, 1.0);
+  gl_Position = ApplySlopedDepthOffset(
+      clip_position, frame_info.depth_offset, frame_info.depth_slope,
+      model_transform_3.xyz, frame_info.camera_transform, draw_position,
+      frame_info.camera_position, vertex.world_normal);
   v_viewvector = frame_info.camera_position - vertex.world_position;
-  v_normal = vertex.world_normal;
+  // Unit length before interpolation (UnitOrZero, normal_transform.glsl).
+  v_normal = UnitOrZero(vertex.world_normal);
   v_texture_coords = vertex.uv;
   v_texture_coords_1 = vertex.uv1;
   v_color = vertex.color;
-  v_tangent = vertex.world_tangent;
+  v_tangent = vec4(UnitOrZero(vertex.world_tangent.xyz), vertex.world_tangent.w);
 
 #ifdef MATERIAL_INSTANCE_VARYINGS
   // Forward the material's declared per-instance attributes to the fragment

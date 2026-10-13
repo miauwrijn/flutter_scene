@@ -4,6 +4,7 @@
 // scale/offset, and that the selected primary directional light is skipped.
 
 import 'dart:math' as math;
+import 'dart:typed_data';
 
 import 'package:flutter_scene/scene.dart';
 import 'package:flutter_scene/src/render/punctual_lights.dart';
@@ -11,9 +12,9 @@ import 'package:flutter_scene/src/render/render_scene.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:vector_math/vector_math.dart';
 
-// Floats per light row (8 RGBA32F texels). Kept local to the test so a change
+// Floats per light row (9 RGBA32F texels). Kept local to the test so a change
 // to the layout has to be reflected here on purpose.
-const int _floatsPerLight = 32;
+const int _floatsPerLight = 36;
 
 PointLightComponent _pointAt(Vector3 position, PointLight light) {
   final node = Node(localTransform: Matrix4.translation(position));
@@ -96,15 +97,76 @@ void main() {
       expect(floats[14], closeTo(2.0, 1e-6));
     });
 
-    test('packs the falloff exponent into texel 3.z, clamped positive', () {
+    test('a photometric profile rides after the lights, named by texel 8.x', () {
+      final profile = Float32List.fromList([1, 0.5, 0]);
+      final a = Node(localTransform: Matrix4.translationValues(0, 2, 0))
+        ..addComponent(
+          PointLightComponent(
+            PointLight(
+              photometry: profile,
+              photometryAxis: Vector3(0, -2, 0),
+              radius: 0.25,
+            ),
+          ),
+        );
+      final b = Node()
+        ..addComponent(PointLightComponent(PointLight(photometry: profile)));
+      final c = Node()..addComponent(PointLightComponent(PointLight()));
+      final (params, count) = PunctualLightBuffer.packLights(
+        directionals: const [],
+        points: [
+          a.getComponent<PointLightComponent>()!,
+          b.getComponent<PointLightComponent>()!,
+          c.getComponent<PointLightComponent>()!,
+        ],
+        spots: const [],
+      );
+      const row = 36; // nine texels
+      expect(count, 3);
+      // Three light rows, then one shared profile of two rows.
+      expect(params.length, (3 + 2) * row);
+      expect(params[32], 3.0, reason: 'first light names row 3');
+      expect(params[row + 32], 3.0, reason: 'the same list is packed once');
+      expect(params[2 * row + 32], -1.0, reason: 'no profile');
+      // The source radius keeps its texel 3.w.
+      expect(params[15], closeTo(0.25, 1e-6));
+      // The point's axis, normalized, in texel 8.yzw.
+      expect(params[33], closeTo(0, 1e-6));
+      expect(params[34], closeTo(-1, 1e-6));
+      // Resampled to 64, 32 to a row: first 1, middle about 0.5, last 0.
+      final p0 = 3 * row;
+      expect(params[p0], closeTo(1, 1e-6));
+      expect(params[p0 + row + 31], closeTo(0, 1e-6));
+      expect(params[p0 + row], closeTo(0.49, 0.02));
+    });
+
+    test('packs the falloff exponent into texel 3.z, clamped at zero', () {
       final (floats, _) = PunctualLightBuffer.packLights(
         directionals: const [],
         points: [_pointAt(Vector3.zero(), PointLight(falloffExponent: 1.3))],
-        spots: [_spotAt(Vector3.zero(), SpotLight(falloffExponent: -1.0))],
+        spots: [
+          _spotAt(Vector3.zero(), SpotLight(falloffExponent: -1.0)),
+          _spotAt(Vector3.zero(), SpotLight(falloffExponent: 0.0)),
+        ],
       );
       expect(floats[14], closeTo(1.3, 1e-6));
-      // The spot occupies row 1; a non-positive exponent clamps to 0.1.
-      expect(floats[32 + 14], closeTo(0.1, 1e-6));
+      // A negative exponent clamps to 0, and 0 (no distance falloff) is kept.
+      expect(floats[36 + 14], 0.0);
+      expect(floats[72 + 14], 0.0);
+    });
+
+    test('packs the source radius into texel 3.w, clamped at zero', () {
+      final (floats, _) = PunctualLightBuffer.packLights(
+        directionals: const [],
+        points: [_pointAt(Vector3.zero(), PointLight(radius: 0.05))],
+        spots: [
+          _spotAt(Vector3.zero(), SpotLight(radius: -1.0)),
+          _spotAt(Vector3.zero(), SpotLight(radius: 0.2)),
+        ],
+      );
+      expect(floats[15], closeTo(0.05, 1e-6));
+      expect(floats[36 + 15], 0.0);
+      expect(floats[72 + 15], closeTo(0.2, 1e-6));
     });
 
     test('an infinite-range point light encodes inverse range 0', () {

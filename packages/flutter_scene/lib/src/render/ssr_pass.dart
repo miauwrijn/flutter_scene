@@ -5,6 +5,7 @@ import 'dart:ui' as ui;
 import 'package:flutter_scene/src/gpu/gpu.dart' as gpu;
 import 'package:flutter_scene/src/gpu/render_pass_compat.dart';
 
+import 'package:flutter_scene/src/render/projection_params.dart';
 import 'package:flutter_scene/src/render/depth_prepass.dart';
 import 'package:flutter_scene/src/render/render_graph.dart';
 import 'package:flutter_scene/src/render/scene_pass.dart';
@@ -12,6 +13,7 @@ import 'package:flutter_scene/src/screen_space_reflections.dart';
 import 'package:flutter_scene/src/shaders.dart';
 import 'package:flutter_scene/src/render/frame_transients.dart';
 import 'package:flutter_scene/src/scene_encoder.dart' show resolvePipeline;
+import 'package:flutter_scene/src/render/uniform_slots.dart';
 
 // Two triangles of NDC positions covering the screen (6 vec2s).
 gpu.BufferView _fullscreenQuad() {
@@ -60,20 +62,14 @@ class SsrPass extends RenderGraphPass {
   SsrPass({
     required ui.Size dimensions,
     required ScreenSpaceReflectionsSettings settings,
-    required double fovRadiansY,
-    required double near,
-    required double far,
+    required ProjectionParams projection,
   }) : _dimensions = dimensions,
        _settings = settings,
-       _fovRadiansY = fovRadiansY,
-       _near = near,
-       _far = far;
+       _projection = projection;
 
   final ui.Size _dimensions;
   final ScreenSpaceReflectionsSettings _settings;
-  final double _fovRadiansY;
-  final double _near;
-  final double _far;
+  final ProjectionParams _projection;
 
   // The shader's constant march-loop bound; user step counts clamp to this.
   static const int _maxStepCeiling = 256;
@@ -114,10 +110,6 @@ class SsrPass extends RenderGraphPass {
       ),
     );
 
-    final tanHalfFovY = math.tan(_fovRadiansY * 0.5);
-    final aspect = _dimensions.width / _dimensions.height;
-    final tanHalfFovX = tanHalfFovY * aspect;
-
     final maxSteps = _settings.maxSteps.clamp(1, _maxStepCeiling);
     final maxDistance = _settings.maxDistance;
     final thickness = _settings.thickness;
@@ -130,15 +122,16 @@ class SsrPass extends RenderGraphPass {
 
     // Trace: the viewport is the reduced trace resolution, so the pixel-space
     // march (stride, step budget) is measured in trace pixels.
-    final info = Float32List(20)
+    final projection = _projection;
+    final info = Float32List(24)
       ..[0] = traceWidth.toDouble()
       ..[1] = traceHeight.toDouble()
       ..[2] = 1.0 / traceWidth
       ..[3] = 1.0 / traceHeight
-      ..[4] = tanHalfFovX
-      ..[5] = tanHalfFovY
-      ..[6] = _near
-      ..[7] = _far
+      ..[4] = projection.scaleX
+      ..[5] = projection.scaleY
+      ..[6] = projection.near
+      ..[7] = projection.far
       ..[8] = maxDistance
       ..[9] = thickness
       ..[10] = startBias
@@ -147,7 +140,10 @@ class SsrPass extends RenderGraphPass {
       ..[13] = debugView
       ..[14] = _settings.blur
       ..[15] = _settings.stride
-      ..[16] = _settings.distanceFadeStart;
+      ..[16] = _settings.distanceFadeStart
+      ..[20] = projection.offsetX
+      ..[21] = projection.offsetY
+      ..[22] = projection.orthographicFlag;
 
     final traceCmd = gpu.gpuContext.createCommandBuffer();
     final tracePass = traceCmd.createRenderPass(
@@ -157,16 +153,16 @@ class SsrPass extends RenderGraphPass {
     tracePass.setColorBlendEnable(false);
     bindVertexBufferCompat(tracePass, _fullscreenQuad(), 6);
     tracePass.bindUniform(
-      _fragmentShader.getUniformSlot('SsrInfo'),
+      _fragmentShader.cachedUniformSlot('SsrInfo'),
       context.transientsBuffer.emplace(ByteData.sublistView(info)),
     );
     tracePass.bindTexture(
-      _fragmentShader.getUniformSlot('input_color'),
+      _fragmentShader.cachedUniformSlot('input_color'),
       sceneColor,
       sampler: _linearClamp,
     );
     tracePass.bindTexture(
-      _fragmentShader.getUniformSlot('linear_depth'),
+      _fragmentShader.cachedUniformSlot('linear_depth'),
       linearDepth,
       sampler: _nearestClamp,
     );
@@ -194,16 +190,16 @@ class SsrPass extends RenderGraphPass {
     compositePass.setColorBlendEnable(false);
     bindVertexBufferCompat(compositePass, _fullscreenQuad(), 6);
     compositePass.bindUniform(
-      _compositeShader.getUniformSlot('CompositeInfo'),
+      _compositeShader.cachedUniformSlot('CompositeInfo'),
       context.transientsBuffer.emplace(ByteData.sublistView(compositeInfo)),
     );
     compositePass.bindTexture(
-      _compositeShader.getUniformSlot('input_color'),
+      _compositeShader.cachedUniformSlot('input_color'),
       sceneColor,
       sampler: _linearClamp,
     );
     compositePass.bindTexture(
-      _compositeShader.getUniformSlot('ssr_reflection'),
+      _compositeShader.cachedUniformSlot('ssr_reflection'),
       reflection,
       sampler: _linearClamp,
     );

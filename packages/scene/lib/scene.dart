@@ -59,7 +59,8 @@ export 'src/specs.dart'
         TorusGeometrySpec,
         TransformSpec,
         TrsTransform;
-export 'src/scene_document.dart' show SceneDocument, currentFsceneVersion;
+export 'src/scene_document.dart'
+    show SceneDocument, UnknownChunk, currentFsceneVersion;
 export 'src/property_value.dart'
     show
         AssetRef,
@@ -72,6 +73,7 @@ export 'src/property_value.dart'
         Matrix4Value,
         NodeRefValue,
         PropertyValue,
+        UnknownValue,
         QuaternionValue,
         ResourceRefValue,
         StringValue,
@@ -95,6 +97,7 @@ export 'src/json/fscene_json.dart'
     show
         decodeDocument,
         encodeDocument,
+        encodeNode,
         encodeResource,
         encodeSkySource,
         encodeStage,

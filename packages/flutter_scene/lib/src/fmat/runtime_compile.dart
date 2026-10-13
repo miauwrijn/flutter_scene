@@ -19,11 +19,15 @@ import 'package:flutter_gpu_shaders/build.dart'
 import 'package:flutter_scene/src/fmat/fmat.dart';
 import 'package:flutter_scene/src/fmat/fmat_emitter.dart'
     show
+        depthSurfaceEntryName,
         emitFragmentGlsl,
+        kDebugViewsDefine,
         kRadianceCubeDefine,
+        materialHasDepthSurface,
         materialSamplesEnvironment,
         radianceCubeEntryName;
 import 'package:flutter_scene/src/importer/build_cache.dart';
+import 'package:flutter_scene/src/shader_reflection/shader_diagnostics.dart';
 
 /// A failed `.fmat` runtime compile. A parse error surfaces as the underlying
 /// [FmatException]; this carries impellerc's GLSL errors.
@@ -31,6 +35,11 @@ final class FmatCompileException implements Exception {
   FmatCompileException(this.message);
 
   final String message;
+
+  /// The compiler's messages parsed out of [message], with lines where it
+  /// reported them. Empty when the log matched no known format.
+  List<ShaderCompileDiagnostic> get diagnostics =>
+      parseShaderCompileErrors(message);
 
   @override
   String toString() => message;
@@ -78,6 +87,7 @@ final class FmatRuntimeCompiler {
     required this.includeDirectories,
     Uri? shaderLibDirectory,
     Directory? cacheDirectory,
+    this.debugViews = false,
   }) : shaderLibDirectory =
            shaderLibDirectory ?? impellerc.resolve('./shader_lib'),
        cacheDirectory =
@@ -99,6 +109,12 @@ final class FmatRuntimeCompiler {
   /// Where generated GLSL, compiled bundles, and cache metadata live.
   final Directory cacheDirectory;
 
+  /// Whether the surface debug views are compiled in. Match the engine's own
+  /// shaders, so a live-edited material shows the views the rest do.
+  final bool debugViews;
+
+  late final List<String> _shadedDefines = [if (debugViews) kDebugViewsDefine];
+
   bool? _supportsDepfile;
 
   /// Compiles `.fmat` [source]. [fileName] labels parse errors. Throws
@@ -112,7 +128,8 @@ final class FmatRuntimeCompiler {
     final key = contentHash(
       utf8.encode(
         '$_cacheFormat\n$_toolStamp\n$shaderLibDirectory\n'
-        '${includeDirectories.join(' ')}\n$sourceHash',
+        '${includeDirectories.join(' ')}\ndebug_views=$debugViews\n'
+        '$sourceHash',
       ),
     );
     final entryDir = Directory('${cacheDirectory.path}/$key');
@@ -148,7 +165,13 @@ final class FmatRuntimeCompiler {
     final manifest = <String, Object?>{
       entryName: {
         'type': 'fragment',
-        'file': _writeShader(genDir, '$entryName.frag', compiled.glsl),
+        'file': _writeShader(
+          genDir,
+          '$entryName.frag',
+          debugViews
+              ? emitFragmentGlsl(compiled.material, defines: _shadedDefines)
+              : compiled.glsl,
+        ),
       },
       if (needsCube)
         cubeEntry: {
@@ -158,10 +181,20 @@ final class FmatRuntimeCompiler {
             '$cubeEntry.frag',
             emitFragmentGlsl(
               compiled.material,
-              defines: const [kRadianceCubeDefine],
+              defines: [..._shadedDefines, kRadianceCubeDefine],
             ),
           ),
         },
+      if (materialHasDepthSurface(compiled.material))
+        for (final kind in DepthSurfaceKind.values)
+          depthSurfaceEntryName(compiled.material, kind): {
+            'type': 'fragment',
+            'file': _writeShader(
+              genDir,
+              '${depthSurfaceEntryName(compiled.material, kind)}.frag',
+              emitFragmentGlsl(compiled.material, depthSurface: kind),
+            ),
+          },
       for (final MapEntry(key: vertexEntry, value: vertexGlsl)
           in compiled.vertexGlsl.entries)
         vertexEntry: {

@@ -118,7 +118,9 @@ into one bundle; each becomes an entry keyed by its `name`.
 | `blending` | `opaque`, `alpha`, `additive` | `opaque` | `alpha` and `additive` both route the material through the depth-sorted translucent pass. `additive` forces the output alpha to zero, so the destination is never darkened, only brightened; allowed on `lit` and `unlit` alike. |
 | `culling` | `back`, `front`, `none` | `back` | Which faces are culled; `none` is double-sided. |
 | `depth_write` | boolean | `false` | For `blending: alpha` surfaces, write depth in the color pass (self-sorting) and join the post-effect depth, so depth of field focuses on the surface instead of the backdrop seen through it. |
+| `effects_depth` | boolean | `false` | For `blending: alpha` surfaces, join the post-effect depth (depth of field, custom passes that read depth) where `Surface()` alpha is at least one half, without writing depth in the color pass. For soft cutouts such as fins that must blur with what they are attached to. |
 | `depth_test` | `less_equal`, `always` | `less_equal` | The depth test used in the translucent pass, so it needs `blending: alpha` or `additive`. `always` draws regardless of the opaque depth, for a projection volume whose own faces are not the surface being shaded (see Decals). |
+| `depth_layer` | whole number, `-8` to `8` | `0` | Which surface wins where this material's geometry and another's share a plane: a higher layer draws over a lower one at any distance, so an overlay that lies on a surface (a sign, road paint, a decal quad) gets `1`. `Material.depthLayer` overrides it per instance. |
 | `parameters` | list of objects | `[]` | The material's parameters (see below). |
 | `engine_inputs` | list of `scene_color`, `scene_depth`, `planar_reflection` | `[]` | Per-frame engine textures the shader samples (see below). Surface materials, `lit` or `unlit` (`planar_reflection` is lit only). |
 | `scene_color_reach` | number | unbounded | How far past its own surface the shader samples, in local units. Lets readers whose screen rects are disjoint share one scene-color capture. Requires `engine_inputs`. |
@@ -350,6 +352,10 @@ struct VertexInputs {
 };
 ```
 
+Spot and point shadow maps are drawn once per frame and shared by the render
+textures and the screen view, so there `camera_position` is the screen view's
+camera. A mirror shows the shadows the screen view sees.
+
 Write `world_position` to displace geometry (the engine projects it to clip
 space after `Vertex()` returns) and `world_normal` to change the shading normal.
 The `material_params.*` values are available in `Vertex()` just as in
@@ -414,13 +420,16 @@ Supply the data on the geometry, one value per vertex, matching by name:
 geometry.setCustomAttribute('phase', phaseValues, components: 1);
 ```
 
+The two sides do not have to match. A declared attribute the mesh does not
+supply reads zero, and a mesh's extra attributes are ignored by materials that
+do not declare them, so one mesh can carry an attribute for an outline shell
+and still draw with a built-in material.
+
 Custom attributes work on both static and skinned meshes; attaching one to a
 skinned mesh switches its vertex layout to a described one, since reflection
 cannot know which slot the stream was bound to (`Geometry.setCustomAttribute`).
-The depth/shadow pass fetches only position, so an attribute reads zero there:
-a displacement driven by a custom attribute is not reflected in the shadow,
-while one driven by `world_position`/a parameter is (world position is
-available in every pass).
+Depth and shadow passes run the material's full vertex variant for such a
+mesh, so a displacement driven by a custom attribute casts the shadow it draws.
 
 ## Custom instance attributes (instance to vertex and fragment)
 
@@ -479,8 +488,9 @@ The rules:
 - An instance whose attributes are never set draws with zeros, and so does a
   non-instanced draw of the same material (a single node has nowhere to take
   per-instance values from).
-- The skinned and depth/shadow variants bind no instance attribute data, so
-  they read zero there, matching per-vertex custom attributes.
+- The skinned variant binds no instance attribute data, so it reads zero.
+  Depth and shadow passes run the full unskinned variant, so an attribute-driven
+  displacement casts the shadow it draws.
 - A declaring material **opts out of automatic cross-node batching**. That
   optimization synthesizes one instance per node, and a node carries no
   attribute values; each instanced mesh draws from its own data instead.
@@ -621,6 +631,84 @@ backend without further care.
 
 ---
 
+# Surface debug views
+
+`Scene.debug.view` replaces every surface's lit result with one channel of
+its `MaterialInputs`, a geometry attribute, an identity color, or a validation
+flag (see `SurfaceDebugChannel`), so a wrong texture, a wrong parameter, and
+wrong lighting are three different pictures. A `.fmat` participates with no
+changes; the generated `main()` fills `MaterialInputs` through `Surface()` and
+then selects between `DebugSurfaceOutput()` and the shaded `MaterialOutput()`.
+Debug pixels are display-referred: the resolve pass hands them through
+untouched, so a roughness of 0.5 is mid gray on screen whatever the exposure.
+
+```dart
+scene.debug.view = const DebugView(channel: SurfaceDebugChannel.roughness);
+scene.debug.split = 0.5;                       // lit left, view right
+scene.debug.overlays.add(DebugOverlay.wireframe);
+node.debugView = DebugView.none;               // this subtree shades normally
+```
+
+To look at an intermediate of your own, write it into `material.debug` inside
+`Surface()` and select the `custom` channel; with hot reload that is a
+one-line probe.
+
+```glsl
+void Surface(inout MaterialInputs material) {
+  float mask = texture(mask_texture, GetUV0()).r;
+  material.debug = vec3(mask);
+  ...
+}
+```
+
+The material channels lengthen every material's shader build, so they are
+compiled in only when the app sets flutter_scene's `debug_views` hook
+user-define (the workspace root's pubspec, in a pub workspace):
+
+```yaml
+hooks:
+  user_defines:
+    flutter_scene:
+      debug_views: true
+```
+
+That covers the engine's materials and its bundled physical materials. An app
+whose own hook calls `buildMaterials` or `buildEngineAssets` also sets
+`flutter_scene_debug_views: true` under its own package name, since a hook
+cannot read another package's user-defines.
+
+A raw `ShaderMaterial` opts in by defining `FLUTTER_SCENE_DEBUG_VIEWS`,
+including the hook, and selecting its output through it, then constructing
+with `debugViews: true`:
+
+```glsl
+#define FLUTTER_SCENE_DEBUG_VIEWS
+#include <material_varyings.glsl>
+#include <material_inputs.glsl>
+#include <material_debug.glsl>
+
+void main() {
+  MaterialInputs material = InitMaterialInputs();
+  // ...fill material...
+  vec4 shaded = vec4(0.0);
+  if (DebugViewNeedsShaded()) {
+    shaded = /* your lit color, linear premultiplied */;
+  }
+  frag_color = DebugViewOutput(material, shaded);
+}
+```
+
+Without the define the debug functions compile to inert stubs, so the same
+source builds either way. A material whose shader lacks the views (a raw
+shader that never opted in, or any material in a build without the
+user-define) is drawn through the engine's fallback debug shader while a view
+is active, which serves the geometry and identity channels from the varyings
+and paints magenta stripes for everything that needs the surface description.
+Keep the shaded result under the `DebugViewNeedsShaded()` branch: it is
+uniform, so the lighting never runs under the per-pixel split test.
+
+---
+
 # Decals
 
 A decal paints a mark (a scorch, a melt glow, a sticker) onto surfaces that are
@@ -628,13 +716,14 @@ already drawn. Two tiers, depending on how flat the receiver is.
 
 ## Mesh decals, for a flat receiver
 
-A translucent quad parented just above the receiving surface, with a nonzero
-`Material.depthBias` so it wins the depth comparison without moving:
+A translucent quad laid on the receiving surface, with `Material.depthLayer`
+(or `depth_layer: 1` in the `.fmat`) so it wins the depth comparison at any
+distance without moving:
 
 ```dart
 final mark = Node(mesh: Mesh(PlaneGeometry(width: 2, depth: 2), scorch))
   ..position = impactPoint;
-scorch.depthBias = 0.02;
+scorch.depthLayer = 1;
 ```
 
 The material is `blending: alpha` with the mark's coverage in `base_color.a`.
@@ -742,13 +831,19 @@ emit the same standard outputs. The `.fmat` accessors wrap these; a raw
 
 ```glsl
 in vec3 v_position;        // world space
-in vec3 v_normal;          // world space, not necessarily unit length
+in vec3 v_normal;          // world space, unit per vertex (renormalize)
 in vec3 v_viewvector;      // camera_position - vertex_position
 in vec2 v_texture_coords;
 in vec2 v_texture_coords_1;
 in vec4 v_color;           // per-vertex color, white when the model has none
 in vec4 v_tangent;         // world-space tangent and bitangent sign
 ```
+
+Declare all seven, in this order, even the ones your shader does not read.
+Metal and Vulkan match a fragment input to a vertex output by location, so
+leaving one out shifts every later input onto the wrong output and the pipeline
+fails to build. On Flutter 3.47 that failure crashes the app rather than
+skipping the draw.
 
 The model scale is no longer one of the interpolated outputs (lit materials
 read it from `FragInfo.model_scale`, which the `.fmat` `GetModelScale()`
@@ -1097,7 +1192,12 @@ a raw `ShaderMaterial` has no such declaration and always sees the fixed record.
 Your shader writes `gl_Position` and the standard outputs the fragment stage reads
 (`v_position`, `v_normal`, `v_viewvector`, `v_texture_coords`,
 `v_texture_coords_1`, `v_color`, `v_tangent`), plus any of
-your own varyings. A skinned mesh
+your own varyings. Write clip space as `camera_transform * world_position`.
+`camera_transform` already carries the view's depth convention, which is
+reversed (near at 1, far at 0) on most devices (`Scene.reversedDepth`), so a
+shader that writes clip depth itself (a sky at `z = w`) is only right with
+`Scene.reversedDepth = false`. `FrameInfo` continues past `camera_position`
+with engine fields a shader may leave undeclared. A skinned mesh
 instead takes its model transform,
 `enable_skinning`, and `joint_texture_size` in `FrameInfo`, and adds the
 `joints` and `weights` attributes and a `joints_texture` sampler.
@@ -1122,7 +1222,9 @@ catch is that the engine's shader writes only the engine varyings. If your
 fragment shader reads a varying your own vertex shader writes, the fallback
 pairs it with a vertex shader that never writes it, and pipeline creation fails
 on the backend. A debug build warns and names the missing variant when this is
-about to happen. So either supply every variant your scene draws, or keep the
+about to happen. On Apple platforms the engine also compares every pairing's
+varyings before building its pipeline, and skips a mismatched draw with a
+message naming the varying rather than letting the backend refuse it. So either supply every variant your scene draws, or keep the
 fragment shader to the engine varyings.
 
 ## Your own vertex layout
@@ -1159,6 +1261,53 @@ is simpler and needs no layout (it also works on skinned meshes):
 ```dart
 geometry.setCustomAttribute('phase', phaseValues, components: 1);
 ```
+
+## A packed vertex format
+
+A mesh can carry its own vertex format end to end, for example 16 bytes a
+vertex instead of the standard 72. Upload the streams as raw bytes, one per
+slot, and describe them:
+
+```dart
+final geometry = UnskinnedGeometry()
+  ..setVertexLayout(layout) // one buffer per stream, then the instance record
+  ..setVertexShader(library['PackedVertex']!)
+  ..uploadVertexStreams([positions, packed], vertexCount, indices: indices)
+  ..setLocalBounds(aabb, sphere);
+```
+
+`uploadVertexStreams` sends the bytes as given, so the engine keeps no CPU
+copy for raycasting and scans no bounds; set them, or the mesh is never
+culled. Integer formats (`VertexFormat.uint32`, read as `in uint`) work on
+Metal, Vulkan, and the web backend but not yet on Impeller's OpenGL ES
+backend, so a mesh that must draw there packs small integers into a float
+stream instead.
+
+A vertex shader set on the geometry with `setVertexShader` runs under any
+material, including the engine's lit one, so it must write all seven standard
+varyings in the order above. Its last layout buffer is the engine's 80-byte
+instance record, the four `model_transform_*` columns and `instance_color`.
+
+The depth-style passes (shadow maps, the depth prepass, the selection mask)
+draw such a geometry through that same full vertex shader unless you give it
+a position-only one:
+
+```dart
+geometry.setDepthOnlyVertex(
+  library['PackedVertexDepth']!,
+  positionStream: VertexBufferDescriptor(
+    strideInBytes: 12,
+    attributes: [
+      VertexAttributeDescriptor(name: 'position', format: VertexFormat.float32x3),
+    ],
+  ),
+);
+```
+
+That shader reads only the first stream and a 64-byte instance record (the
+four `model_transform_*` columns), and writes the same seven varyings.
+`examples/smoke_render/shaders/packed_vertex.vert` and
+`packed_vertex_depth.vert` are a worked pair.
 
 See `examples/flutter_app/lib/example_raw_shader.dart` with
 `shaders/example_ripple.vert` and `.frag` for a worked pair.
@@ -1303,7 +1452,7 @@ attributes), and hot reload are implemented. Remaining and in-flight work:
   translucent depth state).
 - **Per-instance custom attributes** work on unskinned instanced meshes, but a
   declaring material opts out of automatic cross-node batching and reads zero in
-  the skinned and depth/shadow variants.
+  the skinned variant.
 - **An inspector** that surfaces the parameter hints as UI does not exist (the
   metadata is emitted for future tooling).
 

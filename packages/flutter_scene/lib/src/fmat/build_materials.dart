@@ -6,16 +6,21 @@ import 'package:hooks/hooks.dart';
 
 import 'package:flutter_scene/src/importer/build_cache.dart';
 import 'package:flutter_scene/src/importer/build_hooks.dart'
-    show discoveryDependencyDirectory;
+    show discoveryDependencyDirectories;
 
-import '../generated_assets/engine_identity.dart' show engineIdentity;
+import '../generated_assets/engine_identity.dart'
+    show debugViewsVariantSuffix, engineIdentity;
 import '../generated_assets/generated_assets.dart';
 import '../generated_assets/generated_tree.dart';
+import '../generated_assets/wgsl_sidecar.dart' show wgslSidecarPathFor;
 import 'fmat.dart';
 import 'fmat_emitter.dart'
     show
+        depthSurfaceEntryName,
+        kDebugViewsDefine,
         kLightmapDefine,
         kRadianceCubeDefine,
+        materialHasDepthSurface,
         lightmapEntryName,
         materialSamplesEnvironment,
         radianceCubeEntryName;
@@ -121,6 +126,7 @@ const _frameworkShaderFiles = <String>[
   'irradiance_receiver.glsl',
   'lightmap.glsl',
   'lod_fade.glsl',
+  'material_coverage.glsl',
   'material_engine_lighting.glsl',
   'material_inputs.glsl',
   'material_lighting.glsl',
@@ -177,6 +183,11 @@ const _frameworkShaderFiles = <String>[
 /// puts flutter_scene's `shaders/` directory on `impellerc`'s include path (via
 /// `buildShaderBundleJson`'s `includeDirectories`), so no framework files are
 /// copied into the consumer's project.
+///
+/// [debugViews] compiles the surface debug views into the materials. It
+/// defaults to the app's `flutter_scene_debug_views` hook user-define (a hook
+/// cannot read flutter_scene's own `debug_views`), so set both. Without it the
+/// materials draw through the fallback debug shader while a view is active.
 Future<void> buildMaterials({
   required BuildInput buildInput,
   required BuildOutputBuilder buildOutput,
@@ -184,6 +195,7 @@ Future<void> buildMaterials({
   String bundleName = 'materials',
   String discoveryRoot = 'assets/',
   MaterialAssetMode assetMode = MaterialAssetMode.generatedTree,
+  bool? debugViews,
 }) => _buildMaterials(
   buildInput: buildInput,
   buildOutput: buildOutput,
@@ -191,6 +203,7 @@ Future<void> buildMaterials({
   bundleName: bundleName,
   discoveryRoot: discoveryRoot,
   assetMode: assetMode,
+  debugViews: debugViews ?? HookOptions.of(buildInput).debugViews,
 );
 
 /// Builds flutter_scene's bundled physical material shaders.
@@ -207,6 +220,7 @@ Future<void> buildBundledPhysicalMaterials({
   MaterialAssetMode assetMode = MaterialAssetMode.generatedTree,
   bool pruneGeneratedTree = true,
   String? fileVariant,
+  bool debugViews = false,
 }) => _buildMaterials(
   buildInput: buildInput,
   buildOutput: buildOutput,
@@ -228,6 +242,7 @@ Future<void> buildBundledPhysicalMaterials({
   owner: owner,
   pruneGeneratedTree: pruneGeneratedTree,
   fileVariant: fileVariant,
+  debugViews: debugViews,
 );
 
 Future<void> _buildMaterials({
@@ -243,6 +258,7 @@ Future<void> _buildMaterials({
   String? owner,
   bool pruneGeneratedTree = true,
   String? fileVariant,
+  bool debugViews = false,
 }) async {
   // ignore: deprecated_member_use_from_same_package
   if (assetMode == MaterialAssetMode.legacyOnly) {
@@ -272,10 +288,10 @@ Future<void> _buildMaterials({
       materials ??
       discoverFmatMaterials(materialRoot, discoveryRoot: discoveryRoot);
   if (materials == null) {
-    // Hashed as the names of its direct children, so an added or removed
-    // material reruns the hook for nothing.
-    buildOutput.dependencies.add(
-      discoveryDependencyDirectory(materialRoot, discoveryRoot),
+    // Each directory hashes the names of its direct children, so an added
+    // or removed material anywhere below the root reruns the hook.
+    buildOutput.dependencies.addAll(
+      discoveryDependencyDirectories(materialRoot, discoveryRoot),
     );
   }
   if (materialPaths.isEmpty) {
@@ -318,7 +334,11 @@ Future<void> _buildMaterials({
         .resolve('build/shaderbundles/$bundleName.shaderbundle')
         .toFilePath(),
   );
-  final variant = fileVariant ?? await engineIdentity();
+  // Builds with and without the debug views sharing one tree write different
+  // files instead of racing on one.
+  final variant =
+      '${fileVariant ?? await engineIdentity()}'
+      '${debugViews ? debugViewsVariantSuffix : ''}';
   final shippedBundleFile = tree == null
       ? bundleFile
       : File.fromUri(
@@ -350,6 +370,12 @@ Future<void> _buildMaterials({
         ) ??
         packageRoot.resolve('build/shaderbundles/$bundleName.index.json'),
   );
+  // The WebGPU backend's WGSL, only under flutter_scene_webgpu. Data-asset
+  // builds do not carry it yet.
+  // TODO(webgpu-data-assets): register the WGSL as a data asset too.
+  final wgslFile = wgslSidecarsForBuild(buildInput) && tree != null
+      ? File(wgslSidecarPathFor(shippedBundleFile.path))
+      : null;
 
   final sidecars = <String, Object?>{};
   final materialSources = <String, String>{};
@@ -363,7 +389,7 @@ Future<void> _buildMaterials({
     await shaderBundleStamp(
       buildInput,
       'fmat package=$assetOwner bundle=$bundleName '
-      'shadows=$generateShadowVariants '
+      'shadows=$generateShadowVariants debug_views=$debugViews '
       'lightmaps=${(lightmapVariantMaterials.toList()..sort()).join(',')}',
     ),
   );
@@ -381,11 +407,14 @@ Future<void> _buildMaterials({
     );
     stampBuffer.write(' $name=$hash');
   }
+  // An engine change to how materials compile rebuilds them even when no
+  // material or shader file changed.
+  stampBuffer.write(' compiler=${materialCompilerFingerprint()}');
   final stamp = stampBuffer.toString();
   final stampFile = File(
     packageRoot.resolve('build/shaderbundles/$bundleName.inputs').toFilePath(),
   );
-  final outputs = [shippedBundleFile, sidecarFile, indexFile];
+  final outputs = [shippedBundleFile, sidecarFile, indexFile, ?wgslFile];
   var fresh = tree != null
       ? tree.isFresh(
           GeneratedAssetFamily.material,
@@ -410,6 +439,7 @@ Future<void> _buildMaterials({
       bundleFile: shippedBundleFile,
       sidecarFile: sidecarFile,
       indexFile: indexFile,
+      wgslFile: wgslFile,
       tree: tree,
       stamp: stamp,
       owner: assetOwner,
@@ -456,6 +486,7 @@ Future<void> _buildMaterials({
         generateLightmapVariant:
             lightmapVariantMaterials.contains(entryName) &&
             compiled.material.shadingModel != FmatShadingModel.unlit,
+        debugViews: debugViews,
       );
       for (final variant in fragmentVariants.entries) {
         final variantEntryName = variant.key;
@@ -541,6 +572,10 @@ Future<void> _buildMaterials({
     if (tree != null) {
       writeGeneratedBytes(shippedBundleFile.uri, bundleFile.readAsBytesSync());
     }
+    final compiledWgsl = File(wgslSidecarPathFor(bundleFile.path));
+    if (wgslFile != null && compiledWgsl.existsSync()) {
+      writeGeneratedBytes(wgslFile.uri, compiledWgsl.readAsBytesSync());
+    }
     // Write the combined parameter sidecar next to the produced bundle.
     writeGeneratedString(
       sidecarFile.uri,
@@ -591,6 +626,7 @@ Future<void> _buildMaterials({
       bundleFile: shippedBundleFile,
       sidecarFile: sidecarFile,
       indexFile: indexFile,
+      wgslFile: wgslFile,
       tree: tree,
       stamp: stamp,
       owner: assetOwner,
@@ -612,6 +648,7 @@ Future<void> _buildMaterials({
     bundleFile: shippedBundleFile,
     sidecarFile: sidecarFile,
     indexFile: indexFile,
+    wgslFile: wgslFile,
     tree: tree,
     stamp: stamp,
     owner: assetOwner,
@@ -630,16 +667,20 @@ Map<String, String> emitFragmentShaderVariants(
   FmatCompilation compiled, {
   required bool generateShadowVariant,
   bool generateLightmapVariant = false,
+  bool debugViews = false,
 }) {
   final material = compiled.material;
   final entryName = material.name;
+  // The surface debug views are compiled into the shaded entries only; the
+  // depth surfaces never show them.
+  final base = [if (debugViews) kDebugViewsDefine];
   // The outermost axis, so a Lightmap entry still gets its Shadow and Cube
   // twins. Only materials expected to carry a bake generate it; it doubles
   // the entries of the ones that do.
   final byLightmap = <String, List<String>>{
-    entryName: const [],
+    entryName: base,
     if (generateLightmapVariant)
-      lightmapEntryName(entryName): const [kLightmapDefine],
+      lightmapEntryName(entryName): [...base, kLightmapDefine],
   };
   // The unsuffixed entry is the no-shadow fast path. The Shadow entry keeps
   // the complete sampler layout used when the scene binds a shadow atlas.
@@ -652,8 +693,18 @@ Map<String, String> emitFragmentShaderVariants(
       byShadow[name] = defines;
     }
   });
+  // Cutouts cut the depth passes by their own surface alpha.
+  final depthSurfaces = <String, String>{
+    if (materialHasDepthSurface(material))
+      for (final kind in DepthSurfaceKind.values)
+        depthSurfaceEntryName(material, kind): emitFragmentGlsl(
+          material,
+          depthSurface: kind,
+        ),
+  };
   if (!materialSamplesEnvironment(material)) {
     return <String, String>{
+      ...depthSurfaces,
       for (final entry in byShadow.entries)
         entry.key: entry.value.isEmpty
             ? compiled.glsl
@@ -663,7 +714,7 @@ Map<String, String> emitFragmentShaderVariants(
   // Backends build the prefiltered radiance in one of two layouts and each
   // entry declares only its own sampler, so every entry gets a Cube twin that
   // the runtime picks from the bound environment.
-  final variants = <String, String>{};
+  final variants = <String, String>{...depthSurfaces};
   byShadow.forEach((name, defines) {
     variants[name] = defines.isEmpty
         ? compiled.glsl
@@ -695,6 +746,7 @@ void _registerOutputs({
   required File bundleFile,
   required File sidecarFile,
   required File indexFile,
+  required File? wgslFile,
   required GeneratedAssetTree? tree,
   required String stamp,
   required String owner,
@@ -728,6 +780,8 @@ void _registerOutputs({
       'package': owner,
       'bundleName': bundleName,
       'shaderBundleFileName': bundleFile.uri.pathSegments.last,
+      if (wgslFile != null && wgslFile.existsSync())
+        'wgslFileName': wgslFile.uri.pathSegments.last,
       'sidecarFileName': sidecarFile.uri.pathSegments.last,
       'materials': {
         for (final key in sidecars.keys)
@@ -765,8 +819,24 @@ void _registerOutputs({
         stamp: stamp,
         owner: owner,
         target: target,
-      )
-      ..save();
+      );
+    if (wgslFile == null || !wgslFile.existsSync()) {
+      tree.drop(
+        GeneratedAssetFamily.material,
+        '$bundleName#wgsl',
+        target: target,
+      );
+    } else {
+      tree.recordFile(
+        family: GeneratedAssetFamily.material,
+        id: '$bundleName#wgsl',
+        uri: wgslFile.uri,
+        stamp: stamp,
+        owner: owner,
+        target: target,
+      );
+    }
+    tree.save();
   } else {
     buildOutput.assets.data.addAll([
       DataAsset(
@@ -800,4 +870,5 @@ void _registerOutputs({
   buildOutput.dependencies.addAll(
     _frameworkShaderFiles.map(frameworkShaders.resolve),
   );
+  buildOutput.dependencies.addAll(materialCompilerSources());
 }

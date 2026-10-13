@@ -1,5 +1,17 @@
 part of '../animation.dart';
 
+/// Resolves the node an animation channel named [nodeName] drives under
+/// [bindRoot].
+///
+/// The bind root matches its own name first unless the engine named it.
+/// Import roots are named `root`, and rigs often name a joint `root` too, so
+/// for those the joint wins.
+Node? resolveAnimationTarget(Node bindRoot, String nodeName) {
+  final selfMatch = bindRoot.name == nodeName;
+  if (selfMatch && !bindRoot.hasEngineAssignedName) return bindRoot;
+  return bindRoot.getChildByName(nodeName) ?? (selfMatch ? bindRoot : null);
+}
+
 class _ChannelBinding {
   AnimationChannel channel;
   Node node;
@@ -161,12 +173,10 @@ class AnimationClip {
   void _bindToTarget(Node target) {
     _bindings.clear();
     for (final channel in _animation.channels) {
-      final nodeName = channel.bindTarget.nodeName;
-      // A channel may target the bind root itself or one of its
-      // descendants. Resolving descendants first would miss the root.
-      final channelTarget = nodeName == target.name
-          ? target
-          : target.getChildByName(nodeName);
+      final channelTarget = resolveAnimationTarget(
+        target,
+        channel.bindTarget.nodeName,
+      );
       if (channelTarget == null) continue;
       _bindings.add(_ChannelBinding(channel, channelTarget));
     }

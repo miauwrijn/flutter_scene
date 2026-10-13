@@ -347,6 +347,39 @@ fragment { void Surface(inout MaterialInputs material) {} }
       );
     });
 
+    test('an unlit surface material carries no RadianceLayoutInfo block', () {
+      // The block is only written by the engine lighting path, and nothing
+      // binds it on an unlit material (see PreprocessedMaterial.bind). A
+      // fragment-stage uniform block no draw writes is reflected at set 0 /
+      // binding 0, which collides with the vertex stage's FrameInfo: GLES
+      // resolves uniforms per stage and ignores it, Vulkan builds one
+      // descriptor set layout for both stages and every draw with the
+      // material disappears.
+      final m = parseFmat('''
+material { name: "U", shading_model: unlit }
+fragment {
+  void Surface(inout MaterialInputs material) {
+    material.base_color = vec4(SphericalToEquirectangular(vec3(0.0, 1.0, 0.0)), 0.0, 1.0);
+  }
+}
+''');
+      final glsl = emitFragmentGlsl(m);
+      // texture.glsl is still included -- unlit shaders use its UV helpers.
+      expect(glsl, contains('#include <texture.glsl>'));
+      expect(glsl, contains('#define FLUTTER_SCENE_NO_ENGINE_RADIANCE'));
+    });
+
+    test('a lit material keeps the RadianceLayoutInfo block', () {
+      final m = parseFmat('''
+material { name: "L", shading_model: lit }
+fragment { void Surface(inout MaterialInputs material) {} }
+''');
+      expect(
+        emitFragmentGlsl(m),
+        isNot(contains('#define FLUTTER_SCENE_NO_ENGINE_RADIANCE')),
+      );
+    });
+
     test('materials without engine_inputs get no scene-input samplers', () {
       final m = parseFmat('''
 material { name: "Plain" }
@@ -379,12 +412,12 @@ fragment { void Surface(inout MaterialInputs material) {} }
       expect(c.glsl, contains('#include <material_lighting.glsl>'));
       expect(c.glsl, contains('#include <material_engine_lighting.glsl>'));
       expect(c.glsl, contains('uniform MaterialParams {'));
-      expect(c.glsl, contains('  vec4 tint;'));
-      expect(c.glsl, contains('  int steps;'));
+      expect(c.glsl, contains('  highp vec4 tint;'));
+      expect(c.glsl, contains('  highp int steps;'));
       expect(c.glsl, contains('material_params;'));
       expect(c.glsl, contains('uniform sampler2D detail_texture;'));
       expect(c.glsl, contains('#line ${c.material.fragmentSourceLine}'));
-      expect(c.glsl, contains('frag_color = EvaluateLighting(material);'));
+      expect(c.glsl, contains('return EvaluateLighting(material);'));
       expect(c.glsl, contains('Surface(material);'));
     });
 
@@ -417,7 +450,7 @@ fragment {
       expect(
         c.glsl,
         contains(
-          'frag_color = vec4(material.base_color.rgb * '
+          'return vec4(material.base_color.rgb * '
           'material.base_color.a, 0.0);',
         ),
       );
@@ -429,7 +462,7 @@ material { name: "AddL", shading_model: lit, blending: additive }
 fragment { void Surface(inout MaterialInputs material) {} }
 ''');
       expect(c.glsl, contains('vec4 lit = EvaluateLighting(material);'));
-      expect(c.glsl, contains('frag_color = vec4(lit.rgb, 0.0);'));
+      expect(c.glsl, contains('return vec4(lit.rgb, 0.0);'));
     });
 
     test(
@@ -665,8 +698,10 @@ fragment {
       );
       expect(c.glsl, contains('texture(unused_texture, vec2(0.0)).x'));
       expect(c.glsl, contains('texture(unused_cube, vec3(0.0, 0.0, 1.0)).x'));
-      // The sampler the fragment really uses pays no keep-alive fetch.
-      expect(c.glsl, isNot(contains('texture(used_texture, vec2(0.0))')));
+      // A sampler the source names is kept too, since the reference may be
+      // dead code; the fetches sit under a branch that never runs.
+      expect(c.glsl, contains('texture(used_texture, vec2(0.0)).x'));
+      expect(c.glsl, contains('if (fragment_keep_alive.keep_alive.x != 0.0)'));
     });
 
     test(
@@ -690,7 +725,7 @@ fragment {
           c.glsl,
           contains(
             'fragment_keep_alive.keep_alive.x * '
-            'fragment_keep_alive.keep_alive.y',
+            '(texture(tex, vec2(0.0)).x)',
           ),
         );
       },
@@ -877,6 +912,24 @@ sky {
   }
 }
 ''';
+
+    test(
+      'a sky that never samples the environment drops the radiance block',
+      () {
+        expect(
+          emitFragmentGlsl(parseFmat(validSky, fileName: 'sky.fmat')),
+          contains('#define FLUTTER_SCENE_NO_ENGINE_RADIANCE'),
+        );
+        final sampling = parseFmat('''
+material { name: "Env", requires: [environment] }
+sky { vec3 Sky(vec3 d) { return SampleEnvironment(d, 0.0); } }
+''', fileName: 'env.fmat');
+        expect(
+          emitFragmentGlsl(sampling),
+          isNot(contains('#define FLUTTER_SCENE_NO_ENGINE_RADIANCE')),
+        );
+      },
+    );
 
     test('parses a sky domain', () {
       final m = parseFmat(validSky, fileName: 'sky.fmat');

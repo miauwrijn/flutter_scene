@@ -1,3 +1,4 @@
+import 'dart:math' as math;
 import 'dart:typed_data';
 
 import 'package:flutter_scene/src/render/render_scene.dart';
@@ -144,22 +145,34 @@ class Bvh {
   final List<RenderItem> _items;
   final int _nodeCount;
 
+  /// Items this tree was built over.
+  int get itemCount => _items.length;
+
   // Traversal stack, sized for a balanced tree far deeper than any
   // realistic item count. Queries are single-threaded and never nest (a
   // visit callback must not query the same Bvh).
   final Int32List _stack = Int32List(64);
 
-  // Frustum planes as (nx, ny, nz, constant) rows, reloaded per query.
-  final Float64List _planes = Float64List(24);
+  // Frustum planes then additional planes as (nx, ny, nz, constant) rows,
+  // reloaded per query. Grows to fit the largest plane count seen.
+  Float64List _planes = Float64List(24);
 
   /// Calls [visit] once for every item whose world AABB intersects
-  /// [frustum].
-  void query(
+  /// [frustum]. Returns how many it visited; a rejected node's subtree is
+  /// skipped whole, so [itemCount] minus this is the number rejected.
+  int query(
     Frustum frustum,
     void Function(RenderItem) visit, {
     List<Plane> additionalPlanes = const [],
   }) {
-    if (_nodeCount == 0) return;
+    if (_nodeCount == 0) return 0;
+    final planeCount = 6 + additionalPlanes.length;
+    if (_planes.length < planeCount * 4) {
+      _planes = Float64List(planeCount * 4);
+    }
+    for (var i = 0; i < additionalPlanes.length; i++) {
+      _loadPlane(6 + i, additionalPlanes[i]);
+    }
     _loadPlane(0, frustum.plane0);
     _loadPlane(1, frustum.plane1);
     _loadPlane(2, frustum.plane2);
@@ -169,16 +182,18 @@ class Bvh {
     final bounds = _bounds;
     final children = _children;
     final planes = _planes;
+    final rowsEnd = planeCount * 4;
     final stack = _stack;
     var top = 0;
     stack[top++] = _nodeCount - 1;
+    var visited = 0;
     while (top > 0) {
       final node = stack[--top];
       final o = node * 6;
       // Outside when the corner farthest along a plane's normal is below
       // that plane, matching Frustum.intersectsWithAabb3.
       var outside = false;
-      for (var p = 0; p < 24; p += 4) {
+      for (var p = 0; p < rowsEnd; p += 4) {
         final nx = planes[p], ny = planes[p + 1], nz = planes[p + 2];
         final px = nx < 0 ? bounds[o] : bounds[o + 3];
         final py = ny < 0 ? bounds[o + 1] : bounds[o + 4];
@@ -188,29 +203,127 @@ class Bvh {
           break;
         }
       }
-      if (!outside) {
-        for (final plane in additionalPlanes) {
-          final nx = plane.normal.x;
-          final ny = plane.normal.y;
-          final nz = plane.normal.z;
-          final px = nx < 0 ? bounds[o] : bounds[o + 3];
-          final py = ny < 0 ? bounds[o + 1] : bounds[o + 4];
-          final pz = nz < 0 ? bounds[o + 2] : bounds[o + 5];
-          if (nx * px + ny * py + nz * pz + plane.constant < 0) {
-            outside = true;
-            break;
-          }
-        }
-      }
       if (outside) continue;
       final left = children[node * 2];
       if (left < 0) {
         visit(_items[~left]);
+        visited++;
         continue;
       }
       stack[top++] = left;
       stack[top++] = children[node * 2 + 1];
     }
+    return visited;
+  }
+
+  /// The smallest [leafBound] over items whose world AABB intersects
+  /// [frustum], searched nearest first and pruned by a lower bound on each
+  /// node: the larger of its nearest corner's planar depth along [forward]
+  /// from [eye] and its distance from [eye] times [cosHalfAngle] (no point in
+  /// the frustum lies farther off-axis than the frustum's corner ray). Both
+  /// bounds hold for every item inside a node, so a node that cannot beat
+  /// [best] is skipped whole.
+  ///
+  /// [leafBound] returns an item's own bound, or infinity to ignore it. The
+  /// search ends as soon as the best bound reaches [floor].
+  double nearestBound(
+    Frustum frustum,
+    Vector3 eye,
+    Vector3 forward,
+    double cosHalfAngle,
+    double Function(RenderItem item, double best) leafBound, {
+    List<Plane> additionalPlanes = const [],
+    double best = double.infinity,
+    double floor = double.negativeInfinity,
+  }) {
+    if (_nodeCount == 0) return best;
+    final planeCount = 6 + additionalPlanes.length;
+    if (_planes.length < planeCount * 4) {
+      _planes = Float64List(planeCount * 4);
+    }
+    for (var i = 0; i < additionalPlanes.length; i++) {
+      _loadPlane(6 + i, additionalPlanes[i]);
+    }
+    _loadPlane(0, frustum.plane0);
+    _loadPlane(1, frustum.plane1);
+    _loadPlane(2, frustum.plane2);
+    _loadPlane(3, frustum.plane3);
+    _loadPlane(4, frustum.plane4);
+    _loadPlane(5, frustum.plane5);
+    final bounds = _bounds;
+    final children = _children;
+    final planes = _planes;
+    final rowsEnd = planeCount * 4;
+    final stack = _stack;
+    final ex = eye.x, ey = eye.y, ez = eye.z;
+    final fx = forward.x, fy = forward.y, fz = forward.z;
+    var top = 0;
+    stack[top++] = _nodeCount - 1;
+    while (top > 0) {
+      final node = stack[--top];
+      final o = node * 6;
+      final lower = aabbDepthLowerBound(
+        bounds[o],
+        bounds[o + 1],
+        bounds[o + 2],
+        bounds[o + 3],
+        bounds[o + 4],
+        bounds[o + 5],
+        ex,
+        ey,
+        ez,
+        fx,
+        fy,
+        fz,
+        cosHalfAngle,
+      );
+      if (lower >= best) continue;
+      var outside = false;
+      for (var p = 0; p < rowsEnd; p += 4) {
+        final nx = planes[p], ny = planes[p + 1], nz = planes[p + 2];
+        final px = nx < 0 ? bounds[o] : bounds[o + 3];
+        final py = ny < 0 ? bounds[o + 1] : bounds[o + 4];
+        final pz = nz < 0 ? bounds[o + 2] : bounds[o + 5];
+        if (nx * px + ny * py + nz * pz + planes[p + 3] < 0) {
+          outside = true;
+          break;
+        }
+      }
+      if (outside) continue;
+      final left = children[node * 2];
+      if (left < 0) {
+        final bound = leafBound(_items[~left], best);
+        if (bound < best) {
+          best = bound;
+          if (best <= floor) return best;
+        }
+        continue;
+      }
+      // Visit the nearer child first, so a tight bound prunes the other.
+      final right = children[node * 2 + 1];
+      final leftNear = _nodeDistance2(left * 6, ex, ey, ez);
+      final rightNear = _nodeDistance2(right * 6, ex, ey, ez);
+      if (leftNear <= rightNear) {
+        stack[top++] = right;
+        stack[top++] = left;
+      } else {
+        stack[top++] = left;
+        stack[top++] = right;
+      }
+    }
+    return best;
+  }
+
+  double _nodeDistance2(int o, double x, double y, double z) {
+    final b = _bounds;
+    final dx = x < b[o] ? b[o] - x : (x > b[o + 3] ? x - b[o + 3] : 0.0);
+    final dy = y < b[o + 1]
+        ? b[o + 1] - y
+        : (y > b[o + 4] ? y - b[o + 4] : 0.0);
+    final dz = z < b[o + 2]
+        ? b[o + 2] - z
+        : (z > b[o + 5] ? z - b[o + 5] : 0.0);
+    return dx * dx + dy * dy + dz * dz;
   }
 
   void _loadPlane(int index, Plane plane) {
@@ -299,4 +412,38 @@ class Bvh {
     x = (x | (x << 2)) & 0x09249249;
     return x;
   }
+}
+
+/// A lower bound on the planar view depth, along unit [fx], [fy], [fz] from
+/// the eye at [ex], [ey], [ez], of any point of the AABB `(minX..maxZ)` that
+/// lies inside a perspective frustum whose corner ray makes an angle with
+/// forward of cosine [cosHalfAngle]. Zero or negative when the box reaches
+/// the eye's plane.
+double aabbDepthLowerBound(
+  double minX,
+  double minY,
+  double minZ,
+  double maxX,
+  double maxY,
+  double maxZ,
+  double ex,
+  double ey,
+  double ez,
+  double fx,
+  double fy,
+  double fz,
+  double cosHalfAngle,
+) {
+  // Planar depth is linear, so its minimum over the box is at the corner
+  // farthest against forward.
+  final cornerX = fx < 0 ? maxX : minX;
+  final cornerY = fy < 0 ? maxY : minY;
+  final cornerZ = fz < 0 ? maxZ : minZ;
+  final planar =
+      (cornerX - ex) * fx + (cornerY - ey) * fy + (cornerZ - ez) * fz;
+  final dx = ex < minX ? minX - ex : (ex > maxX ? ex - maxX : 0.0);
+  final dy = ey < minY ? minY - ey : (ey > maxY ? ey - maxY : 0.0);
+  final dz = ez < minZ ? minZ - ez : (ez > maxZ ? ez - maxZ : 0.0);
+  final radial = math.sqrt(dx * dx + dy * dy + dz * dz) * cosHalfAngle;
+  return planar > radial ? planar : radial;
 }

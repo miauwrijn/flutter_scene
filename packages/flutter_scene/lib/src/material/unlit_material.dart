@@ -11,6 +11,7 @@ import 'package:flutter_scene/src/material/physically_based_material.dart'
 
 import 'package:vector_math/vector_math.dart';
 import 'package:flutter_scene/src/render/frame_transients.dart';
+import 'package:flutter_scene/src/render/uniform_slots.dart';
 
 /// A material that draws geometry with a flat color or texture, ignoring
 /// scene lighting.
@@ -22,6 +23,9 @@ import 'package:flutter_scene/src/render/frame_transients.dart';
 /// Wraps the `UnlitFragment` shader from the base shader library.
 /// {@category Materials}
 class UnlitMaterial extends Material {
+  @override
+  bool get participatesInDebugViews => true;
+
   /// Creates an [UnlitMaterial], optionally textured.
   ///
   /// When [colorTexture] is null a 1×1 white placeholder is used so the
@@ -62,6 +66,24 @@ class UnlitMaterial extends Material {
   @override
   bool isOpaque() => alphaMode == AlphaMode.opaque;
 
+  @override
+  bool get lodCrossFades => true;
+
+  /// Treats [baseColorTexture] and [baseColorFactor] as display-referred
+  /// (final screen values) instead of scene-referred radiance.
+  ///
+  /// The surface is drawn past the tone curve and composited onto the
+  /// resolved image, so an authored color arrives on screen unchanged. Use it
+  /// for captured widgets and other UI textured into the scene;
+  /// `WidgetComponent` sets it on the material it owns. The surface keeps its
+  /// depth test against the scene but takes no exposure, grading, tone
+  /// mapping, fog or bloom, and does not order against translucent geometry.
+  ///
+  /// With this set, [baseColorFactor] multiplies in display space rather than
+  /// linear space.
+  @override
+  bool displayReferred = false;
+
   /// Linear RGBA tint multiplied with [baseColorTexture].
   Vector4 baseColorFactor = Colors.white;
 
@@ -83,9 +105,10 @@ class UnlitMaterial extends Material {
       baseColorFactor.b, baseColorFactor.a, // color
       vertexColorWeight, // vertex_color_weight
       lodFade, // fade
+      displayReferred ? 1.0 : 0.0, // display_referred
     ]);
     pass.bindUniform(
-      fragmentShader.getUniformSlot("FragInfo"),
+      fragmentShader.cachedUniformSlot("FragInfo"),
       transientsBuffer.emplace(ByteData.sublistView(fragInfo)),
     );
     final transform = _textureTransformScratch
@@ -97,11 +120,11 @@ class UnlitMaterial extends Material {
       ..[5] = math.sin(baseColorTextureTransform.rotation)
       ..[6] = baseColorTextureTexCoord.clamp(0, 1).toDouble();
     pass.bindUniform(
-      fragmentShader.getUniformSlot('TextureTransform'),
+      fragmentShader.cachedUniformSlot('TextureTransform'),
       transientsBuffer.emplace(ByteData.sublistView(transform)),
     );
     pass.bindTexture(
-      fragmentShader.getUniformSlot('base_color_texture'),
+      fragmentShader.cachedUniformSlot('base_color_texture'),
       Material.whitePlaceholder(resolveTextureSource(baseColorTexture)),
       sampler:
           textureSourceSampler(baseColorTexture) ??
@@ -112,6 +135,12 @@ class UnlitMaterial extends Material {
     );
     // The unlit shader carries the FogInfo block (fog.glsl) too.
     EngineLightingUniforms.bindFog(
+      pass,
+      fragmentShader,
+      transientsBuffer,
+      lighting,
+    );
+    EngineLightingUniforms.bindViewInfo(
       pass,
       fragmentShader,
       transientsBuffer,

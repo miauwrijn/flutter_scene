@@ -1,9 +1,10 @@
+import 'dart:collection';
 import 'dart:math' as math;
 import 'dart:typed_data';
 import 'dart:ui' as ui;
 
 import 'package:flutter/foundation.dart'
-    show debugPrint, kDebugMode, visibleForTesting;
+    show debugPrint, internal, kDebugMode, visibleForTesting;
 import 'package:flutter_scene/src/gpu/gpu.dart' as gpu;
 import 'package:vector_math/vector_math.dart';
 
@@ -16,13 +17,24 @@ import 'package:flutter_scene/src/fmat/material_registry.dart'
 import 'package:flutter_scene/src/material/instance_attributes.dart';
 import 'package:flutter_scene/src/material/material.dart';
 import 'package:flutter_scene/src/material/engine_lighting.dart';
+import 'package:flutter_scene/src/material/shader_interface.dart';
+import 'package:flutter_scene/src/render/projection_params.dart';
 import 'package:flutter_scene/src/render/custom_render_pass.dart';
+import 'package:flutter_scene/src/render/depth_raster.dart';
+import 'package:flutter_scene/src/render/debug_view.dart';
+import 'package:flutter_scene/src/render/draw_recorder.dart';
+import 'package:flutter_scene/src/mesh_draw.dart';
+import 'package:flutter_scene/src/render/mesh_draw_selection.dart';
 import 'package:flutter_scene/src/render/instance_packing.dart';
 import 'package:flutter_scene/src/render/lod.dart';
 import 'package:flutter_scene/src/render/render_scene.dart';
 import 'package:flutter_scene/src/render/render_profile.dart';
+import 'package:flutter_scene/src/render/render_stats.dart';
+import 'package:flutter_scene/src/render/viewport_camera.dart';
 import 'package:flutter_scene/src/render/frame_transients.dart';
 import 'package:flutter_scene/src/render/instance_batching.dart';
+import 'package:flutter_scene/src/shaders.dart';
+import 'package:flutter_scene/src/render/uniform_slots.dart';
 
 /// A deferred opaque draw. Holds the [RenderItem] (instanced or not), its
 /// resolved pipeline, a per-pipeline grouping key, and the camera
@@ -34,8 +46,8 @@ base class _OpaqueRecord implements OpaqueBatchRecord {
     Material material,
     this.fade,
     gpu.RenderPipeline pipeline,
+    this.coveragePipeline,
     this.pipelineKey,
-    this.depth,
     this.windingFlipped,
   ) : _item = item,
       _geometry = geometry,
@@ -45,6 +57,8 @@ base class _OpaqueRecord implements OpaqueBatchRecord {
       materialKey = identityHashCode(material);
   RenderItem? _item;
   RenderItem get item => _item!;
+  @override
+  bool get hasDrawSelector => hasMeshDrawSelector(item);
   // The geometry and material to draw, which differ from the item's own when
   // a level of detail was selected.
   Geometry? _geometry;
@@ -60,9 +74,15 @@ base class _OpaqueRecord implements OpaqueBatchRecord {
   gpu.RenderPipeline? _pipeline;
   @override
   gpu.RenderPipeline get pipeline => _pipeline!;
+  // The coverage pre-draw's pipeline for a surface that cuts itself out, or
+  // null when the draw covers its whole geometry.
+  gpu.RenderPipeline? coveragePipeline;
   late int pipelineKey;
-  late double depth;
   late bool windingFlipped;
+
+  // View depth, NaN until the sort first needs it. Depth is the last
+  // tie-breaker, so most records never compute it.
+  double depth = double.nan;
 
   void reset(
     RenderItem item,
@@ -70,8 +90,8 @@ base class _OpaqueRecord implements OpaqueBatchRecord {
     Material material,
     double fade,
     gpu.RenderPipeline pipeline,
+    gpu.RenderPipeline? coveragePipeline,
     int pipelineKey,
-    double depth,
     bool windingFlipped,
   ) {
     _item = item;
@@ -79,8 +99,9 @@ base class _OpaqueRecord implements OpaqueBatchRecord {
     _material = material;
     this.fade = fade;
     _pipeline = pipeline;
+    this.coveragePipeline = coveragePipeline;
     this.pipelineKey = pipelineKey;
-    this.depth = depth;
+    depth = double.nan;
     this.windingFlipped = windingFlipped;
     geometryKey = identityHashCode(geometry);
     materialKey = identityHashCode(material);
@@ -199,7 +220,9 @@ base class _TranslucentRecord {
 const int _transmissionCoverageColumns = 32;
 const int _transmissionCoverageRows = 32;
 
-/// Maximum accumulated scene-color batches emitted in one frame.
+/// Maximum accumulated scene-color batches emitted in one frame, and the
+/// default and upper bound of `Scene.sceneColorCaptureBatches`.
+/// {@category Rendering}
 const int maxSceneColorCaptureBatches = 8;
 
 base class _ScreenCoverage {
@@ -371,12 +394,73 @@ double sceneSortDepth(
 final Map<(gpu.Shader, gpu.Shader, int), gpu.RenderPipeline> _pipelineCache =
     {};
 
+// [_pipelineCache] as nested identity maps, so a per-draw hit builds no
+// record key. Kept in step with the cache on insert and eviction.
+final Map<gpu.Shader, Map<gpu.Shader, Map<int, gpu.RenderPipeline>>>
+_pipelineIndex = HashMap.identity();
+
+gpu.RenderPipeline? _cachedPipeline(
+  gpu.Shader vertexShader,
+  gpu.Shader fragmentShader,
+  int layoutId,
+) => _pipelineIndex[vertexShader]?[fragmentShader]?[layoutId];
+
+/// The already-built pipeline for this shader pair and layout, or null.
+///
+/// Lets a per-draw caller skip [tryResolvePipeline] and the debug closure it
+/// takes when the pipeline exists.
+@internal
+gpu.RenderPipeline? cachedRenderPipeline(
+  gpu.Shader vertexShader,
+  gpu.Shader fragmentShader,
+  VertexLayoutDescriptor? vertexLayout,
+) =>
+    _cachedPipeline(vertexShader, fragmentShader, vertexLayoutId(vertexLayout));
+
 /// Pipeline keys the backend refused to build, so a rejected pairing is not
 /// retried every frame. Keyed exactly like [_pipelineCache] and evicted with
 /// it, so one bad shader variant does not disable the variants that build, and
 /// a hot-reloaded shader gets a fresh attempt instead of staying invisible
 /// until restart.
 final Set<(gpu.Shader, gpu.Shader, int)> _rejectedPipelines = {};
+
+// A sliced warm-up's build budget: while set, new pipelines stop building
+// once builds have taken this long, and the draws that need the rest are
+// skipped and counted, so the warm-up yields and tries them next slice.
+Duration? _buildBudget;
+final Stopwatch _buildClock = Stopwatch();
+int _deferredBuilds = 0;
+
+/// Runs [body] with new pipeline builds capped at [budget] of build time;
+/// draws past it are skipped and counted in [deferredPipelineBuilds].
+@internal
+T withPipelineBuildBudget<T>(Duration budget, T Function() body) {
+  _buildBudget = budget;
+  _buildClock
+    ..stop()
+    ..reset();
+  _deferredBuilds = 0;
+  try {
+    return body();
+  } finally {
+    _buildBudget = null;
+  }
+}
+
+/// Draws the last [withPipelineBuildBudget] skipped for lack of budget.
+@internal
+int get deferredPipelineBuilds => _deferredBuilds;
+
+bool _deferBuild((gpu.Shader, gpu.Shader, int) key) {
+  final budget = _buildBudget;
+  if (budget == null || _pipelineCache.containsKey(key)) return false;
+  if (_buildClock.elapsed < budget) return false;
+  _deferredBuilds++;
+  return true;
+}
+
+/// Pipelines currently held in the process-wide cache.
+int get pipelineCacheSize => _pipelineCache.length;
 
 /// Returns the cached render pipeline for ([vertexShader], [fragmentShader],
 /// [vertexLayout]), building and caching it on first use.
@@ -390,17 +474,21 @@ gpu.RenderPipeline resolvePipeline(
   VertexLayoutDescriptor? vertexLayout,
   String Function()? debugContext,
 }) {
-  final key = (vertexShader, fragmentShader, vertexLayoutId(vertexLayout));
-  final cached = _pipelineCache[key];
+  final layoutId = vertexLayoutId(vertexLayout);
+  final cached = _cachedPipeline(vertexShader, fragmentShader, layoutId);
   if (cached != null) return cached;
+  final key = (vertexShader, fragmentShader, layoutId);
+  activeRenderCounters.pipelineBuilds++;
   final stopwatch = kDebugMode || profileRendering
       ? (Stopwatch()..start())
       : null;
+  if (_buildBudget != null) _buildClock.start();
   final pipeline = gpu.gpuContext.createRenderPipeline(
     vertexShader,
     fragmentShader,
     vertexLayout: vertexLayout?.toGpuLayout(),
   );
+  _buildClock.stop();
   if (stopwatch != null) {
     stopwatch.stop();
     // A backend pipeline build is synchronous and lands mid-frame the first
@@ -416,7 +504,31 @@ gpu.RenderPipeline resolvePipeline(
       );
     }
   }
+  (_pipelineIndex[vertexShader] ??= HashMap.identity())[fragmentShader] ??= {};
+  _pipelineIndex[vertexShader]![fragmentShader]![layoutId] = pipeline;
   return _pipelineCache[key] = pipeline;
+}
+
+/// [resolvePipeline], or null when a sliced warm-up has spent its build
+/// budget and the pipeline is not built yet (the caller skips the draw).
+@internal
+gpu.RenderPipeline? resolvePipelineOrDefer(
+  gpu.Shader vertexShader,
+  gpu.Shader fragmentShader, {
+  VertexLayoutDescriptor? vertexLayout,
+}) {
+  if (_deferBuild((
+    vertexShader,
+    fragmentShader,
+    vertexLayoutId(vertexLayout),
+  ))) {
+    return null;
+  }
+  return resolvePipeline(
+    vertexShader,
+    fragmentShader,
+    vertexLayout: vertexLayout,
+  );
 }
 
 /// Drops cached pipelines that use any of [shaders] (as vertex or fragment) so
@@ -435,6 +547,11 @@ void evictPipelinesForShaders(Set<gpu.Shader> shaders) {
   _rejectedPipelines.removeWhere(
     (key) => shaders.contains(key.$1) || shaders.contains(key.$2),
   );
+  _pipelineIndex.clear();
+  _pipelineCache.forEach((key, pipeline) {
+    final byFragment = _pipelineIndex[key.$1] ??= HashMap.identity();
+    (byFragment[key.$2] ??= {})[key.$3] = pipeline;
+  });
 }
 
 /// [resolvePipeline], returning null instead of throwing when the backend
@@ -454,8 +571,24 @@ gpu.RenderPipeline? tryResolvePipeline(
   VertexLayoutDescriptor? vertexLayout,
   String Function()? debugContext,
 }) {
-  final key = (vertexShader, fragmentShader, vertexLayoutId(vertexLayout));
+  final layoutId = vertexLayoutId(vertexLayout);
+  // A built pipeline is never rejected or deferred.
+  final cached = _cachedPipeline(vertexShader, fragmentShader, layoutId);
+  if (cached != null) return cached;
+  final key = (vertexShader, fragmentShader, layoutId);
   if (_rejectedPipelines.contains(key)) return null;
+  if (_deferBuild(key)) return null;
+  // A ShaderMaterial pairing whose reflection is still loading cannot be
+  // checked yet, so its draw waits rather than risking a refusal.
+  if (stageInterfaceDeferred(vertexShader, fragmentShader)) return null;
+  // A pairing whose stage interfaces do not line up would be refused by the
+  // backend, which crashes at the draw on Flutter 3.47, so catch it first.
+  final interfaceProblem = stageInterfaceProblem(vertexShader, fragmentShader);
+  if (interfaceProblem != null) {
+    _rejectedPipelines.add(key);
+    debugPrint(interfaceProblem);
+    return null;
+  }
   try {
     return resolvePipeline(
       vertexShader,
@@ -473,6 +606,93 @@ gpu.RenderPipeline? tryResolvePipeline(
   }
 }
 
+// A pipeline is rejected once its draws fail in this many frames with no
+// successful draw between. A shader the driver cannot build fails every
+// frame, while a one-off failure (a descriptor pool running dry on Vulkan)
+// does not recur.
+const int _kRejectAfterFailedFrames = 3;
+
+// Failure streaks for pipelines whose last draw failed, as (last failing
+// frame, failing frame count). Cleared by a successful draw, so it is empty,
+// and free to check, in steady state.
+final Map<gpu.RenderPipeline, (int, int)> _failingPipelines = {};
+
+int _drawFailureFrame = 0;
+
+// Pipelines whose failed draws were already reported, so a failure that
+// keeps recurring between successful draws is logged once.
+final Expando<bool> _reportedDrawFailures = Expando();
+
+/// Starts a new frame for the failed-draw streaks [drawOrRejectPipeline]
+/// keeps, so a pipeline drawn in several passes of one frame counts once.
+void beginDrawFailureFrame() {
+  if (_failingPipelines.isNotEmpty) _drawFailureFrame++;
+}
+
+/// Draws [geometry] on [pass], skipping the draw instead of throwing when the
+/// backend refuses it.
+///
+/// GLES compiles and links the program at the first draw, so a shader the
+/// driver rejects fails here rather than in [tryResolvePipeline], and keeps
+/// failing every frame after. Once [pipeline], the one bound for the draw,
+/// fails in several frames with no successful draw between, it is
+/// rejected like a failed build, so later frames skip its draws and the rest
+/// of the scene still renders. A failure that does not persist only skips
+/// the draw.
+void drawOrRejectPipeline(
+  gpu.RenderPass pass,
+  Geometry geometry,
+  gpu.RenderPipeline? pipeline, {
+  int instanceCount = 1,
+  Material? material,
+}) {
+  try {
+    geometry.draw(pass, instanceCount: instanceCount);
+  } on Exception catch (error) {
+    if (pipeline == null) rethrow;
+    _recordFailedDraw(pipeline, geometry, material, error);
+    return;
+  }
+  if (_failingPipelines.isNotEmpty && pipeline != null) {
+    _failingPipelines.remove(pipeline);
+  }
+}
+
+void _recordFailedDraw(
+  gpu.RenderPipeline pipeline,
+  Geometry geometry,
+  Material? material,
+  Exception error,
+) {
+  final streak = _failingPipelines[pipeline];
+  if (streak != null && streak.$1 == _drawFailureFrame) return;
+  final failedFrames = (streak?.$2 ?? 0) + 1;
+  final subject =
+      '${material != null ? '${fmatSourcePathOf(material) ?? material.runtimeType} on ' : ''}'
+      '${geometry.runtimeType}';
+  if (failedFrames < _kRejectAfterFailedFrames) {
+    _failingPipelines[pipeline] = (_drawFailureFrame, failedFrames);
+    if (_reportedDrawFailures[pipeline] ?? false) return;
+    _reportedDrawFailures[pipeline] = true;
+    debugPrint(
+      'flutter_scene: skipped a draw the backend refused ($subject). $error',
+    );
+    return;
+  }
+  _failingPipelines.remove(pipeline);
+  for (final entry in _pipelineCache.entries) {
+    if (!identical(entry.value, pipeline)) continue;
+    _pipelineCache.remove(entry.key);
+    _pipelineIndex[entry.key.$1]?[entry.key.$2]?.remove(entry.key.$3);
+    _rejectedPipelines.add(entry.key);
+    break;
+  }
+  debugPrint(
+    'flutter_scene: skipping draws whose pipeline the backend refused in '
+    '$failedFrames frames ($subject). $error',
+  );
+}
+
 /// Records draw calls for one frame's color pass into a single
 /// `gpu.RenderPass`.
 ///
@@ -484,8 +704,9 @@ gpu.RenderPipeline? tryResolvePipeline(
 /// The encoder splits draws into two phases within the one render pass:
 ///
 /// 1. **Opaque**, with depth writes enabled and color blending disabled,
-///    sorted by pipeline (to reduce state changes) and then front-to-back
-///    (so the depth test can reject occluded fragments early).
+///    sorted by pipeline, material, and geometry (to reduce state changes
+///    and batch identical draws), with front-to-back depth only breaking
+///    ties among draws that share all three.
 /// 2. **Translucent**, depth-sorted back to front from the camera, drawn
 ///    with premultiplied source-over blending.
 ///
@@ -518,37 +739,133 @@ base class SceneEncoder {
     this._cullingPlanes,
     this._cullInstances, {
     Matrix4? cameraTransform,
+    Matrix4? displayReferredCameraTransform,
+    DebugViewFrame? debugView,
+    bool primaryView = true,
   }) : _renderPass = renderPass,
-       _transientsBuffer = transientsBuffer {
+       _transientsBuffer = transientsBuffer,
+       _debugView = debugView,
+       _primaryView = primaryView {
     currentSceneEncoderViewport = _dimensions;
-    _cameraTransform = cameraTransform ?? _camera.getViewTransform(_dimensions);
-    frustum = Frustum.matrix(_cameraTransform);
-    // The screen-size LOD metric is perspective-specific; with any other
-    // projection LOD nodes draw their highest-detail level.
-    final camera = _camera;
-    _lodFovRadiansY = camera is PerspectiveCamera ? camera.fovRadiansY : null;
+    // Read once. A camera's getters may allocate, and both feed every draw.
+    _cameraPosition = _camera.position;
+    _cameraForward = _camera.forward;
+    _raster = depthRasterOf(_camera);
+    _pixelSlope = pixelDepthSlopeOf(_camera, _dimensions);
+    _pixelScale = pixelWorldScaleOf(_camera, _dimensions);
+    _cameraTransform =
+        cameraTransform ?? rasterViewTransformOf(_camera, _dimensions);
+    _displayReferredCameraTransform = displayReferredCameraTransform;
+    frustum = cullingFrustumOf(_camera, _dimensions);
+    // A degenerate projection has no screen-size metric, so LOD nodes draw
+    // their highest-detail level.
+    final projection = ProjectionParams.of(_camera.projection, _dimensions);
+    _lodProjection = projection.scaleY > 0.0 ? projection : null;
 
     // Begin the opaque phase.
     _renderPass.setDepthWriteEnable(true);
     _renderPass.setColorBlendEnable(false);
-    _renderPass.setDepthCompareOperation(gpu.CompareFunction.lessEqual);
+    _renderPass.setDepthCompareOperation(_raster.nearerOrEqual);
   }
 
   final Camera _camera;
+  late final Vector3 _cameraPosition;
+  late final Vector3 _cameraForward;
+
+  // How this view rasterizes depth (reversed or not, fitted near), shared
+  // with every other pass that draws into its depth buffers.
+  late final DepthRaster _raster;
+
+  // The view's pixelDepthSlope, for slope-scaled depth offsets.
+  late final double _pixelSlope;
+
+  // The view's pixelWorldScale, for the depth gap debug view.
+  late final double _pixelScale;
+
+  // Whether this encodes a screen view's camera, for [MeshDrawSelector]s.
+  final bool _primaryView;
   final ui.Size _dimensions;
   final Lighting _lighting;
   final int _layerMask;
+  // The frame's surface debug view state, or null when none is active.
+  final DebugViewFrame? _debugView;
+  // The DebugViewInfo block for one draw, and the shared block that turns
+  // the view off, emplaced once per encoder on first use.
+  final Float32List _debugViewScratch = Float32List(DebugViewFrame.floatCount);
+  gpu.BufferView? _debugViewInactive;
+  // Which material the inactive block is bound for, so a run of draws with
+  // one material binds it once.
+  Material? _debugViewBoundMaterial;
+  bool _debugViewBoundFallback = false;
+  static final gpu.Shader _debugFallbackShader =
+      baseShaderLibrary['DebugSurfaceFragment']!;
+  static final gpu.Shader _coverageShader =
+      baseShaderLibrary['CoverageFragment']!;
+
+  // Whether an opaque draw of [material] at cross-fade coverage [fade] cuts
+  // itself out, and so takes the coverage pre-draw.
+  static bool _cutsOut(Material material, double fade) =>
+      material.depthAlphaMasked || (fade != 1.0 && material.lodCrossFades);
+
+  // MaskInfo for a cross-fade without an alpha mask: a cutoff no alpha falls
+  // below, over the white placeholder.
+  static final ByteData _noMaskInfo = ByteData.sublistView(
+    Float32List(12)
+      ..[0] = -1.0
+      ..[1] = 1.0
+      ..[6] = 1.0
+      ..[7] = 1.0
+      ..[8] = 1.0,
+  );
+  static final Float32List _coverageInfoScratch = Float32List(4);
+  static final ByteData _coverageInfoBytes = ByteData.sublistView(
+    _coverageInfoScratch,
+  );
+  static final gpu.SamplerOptions _coverageMaskSampler = gpu.SamplerOptions();
+
+  // Stencil for the coverage pre-draw (mark what it keeps), its color draw
+  // (shade only marked pixels and clear them), and every other draw. A color
+  // fragment failing the equal depth test keeps the mark, which belongs to
+  // the run's nearest surface there and is cleared when that surface shades.
+  static final gpu.StencilConfig _markCoverage = gpu.StencilConfig(
+    depthStencilPassOperation: gpu.StencilOperation.setToReferenceValue,
+  );
+  static final gpu.StencilConfig _testCoverage = gpu.StencilConfig(
+    compareFunction: gpu.CompareFunction.equal,
+    depthStencilPassOperation: gpu.StencilOperation.zero,
+  );
+  static final gpu.StencilConfig _noStencil = gpu.StencilConfig();
+
+  // Whether the opaque flush is encoding a run's coverage pre-draw.
+  bool _coveragePass = false;
   final List<Plane> _cullingPlanes;
   final bool _cullInstances;
   // Not final because opaque and translucent draws can use separate passes.
   gpu.RenderPass _renderPass;
   final TransientWriter _transientsBuffer;
+  // The view-projection draws rasterize with (see DepthRaster); culling uses
+  // [frustum], built from the standard mapping.
   late final Matrix4 _cameraTransform;
-  // The camera's vertical field of view in radians, or null for a
-  // non-perspective camera (which disables screen-size LOD).
-  late final double? _lodFovRadiansY;
+
+  // The transform the display-referred layer draws with, when it differs from
+  // the scene's. Under TAA the scene is jittered and resolved temporally, but
+  // this layer composites after that resolve, so drawing it jittered would
+  // shake it by the jitter every frame.
+  late final Matrix4? _displayReferredCameraTransform;
+
+  // Swapped in for the display-referred flush; null everywhere else. Only the
+  // draw transform changes, not culling or screen bounds, which stay on the
+  // scene's own frustum.
+  Matrix4? _drawTransformOverride;
+
+  Matrix4 get _drawCameraTransform =>
+      _drawTransformOverride ?? _cameraTransform;
+  // The projection terms for screen-size LOD, or null for a degenerate
+  // projection (which disables it).
+  late final ProjectionParams? _lodProjection;
   final List<_OpaqueRecord> _opaqueRecords = [];
   final List<_TranslucentRecord> _translucentRecords = [];
+  final List<_TranslucentRecord> _displayReferredRecords = [];
   static final List<_OpaqueRecord> _opaqueRecordPool = [];
   static final List<_TranslucentRecord> _translucentRecordPool = [];
   // Refilled per batch group and consumed synchronously by
@@ -562,15 +879,21 @@ base class SceneEncoder {
   /// the start of this frame. Used by [submit] for per-item culling.
   late final Frustum frustum;
 
+  /// The view-projection this encoder draws with.
+  @internal
+  Matrix4 get cameraTransform => _cameraTransform;
+
   // The pipeline currently bound on the render pass, or null before the
   // first bind. `clearBindings` does not clear the pipeline, so a draw
   // that reuses it can skip the rebind. Opaque draws are pipeline-sorted,
   // so reuse runs are common.
   gpu.RenderPipeline? _boundPipeline;
   Material? _boundMaterial;
+  bool _boundMaterialFallback = false;
   gpu.Shader? _boundMaterialVertex;
   gpu.Shader? _boundFrameInfoShader;
   double _boundFrameInfoDepthBias = double.nan;
+  int _boundFrameInfoDepthKey = -1;
   double _boundMaterialFade = double.nan;
   int _boundMaterialLightOffset = -1;
   int _boundMaterialLightCount = -1;
@@ -579,6 +902,7 @@ base class SceneEncoder {
   gpu.PrimitiveType? _boundPrimitiveType;
   int _encodedDraws = 0;
   int _encodedInstances = 0;
+  DrawPhase _phase = DrawPhase.opaque;
 
   /// Queues a draw call for [item], unless it is hidden or frustum
   /// culled.
@@ -587,10 +911,19 @@ base class SceneEncoder {
   /// emits them. A translucent instanced item is queued as one draw per
   /// instance so each can be depth-sorted independently.
   void submit(RenderItem item) {
+    activeRenderCounters.submitted++;
     if (!item.drawsColor) return;
-    if ((item.layers & _layerMask) == 0) return;
+    if ((item.layers & _layerMask) == 0) {
+      activeRenderCounters.layerMasked++;
+      activeDrawRecorder?.onSkip(item, DrawSkipReason.layerMasked);
+      return;
+    }
     if (_cullInstances) {
-      if (!item.cullVisibleInstances(frustum, _cullingPlanes)) return;
+      if (!item.cullVisibleInstances(frustum, _cullingPlanes)) {
+        activeRenderCounters.culled++;
+        activeDrawRecorder?.onSkip(item, DrawSkipReason.frustumCulled);
+        return;
+      }
     } else {
       item.visibleInstanceIndices = null;
     }
@@ -603,7 +936,11 @@ base class SceneEncoder {
     // Queue the level(s) of detail to draw (or cull). A cross-fading node
     // returns its two adjacent levels with complementary dither coverage.
     if (lod != null) {
-      for (final selection in _resolveLod(lod, worldBounds)) {
+      final selections = _resolveLod(lod, worldBounds);
+      if (selections.isEmpty) {
+        activeDrawRecorder?.onSkip(item, DrawSkipReason.lodCulled);
+      }
+      for (final selection in selections) {
         final level = lod.levels[selection.level];
         _record(item, level.geometry, level.material, selection.fade);
       }
@@ -622,23 +959,73 @@ base class SceneEncoder {
   ) {
     // A material with a `vertex { }` block supplies its own vertex shader for
     // this geometry's mesh type; otherwise the engine's standard one is used.
-    final pipeline = tryResolvePipeline(
-      material.materialVertexShader(geometry.materialVertexVariant) ??
-          geometry.vertexShader,
-      material.fragmentShaderForLighting(_lighting),
-      // A material declaring `instance_attributes` widens the instance-rate
-      // slot, so the pipeline depends on the material as well as the geometry.
-      vertexLayout: geometry.instancedVertexLayoutFor(
-        material.instanceAttributes,
-      ),
-      debugContext: () =>
-          '${fmatSourcePathOf(material) ?? material.runtimeType} on '
-          '${geometry.runtimeType}'
-          '${geometry.hasCustomAttributes ? ' with custom vertex attributes' : ''}',
+    // A material that cannot show the active debug view draws through the
+    // engine's fallback debug fragment shader instead of its own.
+    final fallback = _usesDebugFallback(item, material, geometry);
+    final materialVertex = material.materialVertexShader(
+      geometry.materialVertexVariant,
     );
-    if (pipeline == null) return;
+    final vertexShader = materialVertex ?? geometry.vertexShader;
+    final fragmentShader = fallback
+        ? _debugFallbackShader
+        : material.fragmentShaderForLighting(_lighting);
+    // A material declaring `instance_attributes` widens the instance-rate
+    // slot, and its custom vertex `attributes` pick the geometry streams, so
+    // the pipeline depends on the material as well as the geometry.
+    final vertexLayout = geometry.instancedVertexLayoutFor(
+      material.instanceAttributes,
+      material.vertexAttributesFor(materialVertex),
+    );
+    final pipeline =
+        cachedRenderPipeline(vertexShader, fragmentShader, vertexLayout) ??
+        _resolveRecordPipeline(
+          vertexShader,
+          fragmentShader,
+          vertexLayout,
+          material,
+          geometry,
+        );
+    if (pipeline == null) {
+      activeRenderCounters.pipelineRejected++;
+      activeDrawRecorder?.onSkip(item, DrawSkipReason.pipelineRejected);
+      return;
+    }
+
+    // Display-referred surfaces draw past the tone curve into their own
+    // layer, so they leave both scene buckets. They are depth-sorted like
+    // translucency and share its record shape.
+    if (material.displayReferred) {
+      _addDepthSortedRecord(
+        item,
+        geometry,
+        material,
+        fade,
+        pipeline,
+        _displayReferredRecords,
+      );
+      return;
+    }
 
     if (material.isOpaque()) {
+      gpu.RenderPipeline? coveragePipeline;
+      if (!fallback && _cutsOut(material, fade)) {
+        coveragePipeline = tryResolvePipeline(
+          materialVertex ?? geometry.vertexShader,
+          _coverageShader,
+          vertexLayout: geometry.instancedVertexLayoutFor(
+            material.instanceAttributes,
+            material.vertexAttributesFor(materialVertex),
+          ),
+          debugContext: () =>
+              'coverage pre-draw for '
+              '${fmatSourcePathOf(material) ?? material.runtimeType}',
+        );
+        if (coveragePipeline == null) {
+          activeRenderCounters.pipelineRejected++;
+          activeDrawRecorder?.onSkip(item, DrawSkipReason.pipelineRejected);
+          return;
+        }
+      }
       _opaqueRecords.add(
         _obtainOpaqueRecord(
           item,
@@ -646,20 +1033,57 @@ base class SceneEncoder {
           material,
           fade,
           pipeline,
+          coveragePipeline,
           identityHashCode(pipeline),
-          _depthOf(item.worldTransform, geometry),
           item.windingFor(geometry),
         ),
       );
       return;
     }
 
-    // Keep instanced translucency in one record. The instances are sorted
-    // back to front while their transform buffer is packed at draw time.
+    _addDepthSortedRecord(
+      item,
+      geometry,
+      material,
+      fade,
+      pipeline,
+      _translucentRecords,
+    );
+  }
+
+  // The pipeline-cache miss path of [_record]. Its debug closure lives here
+  // so the per-draw path does not allocate a capture context.
+  gpu.RenderPipeline? _resolveRecordPipeline(
+    gpu.Shader vertexShader,
+    gpu.Shader fragmentShader,
+    VertexLayoutDescriptor? vertexLayout,
+    Material material,
+    Geometry geometry,
+  ) => tryResolvePipeline(
+    vertexShader,
+    fragmentShader,
+    vertexLayout: vertexLayout,
+    debugContext: () =>
+        '${fmatSourcePathOf(material) ?? material.runtimeType} on '
+        '${geometry.runtimeType}'
+        '${geometry.hasCustomAttributes ? ' with custom vertex attributes' : ''}',
+  );
+
+  // Appends one back-to-front record to [target]. Keeps instanced draws in a
+  // single record; their instances are sorted while the transform buffer is
+  // packed at draw time.
+  void _addDepthSortedRecord(
+    RenderItem item,
+    Geometry geometry,
+    Material material,
+    double fade,
+    gpu.RenderPipeline pipeline,
+    List<_TranslucentRecord> target,
+  ) {
     final instances = item.instanceTransforms;
     if (instances != null) {
       final bounds = item.worldBounds;
-      _translucentRecords.add(
+      target.add(
         _obtainTranslucentRecord(
           item,
           item.worldTransform,
@@ -682,7 +1106,7 @@ base class SceneEncoder {
         ),
       );
     } else {
-      _translucentRecords.add(
+      target.add(
         _obtainTranslucentRecord(
           item,
           item.worldTransform,
@@ -707,8 +1131,8 @@ base class SceneEncoder {
     Material material,
     double fade,
     gpu.RenderPipeline pipeline,
+    gpu.RenderPipeline? coveragePipeline,
     int pipelineKey,
-    double depth,
     bool windingFlipped,
   ) {
     if (_opaqueRecordPool.isEmpty) {
@@ -718,8 +1142,8 @@ base class SceneEncoder {
         material,
         fade,
         pipeline,
+        coveragePipeline,
         pipelineKey,
-        depth,
         windingFlipped,
       );
     }
@@ -729,8 +1153,8 @@ base class SceneEncoder {
       material,
       fade,
       pipeline,
+      coveragePipeline,
       pipelineKey,
-      depth,
       windingFlipped,
     );
   }
@@ -783,25 +1207,30 @@ base class SceneEncoder {
 
   // The level(s) of detail to draw for [lod] from the item's [worldBounds],
   // each with a fade coverage; empty to cull. Falls back to the highest detail
-  // when no screen-size metric is available (no bounds, or a non-perspective
-  // camera).
+  // when no screen-size metric is available (no bounds, or a degenerate
+  // projection).
   List<({int level, double fade})> _resolveLod(
     LodSelection lod,
     Aabb3? worldBounds,
   ) {
-    final fovRadiansY = _lodFovRadiansY;
-    if (worldBounds == null || fovRadiansY == null) {
+    final projection = _lodProjection;
+    if (worldBounds == null || projection == null) {
       return const [(level: 0, fade: 1.0)];
     }
     // The circumscribed sphere of the world AABB (conservative, so detail is
     // kept slightly longer than a tight sphere would).
     final radius = worldBounds.max.distanceTo(worldBounds.min) * 0.5;
-    final size = lodScreenSize(
-      center: worldBounds.center,
-      radius: radius,
-      cameraPosition: _camera.position,
-      fovRadiansY: fovRadiansY,
-    );
+    final size = projection.orthographic
+        ? lodScreenSizeOrthographic(
+            radius: radius,
+            halfHeight: projection.scaleY,
+          )
+        : lodScreenSize(
+            center: worldBounds.center,
+            radius: radius,
+            cameraPosition: _cameraPosition,
+            fovRadiansY: 2.0 * math.atan(projection.scaleY),
+          );
     return lod.resolve(size);
   }
 
@@ -809,14 +1238,20 @@ base class SceneEncoder {
     return sceneSortDepth(
       worldTransform,
       geometry?.localBounds,
-      _camera.position,
-      _camera.forward,
+      _cameraPosition,
+      _cameraForward,
     );
   }
 
+  double _opaqueDepth(_OpaqueRecord record) {
+    final cached = record.depth;
+    if (!cached.isNaN) return cached;
+    return record.depth = _depthOf(record.item.worldTransform, record.geometry);
+  }
+
   double _depthOfPoint(double x, double y, double z) {
-    final position = _camera.position;
-    final forward = _camera.forward;
+    final position = _cameraPosition;
+    final forward = _cameraForward;
     return (x - position.x) * forward.x +
         (y - position.y) * forward.y +
         (z - position.z) * forward.z;
@@ -827,6 +1262,7 @@ base class SceneEncoder {
   // pipeline only need to bind it once.
   void _bindPipeline(gpu.RenderPipeline pipeline) {
     if (identical(_boundPipeline, pipeline)) return;
+    activeRenderCounters.pipelineBinds++;
     _renderPass.bindPipeline(pipeline);
     _boundPipeline = pipeline;
   }
@@ -839,9 +1275,11 @@ base class SceneEncoder {
     _renderPass.clearBindings();
     EngineLightingUniforms.invalidateBindMemo();
     _boundMaterial = null;
+    _debugViewBoundMaterial = null;
     _boundMaterialVertex = null;
     _boundFrameInfoShader = null;
     _boundFrameInfoDepthBias = double.nan;
+    _boundFrameInfoDepthKey = -1;
     _boundMaterialFade = double.nan;
     _boundMaterialLightOffset = -1;
     _boundMaterialLightCount = -1;
@@ -850,34 +1288,232 @@ base class SceneEncoder {
     _boundPrimitiveType = null;
   }
 
+  // The debug view [item] shows this frame: its node override when one is
+  // set, else the scene view, else none.
+  DebugView _effectiveDebugView(RenderItem? item) {
+    final frame = _debugView;
+    if (frame == null) return DebugView.none;
+    return frame.effectiveView(item?.debugView);
+  }
+
+  // Whether [material] draws through the engine's fallback debug shader for
+  // [item]: a view is active for it, the material cannot show views itself,
+  // and the geometry writes the standard varyings the fallback reads.
+  bool _usesDebugFallback(
+    RenderItem? item,
+    Material material,
+    Geometry geometry,
+  ) {
+    if (_debugView == null) return false;
+    if (!_effectiveDebugView(item).isActive ||
+        material.drawsDebugViews(_lighting)) {
+      return false;
+    }
+    if (material.participatesInDebugViews) _warnDebugViewsCompiledOut();
+    // A split against the lit image keeps the material's own draw, and the
+    // view side draws again through the fallback (see _litSplitViewPipeline).
+    if (_debugView.splitsAgainstLit) return false;
+    return geometry.emitsStandardVaryings;
+  }
+
+  // The fallback pipeline for the view side of a split against the lit
+  // image, when [material] cannot draw the view itself, or null. The draw
+  // functions then draw twice, the material's own pipeline left of the split
+  // and this one right of it. The cut-out pre-draw writes coverage, not
+  // color, so it draws once.
+  gpu.RenderPipeline? _litSplitViewPipeline(
+    RenderItem? item,
+    Material material,
+    Geometry geometry,
+  ) {
+    final frame = _debugView;
+    if (frame == null || _coveragePass || !frame.splitsAgainstLit) return null;
+    if (!_effectiveDebugView(item).isActive ||
+        material.drawsDebugViews(_lighting) ||
+        !geometry.emitsStandardVaryings) {
+      return null;
+    }
+    final materialVertex = material.materialVertexShader(
+      geometry.materialVertexVariant,
+    );
+    return tryResolvePipeline(
+      materialVertex ?? geometry.vertexShader,
+      _debugFallbackShader,
+      vertexLayout: geometry.instancedVertexLayoutFor(
+        material.instanceAttributes,
+        material.vertexAttributesFor(materialVertex),
+      ),
+      debugContext: () =>
+          'debug view fallback for '
+          '${fmatSourcePathOf(material) ?? material.runtimeType}',
+    );
+  }
+
+  // The first pixel column right of the split. A pixel shows the view when
+  // its center is at or right of the split, as in material_debug.glsl.
+  int get _splitColumn => (_debugView!.splitPixels - 0.5).ceil().clamp(
+    0,
+    _dimensions.width.toInt(),
+  );
+
+  void _scissorLitSide() => _renderPass.setScissor(
+    gpu.Scissor(width: _splitColumn, height: _dimensions.height.toInt()),
+  );
+
+  void _scissorViewSide() {
+    final width = _dimensions.width.toInt();
+    _renderPass.setScissor(
+      gpu.Scissor(
+        x: _splitColumn,
+        width: width - _splitColumn,
+        height: _dimensions.height.toInt(),
+      ),
+    );
+  }
+
+  void _scissorFullTarget() => _renderPass.setScissor(
+    gpu.Scissor(
+      width: _dimensions.width.toInt(),
+      height: _dimensions.height.toInt(),
+    ),
+  );
+
+  static bool _warnedDebugViewsCompiledOut = false;
+
+  // A material that would show a view itself was built without the views.
+  static void _warnDebugViewsCompiledOut() {
+    if (_warnedDebugViewsCompiledOut) return;
+    _warnedDebugViewsCompiledOut = true;
+    debugPrint(
+      'flutter_scene: surface debug views are compiled out of this build, so '
+      'materials show only the geometry and identity channels. Set '
+      "flutter_scene's debug_views hook user-define in the app's pubspec to "
+      "compile them in, plus flutter_scene_debug_views under the app's own "
+      'name if its hook builds materials or engine assets:\n'
+      '  hooks:\n'
+      '    user_defines:\n'
+      '      flutter_scene:\n'
+      '        debug_views: true',
+    );
+  }
+
+  // Binds the DebugViewInfo block for the draw about to be recorded. Every
+  // participating shader declares it, so it is bound even when no view is
+  // active (once per material run, the shared off block); an active view
+  // binds per draw, since the identity seeds are per item.
+  void _bindDebugView(Material material, RenderItem? item, bool fallback) {
+    if (_coveragePass) return;
+    if (!fallback && !material.drawsDebugViews(_lighting)) return;
+    final shader = fallback
+        ? _debugFallbackShader
+        : material.fragmentShaderForLighting(_lighting);
+    if (fallback) {
+      // The fallback replaces the material's own shader, so its bind never
+      // supplied the view block the debug hook reads.
+      EngineLightingUniforms.bindViewInfo(
+        _renderPass,
+        shader,
+        _transientsBuffer,
+        _lighting,
+      );
+    }
+    final slot = shader.cachedUniformSlot('DebugViewInfo');
+    final view = _effectiveDebugView(item);
+    if (!view.isActive) {
+      if (identical(_debugViewBoundMaterial, material) &&
+          _debugViewBoundFallback == fallback) {
+        return;
+      }
+      _renderPass.bindUniform(
+        slot,
+        _debugViewInactive ??= _transientsBuffer.emplace(
+          ByteData.sublistView(DebugViewFrame.inactive),
+        ),
+      );
+      _debugViewBoundMaterial = material;
+      _debugViewBoundFallback = fallback;
+      return;
+    }
+    _debugView!.pack(
+      _debugViewScratch,
+      view,
+      objectSeed: item == null ? 0 : identityHashCode(item.sourceNode ?? item),
+      materialSeed: identityHashCode(material),
+      raster: _raster,
+      pixelScale: _pixelScale,
+    );
+    _renderPass.bindUniform(
+      slot,
+      _transientsBuffer.emplace(scratchBytesOf(_debugViewScratch)),
+    );
+    // A per-draw block; the next draw with this material must rebind.
+    _debugViewBoundMaterial = null;
+  }
+
   void _bindMaterial(
     Material material,
     gpu.Shader? materialVertex,
-    double fade,
-  ) {
+    double fade, {
+    bool fallback = false,
+  }) {
     final lightOffset = material.lightListOffset;
     final lightCount = material.lightListCount;
     final lightChannelMask = material.lightChannelMask;
     if (identical(_boundMaterial, material) &&
         identical(_boundMaterialVertex, materialVertex) &&
+        _boundMaterialFallback == fallback &&
         _boundMaterialFade == fade &&
         _boundMaterialLightOffset == lightOffset &&
         _boundMaterialLightCount == lightCount &&
         _boundMaterialLightChannelMask == lightChannelMask) {
       return;
     }
-    material.lodFade = fade;
-    material.bind(_renderPass, _transientsBuffer, _lighting);
+    if (_coveragePass || fallback) {
+      // The coverage pre-draw and the fallback debug shader have none of the
+      // material's fragment slots; only the pass state and the vertex stage
+      // are the material's.
+      _renderPass.setCullMode(material.renderCullMode);
+      _renderPass.setWindingOrder(gpu.WindingOrder.clockwise);
+      if (_coveragePass) _bindCoverage(material, fade);
+    } else {
+      material.lodFade = fade;
+      material.bind(_renderPass, _transientsBuffer, _lighting);
+    }
     _boundWindingOrder = null;
     if (materialVertex != null) {
       material.bindVertexStage(_renderPass, materialVertex, _transientsBuffer);
     }
+    _boundMaterialFallback = fallback;
     _boundMaterial = material;
     _boundMaterialVertex = materialVertex;
     _boundMaterialFade = fade;
     _boundMaterialLightOffset = lightOffset;
     _boundMaterialLightCount = lightCount;
     _boundMaterialLightChannelMask = lightChannelMask;
+  }
+
+  // Binds the coverage pre-draw's fragment inputs: the cross-fade [fade] and
+  // the material's alpha mask, or a mask that keeps everything.
+  void _bindCoverage(Material material, double fade) {
+    final shader = _coverageShader;
+    _coverageInfoScratch[0] = fade;
+    _renderPass.bindUniform(
+      shader.getUniformSlot('CoverageInfo'),
+      _transientsBuffer.emplace(_coverageInfoBytes),
+    );
+    if (material.depthAlphaMasked) {
+      material.bindDepthAlphaMask(_renderPass, shader, _transientsBuffer);
+      return;
+    }
+    _renderPass.bindUniform(
+      shader.getUniformSlot('MaskInfo'),
+      _transientsBuffer.emplace(_noMaskInfo),
+    );
+    _renderPass.bindTexture(
+      shader.getUniformSlot('mask_texture'),
+      Material.whitePlaceholder(null),
+      sampler: _coverageMaskSampler,
+    );
   }
 
   void _setWindingOrder(gpu.WindingOrder windingOrder) {
@@ -895,36 +1531,60 @@ base class SceneEncoder {
   void _bindGeometry(
     Geometry geometry,
     Matrix4 worldTransform,
+    Material material,
     gpu.Shader? materialVertex,
-    double depthBias,
   ) {
-    if (geometry is UnskinnedGeometry) {
+    final depthBias = material.depthBias;
+    final depthKey = _depthOffsetKey(material);
+    setCurrentDrawDepthOffset(
+      _raster,
+      material.depthLayer,
+      material.tieBreakRank,
+      pixelSlope: _pixelSlope,
+    );
+    geometry.useVertexAttributes(material.vertexAttributesFor(materialVertex));
+    // Morphed geometry takes the full bind, which also binds its morph stage.
+    if (geometry is UnskinnedGeometry && geometry.morphTargets == null) {
       geometry.bindGeometryBuffers(_renderPass);
       final shader = materialVertex ?? geometry.vertexShader;
       if (!identical(_boundFrameInfoShader, shader) ||
-          _boundFrameInfoDepthBias != depthBias) {
+          _boundFrameInfoDepthBias != depthBias ||
+          _boundFrameInfoDepthKey != depthKey) {
         bindUnskinnedFrameInfo(
           _renderPass,
           _transientsBuffer,
           shader,
-          _cameraTransform,
-          _camera.position,
+          _drawCameraTransform,
+          _cameraPosition,
           depthBias: depthBias,
         );
         _boundFrameInfoShader = shader;
         _boundFrameInfoDepthBias = depthBias;
+        _boundFrameInfoDepthKey = depthKey;
       }
     } else {
       geometry.bind(
         _renderPass,
         _transientsBuffer,
         worldTransform,
-        _cameraTransform,
-        _camera.position,
+        _drawCameraTransform,
+        _cameraPosition,
         shaderOverride: materialVertex,
         depthBias: depthBias,
       );
+      // The full bind rebinds FrameInfo, possibly on the cached shader.
+      _boundFrameInfoShader = null;
+      _boundFrameInfoDepthBias = double.nan;
+      _boundFrameInfoDepthKey = -1;
     }
+  }
+
+  // Identifies the depth offset [material] draws with under [_raster]: its
+  // layer, plus its tie-break rank when the tie-break applies to it.
+  int _depthOffsetKey(Material material) {
+    final layer = material.depthLayer;
+    final rank = _raster.tieBreak && layer == 0 ? material.tieBreakRank : 0;
+    return (layer + kMaxDepthLayer) * 4 + rank;
   }
 
   void _bindPackedInstances(Float32List packed, int slot) {
@@ -937,12 +1597,52 @@ base class SceneEncoder {
     }
   }
 
-  void _drawGeometry(Geometry geometry, {int instanceCount = 1}) {
+  void _drawGeometry(
+    Geometry geometry,
+    Material material, {
+    int instanceCount = 1,
+  }) {
     if (profileRendering) {
       _encodedDraws++;
       _encodedInstances += instanceCount;
     }
-    geometry.draw(_renderPass, instanceCount: instanceCount);
+    drawOrRejectPipeline(
+      _renderPass,
+      geometry,
+      _boundPipeline,
+      instanceCount: instanceCount,
+      material: material,
+    );
+  }
+
+  // Tells the capture recorder what the next draws are, at the cost of one
+  // null check per encode in steady state.
+  void _describeDraw(
+    RenderItem item,
+    Geometry geometry,
+    Material material,
+    gpu.Shader? materialVertex,
+    gpu.RenderPipeline pipeline, {
+    int batchedItems = 1,
+    BatchBreakReason batchBreak = BatchBreakReason.none,
+  }) {
+    final recorder = activeDrawRecorder;
+    if (recorder == null) return;
+    recorder.setContext(
+      DrawContext(
+        phase: _phase,
+        item: item,
+        geometry: geometry,
+        material: material,
+        vertexShader: materialVertex ?? geometry.vertexShader,
+        fragmentShader: _coveragePass
+            ? _coverageShader
+            : material.fragmentShaderForLighting(_lighting),
+        pipeline: pipeline,
+        batchedItems: batchedItems,
+        batchBreak: batchBreak,
+      ),
+    );
   }
 
   void _encode(
@@ -951,8 +1651,83 @@ base class SceneEncoder {
     Geometry geometry,
     Material material,
     bool windingFlipped,
-    double fade,
-  ) {
+    double fade, {
+    RenderItem? item,
+    BatchBreakReason batchBreak = BatchBreakReason.none,
+  }) {
+    if (item == null) {
+      _encodeSingle(
+        pipeline,
+        worldTransform,
+        geometry,
+        material,
+        windingFlipped,
+        fade,
+        batchBreak: batchBreak,
+      );
+      return;
+    }
+    final selection = beginMeshDraw(
+      item,
+      geometry,
+      MeshDrawPass.color,
+      _cameraPosition,
+      _primaryView,
+    );
+    try {
+      if (selection.instanceCount == 0) return;
+      _encodeSingle(
+        pipeline,
+        worldTransform,
+        geometry,
+        material,
+        windingFlipped,
+        fade,
+        item: item,
+        batchBreak: batchBreak,
+      );
+    } finally {
+      endMeshDraw(geometry);
+    }
+  }
+
+  void _encodeSingle(
+    gpu.RenderPipeline pipeline,
+    Matrix4 worldTransform,
+    Geometry geometry,
+    Material material,
+    bool windingFlipped,
+    double fade, {
+    RenderItem? item,
+    BatchBreakReason batchBreak = BatchBreakReason.none,
+    bool? debugFallback,
+  }) {
+    final viewSide = debugFallback == null
+        ? _litSplitViewPipeline(item, material, geometry)
+        : null;
+    if (viewSide != null) {
+      for (final (side, sidePipeline) in [
+        (false, pipeline),
+        (true, viewSide),
+      ]) {
+        side ? _scissorViewSide() : _scissorLitSide();
+        _encodeSingle(
+          sidePipeline,
+          worldTransform,
+          geometry,
+          material,
+          windingFlipped,
+          fade,
+          item: item,
+          batchBreak: batchBreak,
+          debugFallback: side,
+        );
+      }
+      _scissorFullTarget();
+      return;
+    }
+    final fallback =
+        debugFallback ?? _usesDebugFallback(item, material, geometry);
     // Bindings persist across draws within a pass, and every draw binds its
     // full slot set, so clearing is only needed when the pipeline (and with
     // it the shaders' slot layouts) changes; a stale entry from a different
@@ -972,7 +1747,17 @@ base class SceneEncoder {
     final materialVertex = material.materialVertexShader(
       geometry.materialVertexVariant,
     );
-    _bindGeometry(geometry, worldTransform, materialVertex, material.depthBias);
+    if (item != null) {
+      _describeDraw(
+        item,
+        geometry,
+        material,
+        materialVertex,
+        pipeline,
+        batchBreak: batchBreak,
+      );
+    }
+    _bindGeometry(geometry, worldTransform, material, materialVertex);
     if (geometry.bindsModelTransformInstance) {
       // The model matrix arrives through the instance-rate vertex buffer,
       // bound to the slot after the geometry's vertex streams.
@@ -985,7 +1770,8 @@ base class SceneEncoder {
         attributeFloats: material.instanceAttributes?.floatCount ?? 0,
       );
     }
-    _bindMaterial(material, materialVertex, fade);
+    _bindMaterial(material, materialVertex, fade, fallback: fallback);
+    _bindDebugView(material, item, fallback);
     // A mirrored transform reverses triangle winding. Set both cases because
     // a cached material bind no longer resets it between compatible draws.
     _setWindingOrder(
@@ -994,7 +1780,7 @@ base class SceneEncoder {
           : gpu.WindingOrder.clockwise,
     );
     _setPrimitiveType(geometry.primitiveType);
-    _drawGeometry(geometry);
+    _drawGeometry(geometry, material);
   }
 
   /// Draws an opaque instanced item with hardware instancing: the instance
@@ -1021,6 +1807,100 @@ base class SceneEncoder {
     Uint8List? packedWorldWindingFlipped,
     Float32List? attributeData,
     int attributeFloats = 0,
+    RenderItem? item,
+    BatchBreakReason batchBreak = BatchBreakReason.none,
+    bool? debugFallback,
+  }) {
+    final viewSide = debugFallback == null
+        ? _litSplitViewPipeline(item, material, geometry)
+        : null;
+    if (viewSide != null) {
+      for (final (side, sidePipeline) in [
+        (false, pipeline),
+        (true, viewSide),
+      ]) {
+        side ? _scissorViewSide() : _scissorLitSide();
+        _encodeInstanced(
+          sidePipeline,
+          nodeTransform,
+          geometry,
+          material,
+          instances,
+          colors,
+          windingFlipped,
+          fade,
+          instanceWindingFlipped: instanceWindingFlipped,
+          instanceIndices: instanceIndices,
+          sortBackToFrontFrom: sortBackToFrontFrom,
+          packedWorldData: packedWorldData,
+          packedWorldWindingFlipped: packedWorldWindingFlipped,
+          attributeData: attributeData,
+          attributeFloats: attributeFloats,
+          item: item,
+          batchBreak: batchBreak,
+          debugFallback: side,
+        );
+      }
+      _scissorFullTarget();
+      return;
+    }
+    final selection = item == null
+        ? MeshDrawSelection.all
+        : beginMeshDraw(
+            item,
+            geometry,
+            MeshDrawPass.color,
+            _cameraPosition,
+            _primaryView,
+          );
+    try {
+      if (selection.instanceCount == 0) return;
+      _encodeInstancedBody(
+        pipeline,
+        nodeTransform,
+        geometry,
+        material,
+        instances,
+        colors,
+        windingFlipped,
+        fade,
+        instanceWindingFlipped: instanceWindingFlipped,
+        instanceIndices: instanceIndices,
+        sortBackToFrontFrom: sortBackToFrontFrom,
+        packedWorldData: packedWorldData,
+        packedWorldWindingFlipped: packedWorldWindingFlipped,
+        attributeData: attributeData,
+        attributeFloats: attributeFloats,
+        item: item,
+        batchBreak: batchBreak,
+        instanceLimit: selection.instanceCount,
+        debugFallback: debugFallback,
+      );
+    } finally {
+      endMeshDraw(geometry);
+    }
+  }
+
+  void _encodeInstancedBody(
+    gpu.RenderPipeline pipeline,
+    Matrix4 nodeTransform,
+    Geometry geometry,
+    Material material,
+    List<Matrix4> instances,
+    List<Vector4> colors,
+    bool windingFlipped,
+    double fade, {
+    List<bool>? instanceWindingFlipped,
+    List<int>? instanceIndices,
+    Vector3? sortBackToFrontFrom,
+    Float32List? packedWorldData,
+    Uint8List? packedWorldWindingFlipped,
+    Float32List? attributeData,
+    int attributeFloats = 0,
+    RenderItem? item,
+    BatchBreakReason batchBreak = BatchBreakReason.none,
+    int? instanceLimit,
+    bool? debugFallback,
   }) {
     checkInstanceRecordWidth(material.instanceAttributes, attributeFloats);
     if (!identical(_boundPipeline, pipeline)) {
@@ -1030,9 +1910,28 @@ base class SceneEncoder {
     final materialVertex = material.materialVertexShader(
       geometry.materialVertexVariant,
     );
-    _bindMaterial(material, materialVertex, fade);
+    if (item != null) {
+      _describeDraw(
+        item,
+        geometry,
+        material,
+        materialVertex,
+        pipeline,
+        batchBreak: batchBreak,
+      );
+    }
+    final fallback =
+        debugFallback ?? _usesDebugFallback(item, material, geometry);
+    _bindMaterial(material, materialVertex, fade, fallback: fallback);
+    _bindDebugView(material, item, fallback);
     _setPrimitiveType(geometry.primitiveType);
 
+    final allInstances = instanceIndices == null;
+    instanceIndices = limitInstanceIndices(
+      instanceIndices,
+      instances.length,
+      instanceLimit,
+    );
     if (geometry.instancedVertexLayout == null) {
       final count = instanceIndices?.length ?? instances.length;
       for (var slot = 0; slot < count; slot++) {
@@ -1041,20 +1940,44 @@ base class SceneEncoder {
         _bindGeometry(
           geometry,
           nodeTransform * instanceTransform,
+          material,
           materialVertex,
-          material.depthBias,
         );
         // Each instance can itself mirror; combine with the node's parity.
         final flip = windingFlipped != (instanceTransform.determinant() < 0);
         _setWindingOrder(
           flip ? gpu.WindingOrder.counterClockwise : gpu.WindingOrder.clockwise,
         );
-        _drawGeometry(geometry);
+        _drawGeometry(geometry, material);
       }
       return;
     }
 
-    _bindGeometry(geometry, nodeTransform, materialVertex, material.depthBias);
+    _bindGeometry(geometry, nodeTransform, material, materialVertex);
+    if (sortBackToFrontFrom == null &&
+        allInstances &&
+        packedWorldData != null &&
+        packedWorldWindingFlipped != null) {
+      final flipped = bindRetainedInstanceData(
+        _renderPass,
+        packedWorldData,
+        packedWorldWindingFlipped,
+        slot: geometry.vertexStreamCount,
+      );
+      if (flipped != null) {
+        _setWindingOrder(
+          flipped
+              ? gpu.WindingOrder.counterClockwise
+              : gpu.WindingOrder.clockwise,
+        );
+        _drawGeometry(
+          geometry,
+          material,
+          instanceCount: instanceIndices?.length ?? instances.length,
+        );
+        return;
+      }
+    }
     final packWatch = profileRendering ? (Stopwatch()..start()) : null;
     final packed =
         sortBackToFrontFrom == null &&
@@ -1091,12 +2014,12 @@ base class SceneEncoder {
     if (packed.ccwCount > 0) {
       _bindPackedInstances(packed.ccw, instanceSlot);
       _setWindingOrder(gpu.WindingOrder.clockwise);
-      _drawGeometry(geometry, instanceCount: packed.ccwCount);
+      _drawGeometry(geometry, material, instanceCount: packed.ccwCount);
     }
     if (packed.cwCount > 0) {
       _bindPackedInstances(packed.cw, instanceSlot);
       _setWindingOrder(gpu.WindingOrder.counterClockwise);
-      _drawGeometry(geometry, instanceCount: packed.cwCount);
+      _drawGeometry(geometry, material, instanceCount: packed.cwCount);
     }
   }
 
@@ -1105,11 +2028,39 @@ base class SceneEncoder {
     Geometry geometry,
     Material material,
     List<InstanceDataBatch> batches,
-    double fade,
-  ) {
+    double fade, {
+    RenderItem? item,
+    int batchedItems = 1,
+    BatchBreakReason batchBreak = BatchBreakReason.none,
+    bool? debugFallback,
+  }) {
     // Cross-node batching synthesizes instances, so a material declaring
     // per-instance attributes is kept out of it (see opaqueBatchEnd).
     assert(material.instanceAttributes == null);
+    final viewSide = debugFallback == null
+        ? _litSplitViewPipeline(item, material, geometry)
+        : null;
+    if (viewSide != null) {
+      for (final (side, sidePipeline) in [
+        (false, pipeline),
+        (true, viewSide),
+      ]) {
+        side ? _scissorViewSide() : _scissorLitSide();
+        _encodeInstancedBatches(
+          sidePipeline,
+          geometry,
+          material,
+          batches,
+          fade,
+          item: item,
+          batchedItems: batchedItems,
+          batchBreak: batchBreak,
+          debugFallback: side,
+        );
+      }
+      _scissorFullTarget();
+      return;
+    }
     if (!identical(_boundPipeline, pipeline)) {
       _clearBindings();
     }
@@ -1117,14 +2068,25 @@ base class SceneEncoder {
     final materialVertex = material.materialVertexShader(
       geometry.materialVertexVariant,
     );
-    _bindMaterial(material, materialVertex, fade);
+    if (item != null) {
+      _describeDraw(
+        item,
+        geometry,
+        material,
+        materialVertex,
+        pipeline,
+        batchedItems: batchedItems,
+        batchBreak: batchBreak,
+      );
+    }
+    final fallback =
+        debugFallback ?? _usesDebugFallback(item, material, geometry);
+    _bindMaterial(material, materialVertex, fade, fallback: fallback);
+    // TODO(debug-views): a cross-node batch carries the first item's object
+    // seed, so its members share one object color.
+    _bindDebugView(material, item, fallback);
     _setPrimitiveType(geometry.primitiveType);
-    _bindGeometry(
-      geometry,
-      _identityTransform,
-      materialVertex,
-      material.depthBias,
-    );
+    _bindGeometry(geometry, _identityTransform, material, materialVertex);
     final packWatch = profileRendering ? (Stopwatch()..start()) : null;
     final packed = packInstanceDataBatches(
       batches,
@@ -1138,12 +2100,12 @@ base class SceneEncoder {
     if (packed.ccwCount > 0) {
       _bindPackedInstances(packed.ccw, instanceSlot);
       _setWindingOrder(gpu.WindingOrder.clockwise);
-      _drawGeometry(geometry, instanceCount: packed.ccwCount);
+      _drawGeometry(geometry, material, instanceCount: packed.ccwCount);
     }
     if (packed.cwCount > 0) {
       _bindPackedInstances(packed.cw, instanceSlot);
       _setWindingOrder(gpu.WindingOrder.counterClockwise);
-      _drawGeometry(geometry, instanceCount: packed.cwCount);
+      _drawGeometry(geometry, material, instanceCount: packed.cwCount);
     }
   }
 
@@ -1151,12 +2113,12 @@ base class SceneEncoder {
 
   /// Sorts and emits every deferred draw, then finishes recording.
   ///
-  /// Opaque draws are sorted by pipeline (state-change grouping) and then
-  /// front-to-back (early-Z), and drawn first. Translucent draws are then
-  /// sorted back-to-front and drawn with premultiplied source-over
-  /// blending and depth writes disabled. After this returns the encoder
-  /// has finished recording into its render pass; the caller submits the
-  /// owning command buffer.
+  /// Opaque draws are sorted by pipeline, material, and geometry, with
+  /// front-to-back depth only as the last tie-breaker, and drawn first.
+  /// Translucent draws are then sorted back-to-front and drawn with
+  /// premultiplied source-over blending and depth writes disabled. After this
+  /// returns the encoder has finished recording into its render pass; the
+  /// caller submits the owning command buffer.
   void flush() {
     flushOpaque();
     flushTranslucent();
@@ -1165,29 +2127,37 @@ base class SceneEncoder {
   /// Emits only the opaque phase (see [flush]). Used with [flushTranslucent]
   /// when the scene pass snapshots the opaque color between them.
   void flushOpaque() {
+    _phase = DrawPhase.opaque;
+    // Froxel-lit fragments read their lights from the view's grid, so the
+    // items' own light lists neither order nor split the opaque runs.
+    final froxelLighting = _lighting.froxels != null;
     final sortWatch = profileRendering ? (Stopwatch()..start()) : null;
     _opaqueRecords.sort((a, b) {
+      final byOrder = a.item.renderOrder.compareTo(b.item.renderOrder);
+      if (byOrder != 0) return byOrder;
       final byPipeline = a.pipelineKey.compareTo(b.pipelineKey);
       if (byPipeline != 0) return byPipeline;
       final byMaterial = a.materialKey.compareTo(b.materialKey);
       if (byMaterial != 0) return byMaterial;
       final byGeometry = a.geometryKey.compareTo(b.geometryKey);
       if (byGeometry != 0) return byGeometry;
-      final byLightOffset = a.item.lightListOffset.compareTo(
-        b.item.lightListOffset,
-      );
-      if (byLightOffset != 0) return byLightOffset;
-      final byLightCount = a.item.lightListCount.compareTo(
-        b.item.lightListCount,
-      );
-      if (byLightCount != 0) return byLightCount;
+      if (!froxelLighting) {
+        final byLightOffset = a.item.lightListOffset.compareTo(
+          b.item.lightListOffset,
+        );
+        if (byLightOffset != 0) return byLightOffset;
+        final byLightCount = a.item.lightListCount.compareTo(
+          b.item.lightListCount,
+        );
+        if (byLightCount != 0) return byLightCount;
+      }
       final byChannels = a.item.lightChannelMask.compareTo(
         b.item.lightChannelMask,
       );
       if (byChannels != 0) return byChannels;
       final byFade = a.fade.compareTo(b.fade);
       if (byFade != 0) return byFade;
-      return a.depth.compareTo(b.depth);
+      return _opaqueDepth(a).compareTo(_opaqueDepth(b));
     });
     sortWatch?.stop();
     final encodeWatch = profileRendering ? (Stopwatch()..start()) : null;
@@ -1202,8 +2172,22 @@ base class SceneEncoder {
       item.applyJointsTexture(record.geometry);
       item.applyMorphWeights(record.geometry);
 
-      final end = opaqueBatchEnd(_opaqueRecords, index);
+      final end = opaqueBatchEnd(
+        _opaqueRecords,
+        index,
+        froxelLighting: froxelLighting,
+      );
+      // Only a capture asks why a run ended; steady state skips the walk.
+      final batchBreak = activeDrawRecorder == null
+          ? BatchBreakReason.none
+          : opaqueBatchBreakReason(
+              _opaqueRecords[end - 1],
+              end < _opaqueRecords.length ? _opaqueRecords[end] : null,
+              froxelLighting: froxelLighting,
+            );
       if (end > index + 1) {
+        activeRenderCounters.batches++;
+        activeRenderCounters.batchedItems += end - index;
         _batchPool.reset();
         for (var batchIndex = index; batchIndex < end; batchIndex++) {
           final item = _opaqueRecords[batchIndex].item;
@@ -1213,51 +2197,34 @@ base class SceneEncoder {
             windingFlipped: _opaqueRecords[batchIndex].windingFlipped,
           );
         }
-        _encodeInstancedBatches(
-          record.pipeline,
-          record.geometry,
-          record.material,
-          _batchPool.batches,
-          record.fade,
-        );
-        index = end;
-        continue;
       }
-
-      final instances = item.instanceTransforms;
-      if (instances != null) {
-        _encodeInstanced(
-          record.pipeline,
-          item.worldTransform,
-          record.geometry,
-          record.material,
-          instances,
-          item.instanceColors!,
-          record.windingFlipped,
-          record.fade,
-          instanceWindingFlipped: item.instanceWindingFlipped,
-          instanceIndices: item.visibleInstanceIndices,
-          packedWorldData: record.windingFlipped == item.windingFlipped
-              ? item.instanceWorldData
-              : null,
-          packedWorldWindingFlipped:
-              record.windingFlipped == item.windingFlipped
-              ? item.instanceWorldWindingFlipped
-              : null,
-          attributeData: item.instanceAttributeData,
-          attributeFloats: item.instanceAttributeFloats,
-        );
+      // A surface that cuts itself out first draws its coverage, writing
+      // depth and a stencil mark only where it is kept, then shades exactly
+      // the marked pixels (clearing the mark) with an equal depth test. The
+      // mark keeps a coplanar surface drawn earlier, whose depth can equal
+      // this one's, from passing the equal test where this surface is cut
+      // away. The opaque shaders never discard, which keeps early depth
+      // testing and hidden-surface removal on for every other draw. The
+      // coverage carries the cross-fade, so the color draw shades at full
+      // coverage.
+      final coverage = record.coveragePipeline;
+      if (coverage != null) {
+        _coveragePass = true;
+        _renderPass.setStencilReference(1);
+        _renderPass.setStencilConfig(_markCoverage);
+        _encodeOpaqueRun(index, end, coverage, record.fade, batchBreak);
+        _coveragePass = false;
+        _renderPass.setStencilConfig(_testCoverage);
+        _renderPass.setDepthCompareOperation(gpu.CompareFunction.equal);
+        _renderPass.setDepthWriteEnable(false);
+        _encodeOpaqueRun(index, end, record.pipeline, 1.0, batchBreak);
+        _renderPass.setStencilConfig(_noStencil);
+        _renderPass.setDepthCompareOperation(_raster.nearerOrEqual);
+        _renderPass.setDepthWriteEnable(true);
       } else {
-        _encode(
-          record.pipeline,
-          item.worldTransform,
-          record.geometry,
-          record.material,
-          record.windingFlipped,
-          record.fade,
-        );
+        _encodeOpaqueRun(index, end, record.pipeline, 1.0, batchBreak);
       }
-      index++;
+      index = end;
     }
     encodeWatch?.stop();
     if (profileRendering) {
@@ -1270,6 +2237,68 @@ base class SceneEncoder {
       _opaqueRecordPool.add(record);
     }
     _opaqueRecords.clear();
+  }
+
+  // Encodes the opaque records [index, end) (one batchable run) with
+  // [pipeline] at cross-fade coverage [fade].
+  void _encodeOpaqueRun(
+    int index,
+    int end,
+    gpu.RenderPipeline pipeline,
+    double fade,
+    BatchBreakReason batchBreak,
+  ) {
+    final record = _opaqueRecords[index];
+    final item = record.item;
+    if (end > index + 1) {
+      _encodeInstancedBatches(
+        pipeline,
+        record.geometry,
+        record.material,
+        _batchPool.batches,
+        fade,
+        item: item,
+        batchedItems: end - index,
+        batchBreak: batchBreak,
+      );
+      return;
+    }
+    final instances = item.instanceTransforms;
+    if (instances != null) {
+      _encodeInstanced(
+        pipeline,
+        item.worldTransform,
+        record.geometry,
+        record.material,
+        instances,
+        item.instanceColors!,
+        record.windingFlipped,
+        fade,
+        instanceWindingFlipped: item.instanceWindingFlipped,
+        instanceIndices: item.visibleInstanceIndices,
+        packedWorldData: record.windingFlipped == item.windingFlipped
+            ? item.instanceWorldData
+            : null,
+        packedWorldWindingFlipped: record.windingFlipped == item.windingFlipped
+            ? item.instanceWorldWindingFlipped
+            : null,
+        attributeData: item.instanceAttributeData,
+        attributeFloats: item.instanceAttributeFloats,
+        item: item,
+        batchBreak: batchBreak,
+      );
+      return;
+    }
+    _encode(
+      pipeline,
+      item.worldTransform,
+      record.geometry,
+      record.material,
+      record.windingFlipped,
+      fade,
+      item: item,
+      batchBreak: batchBreak,
+    );
   }
 
   void _recordProfile(
@@ -1420,10 +2449,16 @@ base class SceneEncoder {
     );
   }
 
+  // Render order first, then farthest first.
+  static int _backToFront(_TranslucentRecord a, _TranslucentRecord b) {
+    final byOrder = a.item.renderOrder.compareTo(b.item.renderOrder);
+    return byOrder != 0 ? byOrder : b.depth.compareTo(a.depth);
+  }
+
   void _prepareTranslucent() {
     if (_translucentPrepared) return;
     final sortWatch = profileRendering ? (Stopwatch()..start()) : null;
-    _translucentRecords.sort((a, b) => b.depth.compareTo(a.depth));
+    _translucentRecords.sort(_backToFront);
     sortWatch?.stop();
     _translucentSortMicros = sortWatch?.elapsedMicroseconds ?? 0;
     _translucentPrepared = true;
@@ -1522,6 +2557,7 @@ base class SceneEncoder {
   void _flushTranslucentThrough(int end, {gpu.RenderPass? translucentPass}) {
     _prepareTranslucent();
     if (_translucentCursor >= _translucentRecords.length) return;
+    _phase = DrawPhase.translucent;
 
     if (translucentPass != null) {
       _renderPass = translucentPass;
@@ -1530,6 +2566,7 @@ base class SceneEncoder {
       _boundMaterialVertex = null;
       _boundFrameInfoShader = null;
       _boundFrameInfoDepthBias = double.nan;
+      _boundFrameInfoDepthKey = -1;
       _boundMaterialFade = double.nan;
       _boundMaterialLightOffset = -1;
       _boundMaterialLightCount = -1;
@@ -1538,7 +2575,7 @@ base class SceneEncoder {
       _boundPrimitiveType = null;
       EngineLightingUniforms.invalidateBindMemo();
     }
-    _renderPass.setDepthCompareOperation(gpu.CompareFunction.lessEqual);
+    _renderPass.setDepthCompareOperation(_raster.nearerOrEqual);
     final encodeWatch = profileRendering ? (Stopwatch()..start()) : null;
     _renderPass.setDepthWriteEnable(false);
     _renderPass.setColorBlendEnable(true);
@@ -1558,7 +2595,9 @@ base class SceneEncoder {
       _renderPass.setDepthWriteEnable(record.material.translucentDepthWrite);
       // Set per record, like the depth write above, so a projection volume
       // drawn with `always` cannot leak that test into the next draw.
-      _renderPass.setDepthCompareOperation(record.material.depthCompare);
+      _renderPass.setDepthCompareOperation(
+        _raster.compare(record.material.depthCompare),
+      );
       record.material.lightListOffset = record.lightListOffset;
       record.material.lightListCount = record.lightListCount;
       record.material.lightChannelMask = record.item.lightChannelMask;
@@ -1582,7 +2621,7 @@ base class SceneEncoder {
           instanceWindingFlipped: record.item.instanceWindingFlipped,
           instanceIndices: record.item.visibleInstanceIndices,
           sortBackToFrontFrom: record.item.sortTransparentInstances
-              ? _camera.position
+              ? _cameraPosition
               : null,
           packedWorldData: record.windingFlipped == record.item.windingFlipped
               ? record.item.instanceWorldData
@@ -1593,6 +2632,7 @@ base class SceneEncoder {
               : null,
           attributeData: record.item.instanceAttributeData,
           attributeFloats: record.item.instanceAttributeFloats,
+          item: record.item,
         );
       } else {
         _encode(
@@ -1602,6 +2642,7 @@ base class SceneEncoder {
           record.material,
           record.windingFlipped,
           record.fade,
+          item: record.item,
         );
       }
     }
@@ -1637,6 +2678,112 @@ base class SceneEncoder {
       flushNextTranslucentBatch(translucentPass: pass);
       pass = null;
     }
+  }
+
+  /// Whether any recorded draw is display-referred (see
+  /// [Material.displayReferred]).
+  bool get hasDisplayReferred => _displayReferredRecords.isNotEmpty;
+
+  /// Emits the display-referred layer into [pass], back to front with
+  /// premultiplied source-over blending.
+  ///
+  /// The pass writes display-encoded color into its own target and shares the
+  /// scene's depth attachment, so these surfaces are occluded by opaque
+  /// geometry but never write depth and never order against translucency.
+  void flushDisplayReferred(gpu.RenderPass pass) {
+    if (_displayReferredRecords.isEmpty) return;
+    _phase = DrawPhase.translucent;
+    _drawTransformOverride = _displayReferredCameraTransform;
+    _displayReferredRecords.sort(_backToFront);
+
+    _renderPass = pass;
+    _boundPipeline = null;
+    _boundMaterial = null;
+    _boundMaterialVertex = null;
+    _boundFrameInfoShader = null;
+    _boundFrameInfoDepthBias = double.nan;
+    _boundFrameInfoDepthKey = -1;
+    _boundMaterialFade = double.nan;
+    _boundMaterialLightOffset = -1;
+    _boundMaterialLightCount = -1;
+    _boundMaterialLightChannelMask = -1;
+    _boundWindingOrder = null;
+    _boundPrimitiveType = null;
+    EngineLightingUniforms.invalidateBindMemo();
+
+    _renderPass.setDepthWriteEnable(false);
+    _renderPass.setColorBlendEnable(true);
+    _renderPass.setColorBlendEquation(
+      gpu.ColorBlendEquation(
+        colorBlendOperation: gpu.BlendOperation.add,
+        sourceColorBlendFactor: gpu.BlendFactor.one,
+        destinationColorBlendFactor: gpu.BlendFactor.oneMinusSourceAlpha,
+        alphaBlendOperation: gpu.BlendOperation.add,
+        sourceAlphaBlendFactor: gpu.BlendFactor.one,
+        destinationAlphaBlendFactor: gpu.BlendFactor.oneMinusSourceAlpha,
+      ),
+    );
+
+    for (final record in _displayReferredRecords) {
+      _renderPass.setDepthCompareOperation(
+        _raster.compare(record.material.depthCompare),
+      );
+      record.material.lightListOffset = record.lightListOffset;
+      record.material.lightListCount = record.lightListCount;
+      record.material.lightChannelMask = record.item.lightChannelMask;
+      record.material.setModelScaleFromTransform(record.item.worldTransform);
+      final joints = record.jointsTexture;
+      if (joints != null) {
+        record.geometry.setJointsTexture(joints, record.jointsTextureWidth);
+      }
+      record.item.applyMorphWeights(record.geometry);
+      final instances = record.item.instanceTransforms;
+      if (instances != null) {
+        _encodeInstanced(
+          record.pipeline,
+          record.worldTransform,
+          record.geometry,
+          record.material,
+          instances,
+          record.item.instanceColors!,
+          record.windingFlipped,
+          record.fade,
+          instanceWindingFlipped: record.item.instanceWindingFlipped,
+          instanceIndices: record.item.visibleInstanceIndices,
+          sortBackToFrontFrom: record.item.sortTransparentInstances
+              ? _cameraPosition
+              : null,
+          packedWorldData: record.windingFlipped == record.item.windingFlipped
+              ? record.item.instanceWorldData
+              : null,
+          packedWorldWindingFlipped:
+              record.windingFlipped == record.item.windingFlipped
+              ? record.item.instanceWorldWindingFlipped
+              : null,
+          attributeData: record.item.instanceAttributeData,
+          attributeFloats: record.item.instanceAttributeFloats,
+          item: record.item,
+        );
+      } else {
+        _encode(
+          record.pipeline,
+          record.worldTransform,
+          record.geometry,
+          record.material,
+          record.windingFlipped,
+          record.fade,
+          item: record.item,
+        );
+      }
+    }
+
+    _drawTransformOverride = null;
+    for (final record in _displayReferredRecords) {
+      if (_translucentRecordPool.length == _recordPoolLimit) break;
+      record.release();
+      _translucentRecordPool.add(record);
+    }
+    _displayReferredRecords.clear();
   }
 
   static bool _readsSceneColor(Material material) {

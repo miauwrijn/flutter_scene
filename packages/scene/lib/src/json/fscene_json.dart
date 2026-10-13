@@ -245,11 +245,14 @@ Map<String, dynamic> encodeDocument(SceneDocument doc) {
           'radius': camera.radius,
           'target': _vec3Json(camera.target),
           if (camera.orthographic) 'orthographic': true,
+          ...camera.unknown,
         },
       if (editor.selection.isNotEmpty)
         'selection': [for (final id in editor.selection) idKey(id)],
+      ...editor.unknown,
     };
   }
+  json.addAll(doc.unknown);
   return json;
 }
 
@@ -264,6 +267,7 @@ Map<String, dynamic> _encodeView(
   if (view.antiAliasingMode != null) 'antiAliasing': view.antiAliasingMode,
   if (view.renderScale != null) 'renderScale': view.renderScale,
   if (view.filterQuality != null) 'filterQuality': view.filterQuality,
+  ...view.unknown,
 };
 
 Map<LocalId, String> _buildPrefixMap(SceneDocument doc) {
@@ -316,6 +320,7 @@ Map<String, dynamic> encodeStage(
   if (s.antiAliasingMode != 'auto') 'antiAliasing': s.antiAliasingMode,
   if (s.renderScale != 1.0) 'renderScale': s.renderScale,
   if (s.filterQuality != 'medium') 'filterQuality': s.filterQuality,
+  ...s.unknown,
 };
 
 /// Encodes the look fields shared by the stage (the global base) and each
@@ -338,17 +343,23 @@ Map<String, dynamic> _encodeLook({
   required bool overridesEffects,
 }) => {
   'environment': switch (environment) {
-    StudioEnvironment() => {'type': 'studio'},
-    AssetEnvironment(:final asset) => {'type': 'asset', 'ref': asset.key},
+    StudioEnvironment() => {'type': 'studio', ...environment.unknown},
+    AssetEnvironment(:final asset) => {
+      'type': 'asset',
+      'ref': asset.key,
+      ...environment.unknown,
+    },
     PayloadEnvironment(:final payload) => {
       'type': 'payload',
       'payload': idKey(payload),
+      ...environment.unknown,
     },
     ConstantEnvironment(:final color) => {
       'type': 'constant',
       'color': _vec3Json(color),
+      ...environment.unknown,
     },
-    EmptyEnvironment() => {'type': 'empty'},
+    EmptyEnvironment() => {'type': 'empty', ...environment.unknown},
   },
   'environmentIntensity': environmentIntensity,
   'exposure': exposure,
@@ -362,6 +373,7 @@ Map<String, dynamic> _encodeLook({
     'skybox': {
       'source': encodeSkySource(skybox.source),
       'intensity': skybox.intensity,
+      ...skybox.unknown,
     },
   if (skyEnvironment != null)
     'skyEnvironment': {
@@ -372,6 +384,7 @@ Map<String, dynamic> _encodeLook({
       'equirectWidth': skyEnvironment.equirectWidth,
       if (skyEnvironment.sunLight != null)
         'sunLight': _encodeSunLight(skyEnvironment.sunLight!),
+      ...skyEnvironment.unknown,
     },
 };
 
@@ -398,6 +411,7 @@ Map<String, dynamic> _encodeSunLight(SunLightSpec s) => {
     'contactShadowDistance': s.contactShadowDistance,
   if (s.angularRadius != 0.005) 'angularRadius': s.angularRadius,
   if (s.shadowCasterFaces != 'front') 'shadowCasterFaces': s.shadowCasterFaces,
+  ...s.unknown,
 };
 
 Map<String, dynamic> _encodeEnvironmentEffects(EnvironmentEffectsSpec e) {
@@ -610,22 +624,50 @@ Map<String, dynamic> _encodeEnvironmentEffects(EnvironmentEffectsSpec e) {
     if (e.smaaCornerRounding != 25.0) 'cornerRounding': e.smaaCornerRounding,
   };
   return {
-    if (colorGrading.isNotEmpty) 'colorGrading': colorGrading,
-    if (bloom.isNotEmpty) 'bloom': bloom,
-    if (lensFlare.isNotEmpty) 'lensFlare': lensFlare,
-    if (vignette.isNotEmpty) 'vignette': vignette,
-    if (chromaticAberration.isNotEmpty)
-      'chromaticAberration': chromaticAberration,
-    if (filmGrain.isNotEmpty) 'filmGrain': filmGrain,
-    if (ao.isNotEmpty) 'ambientOcclusion': ao,
-    if (ssr.isNotEmpty) 'screenSpaceReflections': ssr,
-    if (gi.isNotEmpty) 'globalIllumination': gi,
-    if (taa.isNotEmpty) 'temporalAntiAliasing': taa,
-    if (smaa.isNotEmpty) 'smaa': smaa,
-    if (fog.isNotEmpty) 'fog': fog,
-    if (godRays.isNotEmpty) 'godRays': godRays,
-    if (dof.isNotEmpty) 'depthOfField': dof,
-    if (autoExposure.isNotEmpty) 'autoExposure': autoExposure,
+    if (colorGrading.isNotEmpty || e.unknownInGroups['colorGrading'] != null)
+      'colorGrading': {...colorGrading, ...?e.unknownInGroups['colorGrading']},
+    if (bloom.isNotEmpty || e.unknownInGroups['bloom'] != null)
+      'bloom': {...bloom, ...?e.unknownInGroups['bloom']},
+    if (lensFlare.isNotEmpty || e.unknownInGroups['lensFlare'] != null)
+      'lensFlare': {...lensFlare, ...?e.unknownInGroups['lensFlare']},
+    if (vignette.isNotEmpty || e.unknownInGroups['vignette'] != null)
+      'vignette': {...vignette, ...?e.unknownInGroups['vignette']},
+    if (chromaticAberration.isNotEmpty ||
+        e.unknownInGroups['chromaticAberration'] != null)
+      'chromaticAberration': {
+        ...chromaticAberration,
+        ...?e.unknownInGroups['chromaticAberration'],
+      },
+    if (filmGrain.isNotEmpty || e.unknownInGroups['filmGrain'] != null)
+      'filmGrain': {...filmGrain, ...?e.unknownInGroups['filmGrain']},
+    if (ao.isNotEmpty || e.unknownInGroups['ambientOcclusion'] != null)
+      'ambientOcclusion': {...ao, ...?e.unknownInGroups['ambientOcclusion']},
+    if (ssr.isNotEmpty || e.unknownInGroups['screenSpaceReflections'] != null)
+      'screenSpaceReflections': {
+        ...ssr,
+        ...?e.unknownInGroups['screenSpaceReflections'],
+      },
+    if (gi.isNotEmpty || e.unknownInGroups['globalIllumination'] != null)
+      'globalIllumination': {
+        ...gi,
+        ...?e.unknownInGroups['globalIllumination'],
+      },
+    if (taa.isNotEmpty || e.unknownInGroups['temporalAntiAliasing'] != null)
+      'temporalAntiAliasing': {
+        ...taa,
+        ...?e.unknownInGroups['temporalAntiAliasing'],
+      },
+    if (smaa.isNotEmpty || e.unknownInGroups['smaa'] != null)
+      'smaa': {...smaa, ...?e.unknownInGroups['smaa']},
+    if (fog.isNotEmpty || e.unknownInGroups['fog'] != null)
+      'fog': {...fog, ...?e.unknownInGroups['fog']},
+    if (godRays.isNotEmpty || e.unknownInGroups['godRays'] != null)
+      'godRays': {...godRays, ...?e.unknownInGroups['godRays']},
+    if (dof.isNotEmpty || e.unknownInGroups['depthOfField'] != null)
+      'depthOfField': {...dof, ...?e.unknownInGroups['depthOfField']},
+    if (autoExposure.isNotEmpty || e.unknownInGroups['autoExposure'] != null)
+      'autoExposure': {...autoExposure, ...?e.unknownInGroups['autoExposure']},
+    ...e.unknown,
   };
 }
 
@@ -636,6 +678,7 @@ Object encodeSkySource(SkySourceSpec source) => switch (source) {
   EnvironmentSkySpec(:final blurriness) => {
     'type': 'environment',
     'blurriness': blurriness,
+    ...source.unknown,
   },
   FmatSkySpec(:final asset, :final properties) => {
     'type': 'fmat',
@@ -645,6 +688,7 @@ Object encodeSkySource(SkySourceSpec source) => switch (source) {
         for (final e in properties.entries)
           e.key: encodePropertyValue(e.value, (id) => id.toToken()),
       },
+    ...source.unknown,
   },
   GradientSkySpec s => {
     'type': 'gradient',
@@ -654,6 +698,7 @@ Object encodeSkySource(SkySourceSpec source) => switch (source) {
     'sunDirection': _vec3Json(s.sunDirection),
     'sunColor': _vec3Json(s.sunColor),
     'sunSharpness': s.sunSharpness,
+    ...s.unknown,
   },
   PhysicalSkySpec s => {
     'type': 'physical',
@@ -667,6 +712,7 @@ Object encodeSkySource(SkySourceSpec source) => switch (source) {
     'turbidity': s.turbidity,
     'groundColor': _vec3Json(s.groundColor),
     'energy': s.energy,
+    ...s.unknown,
   },
 };
 
@@ -698,6 +744,7 @@ Object _encodeResource(ResourceSpec r, String Function(LocalId) idKey) {
           'bounds': {
             'min': [bounds.min.x, bounds.min.y, bounds.min.z],
             'max': [bounds.max.x, bounds.max.y, bounds.max.z],
+            ...bounds.unknown,
           },
         if (r.topology != 'triangle') 'topology': r.topology,
         if (morphTargets != null)
@@ -710,8 +757,10 @@ Object _encodeResource(ResourceSpec r, String Function(LocalId) idKey) {
               'names': morphTargets.targetNames,
             if (morphTargets.defaultWeights.isNotEmpty)
               'weights': morphTargets.defaultWeights,
+            ...morphTargets.unknown,
           },
         if (legacyWinding) 'legacyWinding': true,
+        ...r.unknown,
       };
     case TextureResource(:final payload, :final asset, :final content):
       return {
@@ -719,6 +768,7 @@ Object _encodeResource(ResourceSpec r, String Function(LocalId) idKey) {
         if (payload != null) 'payload': idKey(payload),
         if (asset != null) 'ref': asset.key,
         if (content != 'color') 'content': content,
+        ...r.unknown,
       };
     case RenderTextureResource(
       :final width,
@@ -737,6 +787,7 @@ Object _encodeResource(ResourceSpec r, String Function(LocalId) idKey) {
           'intervalMilliseconds': intervalMilliseconds,
         if (filter != 'linear') 'filter': filter,
         if (wrap != 'clampToEdge') 'wrap': wrap,
+        ...r.unknown,
       };
     case MaterialResource(
       :final type,
@@ -754,6 +805,7 @@ Object _encodeResource(ResourceSpec r, String Function(LocalId) idKey) {
             for (final e in properties.entries)
               e.key: encodePropertyValue(e.value, idKey),
           },
+        ...r.unknown,
       };
     case EnvironmentResource():
       return {
@@ -774,9 +826,17 @@ Object _encodeResource(ResourceSpec r, String Function(LocalId) idKey) {
           effects: r.effects,
           overridesEffects: r.overridesEffects,
         ),
+        ...r.unknown,
       };
   }
 }
+
+/// Encodes a single node the same way [encodeDocument] does, for a caller
+/// that needs one node's authored form (the read protocol hands a prefab
+/// instance's delta over this way rather than encoding it a second time).
+/// {@category Serialization}
+Map<String, dynamic> encodeNode(NodeSpec n, String Function(LocalId) idKey) =>
+    _encodeNode(n, idKey);
 
 Map<String, dynamic> _encodeNode(NodeSpec n, String Function(LocalId) idKey) {
   return {
@@ -791,17 +851,22 @@ Map<String, dynamic> _encodeNode(NodeSpec n, String Function(LocalId) idKey) {
     if (n.instance != null) 'instance': _encodeInstance(n.instance!, idKey),
     if (!n.visible) 'visible': false,
     if (n.shadowCastingMode != 'on') 'shadowCasting': n.shadowCastingMode,
+    ...n.unknown,
   };
 }
 
 Map<String, dynamic> _encodeTransform(TransformSpec t) => switch (t) {
-  MatrixTransform(:final matrix) => {'matrix': matrix.storage.toList()},
+  MatrixTransform(:final matrix) => {
+    'matrix': matrix.storage.toList(),
+    ...t.unknown,
+  },
   TrsTransform(:final translation, :final rotation, :final scale) => {
     'trs': {
       't': [translation.x, translation.y, translation.z],
       'r': [rotation.x, rotation.y, rotation.z, rotation.w],
       's': [scale.x, scale.y, scale.z],
     },
+    ...t.unknown,
   },
 };
 
@@ -815,6 +880,7 @@ Map<String, dynamic> _encodeComponent(
       for (final e in c.properties.entries)
         e.key: encodePropertyValue(e.value, idKey),
     },
+  ...c.unknown,
 };
 
 Map<String, dynamic> _encodeInstance(
@@ -830,6 +896,7 @@ Map<String, dynamic> _encodeInstance(
           'target': idKey(o.target),
           'path': o.path,
           'value': encodePropertyValue(o.value, idKey),
+          ...o.unknown,
         },
     ],
   if (p.attachments.isNotEmpty)
@@ -838,6 +905,7 @@ Map<String, dynamic> _encodeInstance(
         {
           'node': idKey(a.node),
           if (a.parent != null) 'parent': idKey(a.parent!),
+          ...a.unknown,
         },
     ],
   if (p.removedNodes.isNotEmpty)
@@ -854,8 +922,10 @@ Map<String, dynamic> _encodeInstance(
         {
           'member': idKey(mc.member),
           'component': _encodeComponent(mc.component, idKey),
+          ...mc.unknown,
         },
     ],
+  ...p.unknown,
 };
 
 Map<String, dynamic> _encodeSkin(SkinSpec s, String Function(LocalId) idKey) =>
@@ -863,6 +933,7 @@ Map<String, dynamic> _encodeSkin(SkinSpec s, String Function(LocalId) idKey) =>
       'joints': [for (final j in s.joints) idKey(j)],
       'inverseBindMatrices': idKey(s.inverseBindMatrices),
       if (s.skeleton != null) 'skeleton': idKey(s.skeleton!),
+      ...s.unknown,
     };
 
 Map<String, dynamic> _encodeAnimation(
@@ -878,8 +949,10 @@ Map<String, dynamic> _encodeAnimation(
         'property': ch.property.name,
         'timeline': idKey(ch.timeline),
         'keyframes': idKey(ch.keyframes),
+        ...ch.unknown,
       },
   ],
+  ...a.unknown,
 };
 
 Map<String, dynamic> _encodePayload(PayloadSpec p) => {
@@ -889,7 +962,31 @@ Map<String, dynamic> _encodePayload(PayloadSpec p) => {
   if (p.width != null) 'width': p.width,
   if (p.height != null) 'height': p.height,
   if (p.length != null) 'length': p.length,
+  ...p.unknown,
 };
+
+//-----------------------------------------------------------------------------
+// Unknown-key preservation
+//-----------------------------------------------------------------------------
+
+/// The entries of [json] this build does not recognize.
+///
+/// Covers entity objects and the value objects nested inside them, down to
+/// each environment effects group. A property value with a tag this build
+/// does not know is preserved as an `UnknownValue` rather than rejected.
+///
+/// Decoders pass the keys they read; whatever is left is kept on the spec and
+/// written back out unchanged, so a document from a newer engine or from an
+/// extension survives a load and save. Preserved keys are re-emitted after
+/// the known ones, which keeps a rewrite stable but does not reproduce a
+/// foreign writer's key order.
+Map<String, Object?> _rest(Map<String, dynamic> json, Set<String> known) {
+  final rest = <String, Object?>{};
+  for (final entry in json.entries) {
+    if (!known.contains(entry.key)) rest[entry.key] = entry.value;
+  }
+  return rest;
+}
 
 //-----------------------------------------------------------------------------
 // Decode
@@ -898,6 +995,24 @@ Map<String, dynamic> _encodePayload(PayloadSpec p) => {
 /// Decodes a [SceneDocument] from a raw JSON tree (already migrated to the
 /// current version). Throws on an unsupported required feature.
 /// {@category Serialization}
+const Set<String> _documentKeys = {
+  'fscene',
+  'documentId',
+  'featuresUsed',
+  'featuresRequired',
+  'generator',
+  'payloadSource',
+  'stage',
+  'resources',
+  'nodes',
+  'roots',
+  'skins',
+  'animations',
+  'payloads',
+  'views',
+  'editor',
+};
+
 SceneDocument decodeDocument(Map<String, dynamic> json) {
   final version = json['fscene'] as int? ?? currentFsceneVersion;
   if (version != currentFsceneVersion) {
@@ -951,6 +1066,7 @@ SceneDocument decodeDocument(Map<String, dynamic> json) {
     allocator: IdAllocator(excludedSessions: usedSessions),
     stage: _decodeStage(json['stage'] as Map<String, dynamic>),
   );
+  doc.unknown.addAll(_rest(json, _documentKeys));
   doc.formatVersion = version;
   doc.generator = json['generator'] as String?;
   doc.payloadSource = json['payloadSource'] as String?;
@@ -978,7 +1094,14 @@ SceneDocument decodeDocument(Map<String, dynamic> json) {
           (target[1] as num).toDouble(),
           (target[2] as num).toDouble(),
         ),
-        orthographic: editorJson['camera']['orthographic'] as bool? ?? false,
+        orthographic: cameraJson['orthographic'] as bool? ?? false,
+        unknown: _rest(Map<String, dynamic>.from(cameraJson), const {
+          'azimuth',
+          'elevation',
+          'radius',
+          'target',
+          'orthographic',
+        }),
       );
     }
     // Selection ids referencing nodes no longer in the document are dropped.
@@ -986,12 +1109,28 @@ SceneDocument decodeDocument(Map<String, dynamic> json) {
       for (final id in (editorJson['selection'] as List? ?? const []))
         LocalId.parse(id as String),
     ].where(nodes.containsKey).toList();
-    doc.editor = EditorStateSpec(camera: camera, selection: selection);
+    doc.editor = EditorStateSpec(
+      camera: camera,
+      selection: selection,
+      unknown: _rest(Map<String, dynamic>.from(editorJson), const {
+        'camera',
+        'selection',
+      }),
+    );
   }
   return doc;
 }
 
 RenderViewSpec _decodeView(Map<String, dynamic> json) => RenderViewSpec(
+  unknown: _rest(json, const {
+    'camera',
+    'target',
+    'layerMask',
+    'order',
+    'antiAliasing',
+    'renderScale',
+    'filterQuality',
+  }),
   cameraNode: LocalId.parse(json['camera'] as String),
   target: json['target'] != null
       ? LocalId.parse(json['target'] as String)
@@ -1016,7 +1155,20 @@ Map<LocalId, V> _decodeIdMap<V>(
   return out;
 }
 
+const Set<String> _nodeKeys = {
+  'name',
+  'transform',
+  'children',
+  'components',
+  'layers',
+  'skin',
+  'instance',
+  'visible',
+  'shadowCasting',
+};
+
 NodeSpec _decodeNode(LocalId id, Map<String, dynamic> json) => NodeSpec(
+  unknown: _rest(json, _nodeKeys),
   id: id,
   name: json['name'] as String? ?? '',
   transform: _decodeTransform(json['transform'] as Map<String, dynamic>),
@@ -1042,6 +1194,7 @@ TransformSpec _decodeTransform(Map<String, dynamic> json) {
   if (matrix != null) {
     return MatrixTransform(
       Matrix4.fromList([for (final e in matrix as List) _d(e)]),
+      unknown: _rest(json, const {'matrix'}),
     );
   }
   final trs = json['trs'] as Map<String, dynamic>;
@@ -1052,12 +1205,14 @@ TransformSpec _decodeTransform(Map<String, dynamic> json) {
     translation: Vector3(_d(t[0]), _d(t[1]), _d(t[2])),
     rotation: Quaternion(_d(r[0]), _d(r[1]), _d(r[2]), _d(r[3])),
     scale: Vector3(_d(s[0]), _d(s[1]), _d(s[2])),
+    unknown: _rest(json, const {'trs'}),
   );
 }
 
 ComponentSpec _decodeComponent(Map<String, dynamic> json) => ComponentSpec(
   json['type'] as String,
   properties: _decodeProperties(json['properties']),
+  unknown: _rest(json, const {'type', 'properties'}),
 );
 
 Map<String, PropertyValue> _decodeProperties(Object? json) => {
@@ -1095,8 +1250,22 @@ PrefabInstanceSpec _decodeInstance(Map<String, dynamic> json) =>
             component: _decodeComponent(
               Map<String, dynamic>.from(mc['component'] as Map),
             ),
+            unknown: _rest(Map<String, dynamic>.from(mc), const {
+              'member',
+              'component',
+            }),
           ),
       ],
+      unknown: _rest(json, const {
+        'source',
+        'load',
+        'overrides',
+        'attachments',
+        'removedNodes',
+        'addedComponents',
+        'removedComponentTypes',
+        'memberComponents',
+      }),
     );
 
 Attachment _decodeAttachment(Map<String, dynamic> json) => Attachment(
@@ -1104,12 +1273,14 @@ Attachment _decodeAttachment(Map<String, dynamic> json) => Attachment(
   parent: json['parent'] == null
       ? null
       : LocalId.parse(json['parent'] as String),
+  unknown: _rest(json, const {'node', 'parent'}),
 );
 
 PropertyOverride _decodeOverride(Map<String, dynamic> json) => PropertyOverride(
   target: LocalId.parse(json['target'] as String),
   path: json['path'] as String,
   value: decodePropertyValue(json['value']),
+  unknown: _rest(json, const {'target', 'path', 'value'}),
 );
 
 Map<String, dynamic> _map(Object? value) =>
@@ -1120,8 +1291,162 @@ Vector3 _effectVec(Object? value, Vector3 fallback) {
   return Vector3(_d(value[0]), _d(value[1]), _d(value[2]));
 }
 
+/// The keys each effects group is known to carry, so anything else in a
+/// group rides along untouched.
+const Map<String, Set<String>> _effectGroupKeys = {
+  'ambientOcclusion': {
+    'bentNormals',
+    'bias',
+    'depthMipChain',
+    'detail',
+    'directLightAffect',
+    'enabled',
+    'halfResolution',
+    'horizonAngle',
+    'indirectLight',
+    'intensity',
+    'method',
+    'multiBounce',
+    'power',
+    'radius',
+    'sampleCount',
+    'sliceCount',
+    'specularMode',
+    'stepsPerSlice',
+    'thickness',
+    'thicknessHeuristic',
+    'visibilityBitmask',
+  },
+  'autoExposure': {
+    'compensation',
+    'enabled',
+    'maxEv',
+    'minEv',
+    'speedDown',
+    'speedUp',
+    'strength',
+  },
+  'bloom': {'enabled', 'intensity', 'scatter', 'threshold'},
+  'chromaticAberration': {'enabled', 'intensity'},
+  'colorGrading': {
+    'brightness',
+    'contrast',
+    'enabled',
+    'gain',
+    'gamma',
+    'lift',
+    'lut',
+    'lutBlend',
+    'saturation',
+    'temperature',
+    'tint',
+  },
+  'depthOfField': {
+    'bladeCount',
+    'bladeCurvature',
+    'bladeRotation',
+    'blurScale',
+    'enabled',
+    'fStop',
+    'focalLength',
+    'focusDistance',
+    'maxBackgroundBlur',
+    'maxForegroundBlur',
+    'quality',
+    'sensorHeight',
+  },
+  'filmGrain': {'enabled', 'intensity'},
+  'fog': {
+    'color',
+    'cutoffDistance',
+    'density',
+    'enabled',
+    'end',
+    'height',
+    'heightFalloff',
+    'maxOpacity',
+    'mode',
+    'skyColorInfluence',
+    'start',
+    'sunInScatter',
+    'sunInScatterExponent',
+  },
+  'globalIllumination': {
+    'bakeOnly',
+    'emissiveBoost',
+    'enabled',
+    'extents',
+    'fireflyClamp',
+    'hysteresis',
+    'injectionResolution',
+    'intensity',
+    'probeUpdateBudget',
+    'resolution',
+    'shadowBias',
+    'updateWhenIdleOnly',
+    'visibility',
+    'visibilityBias',
+    'volumeMode',
+  },
+  'godRays': {
+    'anisotropy',
+    'color',
+    'density',
+    'enabled',
+    'intensity',
+    'jitter',
+    'maxDistance',
+    'stepCount',
+  },
+  'lensFlare': {
+    'chromaticAberration',
+    'enabled',
+    'ghostCount',
+    'ghostSpacing',
+    'haloIntensity',
+    'haloRadius',
+    'intensity',
+  },
+  'screenSpaceReflections': {
+    'blur',
+    'distanceFadeStart',
+    'enabled',
+    'intensity',
+    'maxDistance',
+    'maxSteps',
+    'resolutionScale',
+    'stride',
+    'thickness',
+  },
+  'smaa': {
+    'cornerRounding',
+    'maxDiagonalSearchSteps',
+    'maxSearchSteps',
+    'threshold',
+  },
+  'temporalAntiAliasing': {
+    'enabled',
+    'jitterScale',
+    'jitterSequenceLength',
+    'minimumCurrentWeight',
+    'objectMotion',
+    'sharpness',
+    'skinnedMotion',
+    'varianceGamma',
+  },
+  'vignette': {'enabled', 'intensity', 'radius', 'smoothness'},
+};
+
 EnvironmentEffectsSpec _decodeEnvironmentEffects(Object? value) {
   final effects = _map(value);
+  final unknownInGroups = <String, Map<String, Object?>>{};
+  for (final entry in _effectGroupKeys.entries) {
+    final group = effects[entry.key];
+    if (group is! Map) continue;
+    final rest = _rest(Map<String, dynamic>.from(group), entry.value);
+    if (rest.isNotEmpty) unknownInGroups[entry.key] = rest;
+  }
+  final unknownGroups = _rest(effects, _effectGroupKeys.keys.toSet());
   final cg = _map(effects['colorGrading']);
   final bloom = _map(effects['bloom']);
   final lensFlare = _map(effects['lensFlare']);
@@ -1278,8 +1603,51 @@ EnvironmentEffectsSpec _decodeEnvironmentEffects(Object? value) {
     autoExposureMaxEv: _d(auto['maxEv'] ?? 4.0),
     autoExposureSpeedUp: _d(auto['speedUp'] ?? 3.0),
     autoExposureSpeedDown: _d(auto['speedDown'] ?? 1.0),
+    unknown: unknownGroups,
+    unknownInGroups: unknownInGroups,
   );
 }
+
+const Set<String> _geometryKeys = {
+  'kind',
+  'vertices',
+  'indices',
+  'procedural',
+  'bounds',
+  'topology',
+  'morphTargets',
+  'legacyWinding',
+};
+
+const Set<String> _textureKeys = {'kind', 'payload', 'ref', 'content'};
+
+const Set<String> _renderTextureKeys = {
+  'kind',
+  'width',
+  'height',
+  'update',
+  'intervalMilliseconds',
+  'filter',
+  'wrap',
+};
+
+const Set<String> _materialKeys = {'kind', 'type', 'name', 'ref', 'properties'};
+
+const Set<String> _environmentKeys = {
+  'kind',
+  'name',
+  'environment',
+  'environmentIntensity',
+  'exposure',
+  'toneMapping',
+  'agxWhite',
+  'agxContrast',
+  'environmentRotationY',
+  'radianceCubeSize',
+  'skybox',
+  'skyEnvironment',
+  'effects',
+};
 
 ResourceSpec _decodeResource(LocalId id, Map<String, dynamic> json) {
   final kind = json['kind'] as String;
@@ -1302,6 +1670,7 @@ ResourceSpec _decodeResource(LocalId id, Map<String, dynamic> json) {
         topology: json['topology'] as String? ?? 'triangle',
         morphTargets: _decodeMorphTargets(json['morphTargets']),
         legacyWinding: json['legacyWinding'] == true,
+        unknown: _rest(json, _geometryKeys),
       );
     case 'texture':
       return TextureResource(
@@ -1311,6 +1680,7 @@ ResourceSpec _decodeResource(LocalId id, Map<String, dynamic> json) {
             : null,
         asset: json['ref'] != null ? AssetRef(json['ref'] as String) : null,
         content: json['content'] as String? ?? 'color',
+        unknown: _rest(json, _textureKeys),
       );
     case 'renderTexture':
       return RenderTextureResource(
@@ -1321,6 +1691,7 @@ ResourceSpec _decodeResource(LocalId id, Map<String, dynamic> json) {
         intervalMilliseconds: json['intervalMilliseconds'] as int?,
         filter: json['filter'] as String? ?? 'linear',
         wrap: json['wrap'] as String? ?? 'clampToEdge',
+        unknown: _rest(json, _renderTextureKeys),
       );
     case 'material':
       return MaterialResource(
@@ -1329,6 +1700,7 @@ ResourceSpec _decodeResource(LocalId id, Map<String, dynamic> json) {
         name: json['name'] as String? ?? '',
         asset: json['ref'] != null ? AssetRef(json['ref'] as String) : null,
         properties: _decodeProperties(json['properties']),
+        unknown: _rest(json, _materialKeys),
       );
     case 'environment':
       return EnvironmentResource(
@@ -1346,6 +1718,7 @@ ResourceSpec _decodeResource(LocalId id, Map<String, dynamic> json) {
         skyEnvironment: _decodeSkyEnvironment(json['skyEnvironment']),
         effects: _decodeEnvironmentEffects(json['effects']),
         overridesEffects: json.containsKey('effects'),
+        unknown: _rest(json, _environmentKeys),
       );
     default:
       throw FsceneFormatException('Unknown resource kind: $kind');
@@ -1357,6 +1730,7 @@ Map<String, dynamic> _encodeProcedural(ProceduralGeometry p) => switch (p) {
     'shape': 'cuboid',
     'extents': [extents.x, extents.y, extents.z],
     if (debugColors) 'debugColors': true,
+    ...p.unknown,
   },
   PlaneGeometrySpec(
     :final width,
@@ -1370,12 +1744,14 @@ Map<String, dynamic> _encodeProcedural(ProceduralGeometry p) => switch (p) {
       'depth': depth,
       'segmentsX': segmentsX,
       'segmentsZ': segmentsZ,
+      ...p.unknown,
     },
   SphereGeometrySpec(:final radius, :final segments, :final rings) => {
     'shape': 'sphere',
     'radius': radius,
     'segments': segments,
     'rings': rings,
+    ...p.unknown,
   },
   TorusGeometrySpec(
     :final radius,
@@ -1389,11 +1765,13 @@ Map<String, dynamic> _encodeProcedural(ProceduralGeometry p) => switch (p) {
       'tubeRadius': tubeRadius,
       'radialSegments': radialSegments,
       'tubularSegments': tubularSegments,
+      ...p.unknown,
     },
   IcosphereGeometrySpec(:final radius, :final subdivisions) => {
     'shape': 'icosphere',
     'radius': radius,
     'subdivisions': subdivisions,
+    ...p.unknown,
   },
 };
 
@@ -1405,6 +1783,7 @@ ProceduralGeometry _decodeProcedural(Map<String, dynamic> json) {
       return CuboidGeometrySpec(
         extents: Vector3(_d(e[0]), _d(e[1]), _d(e[2])),
         debugColors: json['debugColors'] as bool? ?? false,
+        unknown: _rest(json, const {'shape', 'extents', 'debugColors'}),
       );
     case 'plane':
       return PlaneGeometrySpec(
@@ -1412,12 +1791,20 @@ ProceduralGeometry _decodeProcedural(Map<String, dynamic> json) {
         depth: _d(json['depth'] ?? 1.0),
         segmentsX: json['segmentsX'] as int? ?? 1,
         segmentsZ: json['segmentsZ'] as int? ?? 1,
+        unknown: _rest(json, const {
+          'shape',
+          'width',
+          'depth',
+          'segmentsX',
+          'segmentsZ',
+        }),
       );
     case 'sphere':
       return SphereGeometrySpec(
         radius: _d(json['radius'] ?? 0.5),
         segments: json['segments'] as int? ?? 32,
         rings: json['rings'] as int? ?? 16,
+        unknown: _rest(json, const {'shape', 'radius', 'segments', 'rings'}),
       );
     case 'torus':
       return TorusGeometrySpec(
@@ -1425,11 +1812,19 @@ ProceduralGeometry _decodeProcedural(Map<String, dynamic> json) {
         tubeRadius: _d(json['tubeRadius'] ?? 0.15),
         radialSegments: json['radialSegments'] as int? ?? 32,
         tubularSegments: json['tubularSegments'] as int? ?? 16,
+        unknown: _rest(json, const {
+          'shape',
+          'radius',
+          'tubeRadius',
+          'radialSegments',
+          'tubularSegments',
+        }),
       );
     case 'icosphere':
       return IcosphereGeometrySpec(
         radius: _d(json['radius'] ?? 0.5),
         subdivisions: json['subdivisions'] as int? ?? 2,
+        unknown: _rest(json, const {'shape', 'radius', 'subdivisions'}),
       );
     default:
       throw FsceneFormatException('Unknown procedural geometry shape: $shape');
@@ -1444,6 +1839,7 @@ BoundsSpec? _decodeBounds(Object? json) {
   return BoundsSpec(
     min: Vector3(_d(min[0]), _d(min[1]), _d(min[2])),
     max: Vector3(_d(max[0]), _d(max[1]), _d(max[2])),
+    unknown: _rest(Map<String, dynamic>.from(m), const {'min', 'max'}),
   );
 }
 
@@ -1462,11 +1858,20 @@ MorphTargetsSpec? _decodeMorphTargets(Object? json) {
       for (final weight in (m['weights'] as List? ?? const []))
         _d(weight as num),
     ],
+    unknown: _rest(Map<String, dynamic>.from(m), const {
+      'deltas',
+      'targetCount',
+      'normals',
+      'tangents',
+      'names',
+      'weights',
+    }),
   );
 }
 
 SkinSpec _decodeSkin(LocalId id, Map<String, dynamic> json) => SkinSpec(
   id,
+  unknown: _rest(json, const {'joints', 'inverseBindMatrices', 'skeleton'}),
   joints: [
     for (final j in (json['joints'] as List? ?? const []))
       LocalId.parse(j as String),
@@ -1485,6 +1890,7 @@ AnimationSpec _decodeAnimation(LocalId id, Map<String, dynamic> json) =>
         for (final ch in (json['channels'] as List? ?? const []))
           _decodeChannel(Map<String, dynamic>.from(ch as Map)),
       ],
+      unknown: _rest(json, const {'name', 'channels'}),
     );
 
 AnimationChannelSpec _decodeChannel(Map<String, dynamic> json) =>
@@ -1494,6 +1900,13 @@ AnimationChannelSpec _decodeChannel(Map<String, dynamic> json) =>
       property: AnimationProperty.values.byName(json['property'] as String),
       timeline: LocalId.parse(json['timeline'] as String),
       keyframes: LocalId.parse(json['keyframes'] as String),
+      unknown: _rest(json, const {
+        'target',
+        'targetName',
+        'property',
+        'timeline',
+        'keyframes',
+      }),
     );
 
 PayloadSpec _decodePayload(LocalId id, Map<String, dynamic> json) =>
@@ -1505,9 +1918,23 @@ PayloadSpec _decodePayload(LocalId id, Map<String, dynamic> json) =>
       width: json['width'] as int?,
       height: json['height'] as int?,
       length: json['length'] as int?,
+      unknown: _rest(json, const {
+        'encoding',
+        'layout',
+        'format',
+        'width',
+        'height',
+        'length',
+      }),
     );
 
 StageMetadata _decodeStage(Map<String, dynamic> json) => StageMetadata(
+  unknown: _rest(json, const {
+    'antiAliasing',
+    'renderScale',
+    'filterQuality',
+    'environmentRef',
+  }),
   antiAliasingMode: json['antiAliasing'] as String? ?? 'auto',
   renderScale: _d(json['renderScale'] ?? 1.0),
   filterQuality: json['filterQuality'] as String? ?? 'medium',
@@ -1521,7 +1948,11 @@ SkyboxSpec? _decodeSkybox(Object? json) {
   final m = json as Map;
   final source = _decodeSkySource(m['source']);
   if (source == null) return null;
-  return SkyboxSpec(source, intensity: _d(m['intensity'] ?? 1.0));
+  return SkyboxSpec(
+    source,
+    intensity: _d(m['intensity'] ?? 1.0),
+    unknown: _rest(Map<String, dynamic>.from(m), const {'source', 'intensity'}),
+  );
 }
 
 SkyEnvironmentSpec? _decodeSkyEnvironment(Object? json) {
@@ -1538,6 +1969,15 @@ SkyEnvironmentSpec? _decodeSkyEnvironment(Object? json) {
     sunLight: m['sunLight'] != null
         ? _decodeSunLight(m['sunLight'] as Map)
         : (m['castShadows'] == true ? SunLightSpec() : null),
+    unknown: _rest(Map<String, dynamic>.from(m), const {
+      'source',
+      'refresh',
+      'intervalSeconds',
+      'faceResolution',
+      'equirectWidth',
+      'sunLight',
+      'castShadows',
+    }),
   );
 }
 
@@ -1560,6 +2000,26 @@ SunLightSpec _decodeSunLight(Map<dynamic, dynamic> m) => SunLightSpec(
   contactShadowDistance: _d(m['contactShadowDistance'] ?? 0.3),
   angularRadius: _d(m['angularRadius'] ?? 0.005),
   shadowCasterFaces: m['shadowCasterFaces'] as String? ?? 'front',
+  unknown: _rest(Map<String, dynamic>.from(m), const {
+    'castsShadow',
+    'intensityScale',
+    'priority',
+    'cacheStaticShadows',
+    'shadowSoftness',
+    'shadowMaxDistance',
+    'shadowCascadeCount',
+    'shadowMapResolution',
+    'shadowDepthBias',
+    'shadowNormalBias',
+    'shadowFadeRange',
+    'shadowCascadeSplitLambda',
+    'shadowAmbientStrength',
+    'shadowFilter',
+    'contactShadows',
+    'contactShadowDistance',
+    'angularRadius',
+    'shadowCasterFaces',
+  }),
 );
 
 SkySourceSpec? _decodeSkySource(Object? json) {
@@ -1567,7 +2027,13 @@ SkySourceSpec? _decodeSkySource(Object? json) {
   final m = json as Map;
   switch (m['type']) {
     case 'environment':
-      return EnvironmentSkySpec(blurriness: _d(m['blurriness'] ?? 0.0));
+      return EnvironmentSkySpec(
+        blurriness: _d(m['blurriness'] ?? 0.0),
+        unknown: _rest(Map<String, dynamic>.from(m), const {
+          'type',
+          'blurriness',
+        }),
+      );
     case 'fmat':
       return FmatSkySpec(
         AssetRef(m['ref'] as String),
@@ -1575,9 +2041,24 @@ SkySourceSpec? _decodeSkySource(Object? json) {
           for (final e in ((m['properties'] as Map?) ?? const {}).entries)
             e.key as String: decodePropertyValue(e.value),
         },
+        unknown: _rest(Map<String, dynamic>.from(m), const {
+          'type',
+          'ref',
+          'properties',
+        }),
       );
     case 'gradient':
-      final s = GradientSkySpec();
+      final s = GradientSkySpec(
+        unknown: _rest(Map<String, dynamic>.from(m), const {
+          'type',
+          'zenithColor',
+          'horizonColor',
+          'groundColor',
+          'sunDirection',
+          'sunColor',
+          'sunSharpness',
+        }),
+      );
       _setVec3(m['zenithColor'], (v) => s.zenithColor = v);
       _setVec3(m['horizonColor'], (v) => s.horizonColor = v);
       _setVec3(m['groundColor'], (v) => s.groundColor = v);
@@ -1586,7 +2067,21 @@ SkySourceSpec? _decodeSkySource(Object? json) {
       if (m['sunSharpness'] != null) s.sunSharpness = _d(m['sunSharpness']);
       return s;
     case 'physical':
-      final s = PhysicalSkySpec();
+      final s = PhysicalSkySpec(
+        unknown: _rest(Map<String, dynamic>.from(m), const {
+          'type',
+          'sunDirection',
+          'sunAngularRadius',
+          'rayleighCoefficient',
+          'rayleighColor',
+          'mieCoefficient',
+          'mieEccentricity',
+          'mieColor',
+          'turbidity',
+          'groundColor',
+          'energy',
+        }),
+      );
       _setVec3(m['sunDirection'], (v) => s.sunDirection = v);
       if (m['sunAngularRadius'] != null) {
         s.sunAngularRadius = _d(m['sunAngularRadius']);
@@ -1621,19 +2116,30 @@ EnvironmentSpec _decodeEnvironment(Object? json) {
   final m = json as Map;
   switch (m['type']) {
     case 'asset':
-      return AssetEnvironment(AssetRef(m['ref'] as String));
+      return AssetEnvironment(
+        AssetRef(m['ref'] as String),
+        unknown: _rest(Map<String, dynamic>.from(m), const {'type', 'ref'}),
+      );
     case 'payload':
-      return PayloadEnvironment(LocalId.parse(m['payload'] as String));
+      return PayloadEnvironment(
+        LocalId.parse(m['payload'] as String),
+        unknown: _rest(Map<String, dynamic>.from(m), const {'type', 'payload'}),
+      );
     case 'empty':
-      return const EmptyEnvironment();
+      return EmptyEnvironment(
+        unknown: _rest(Map<String, dynamic>.from(m), const {'type'}),
+      );
     case 'constant':
       final color = m['color'] as List;
       return ConstantEnvironment(
         Vector3(_d(color[0]), _d(color[1]), _d(color[2])),
+        unknown: _rest(Map<String, dynamic>.from(m), const {'type', 'color'}),
       );
     case 'studio':
     default:
-      return const StudioEnvironment();
+      return StudioEnvironment(
+        unknown: _rest(Map<String, dynamic>.from(m), const {'type'}),
+      );
   }
 }
 

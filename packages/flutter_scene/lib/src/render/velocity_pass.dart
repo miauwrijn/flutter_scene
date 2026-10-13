@@ -2,23 +2,26 @@ import 'dart:typed_data';
 import 'dart:ui' as ui;
 
 import 'package:flutter_scene/src/camera.dart';
-import 'package:flutter_scene/src/geometry/geometry.dart'
-    show SkinnedGeometry, kUnskinnedPositionOnlyLayout;
+import 'package:flutter_scene/src/geometry/geometry.dart' show SkinnedGeometry;
 import 'package:flutter_scene/src/geometry/vertex_layout.dart';
 import 'package:flutter_scene/src/gpu/gpu.dart' as gpu;
 import 'package:flutter_scene/src/importer/constants.dart'
     show kSkinnedPerVertexSize;
 import 'package:flutter_scene/src/render/depth_prepass.dart'
     show kPrepassDepthStencilBlackboardKey;
+import 'package:flutter_scene/src/render/depth_raster.dart';
 import 'package:flutter_scene/src/render/frame_transients.dart';
 import 'package:flutter_scene/src/render/instance_packing.dart'
     show bindSingleInstanceData;
 import 'package:flutter_scene/src/render/render_graph.dart';
 import 'package:flutter_scene/src/render/render_layers.dart';
 import 'package:flutter_scene/src/render/render_scene.dart';
+import 'package:flutter_scene/src/render/viewport_camera.dart';
 import 'package:flutter_scene/src/scene_encoder.dart' show resolvePipeline;
 import 'package:flutter_scene/src/shaders.dart';
 import 'package:vector_math/vector_math.dart';
+import 'package:flutter_scene/src/material/vertex_attributes.dart';
+import 'package:flutter_scene/src/render/uniform_slots.dart';
 
 /// Render-graph blackboard key for the screen-space velocity buffer.
 const String kVelocityBlackboardKey = 'velocity';
@@ -71,7 +74,8 @@ class VelocityPass extends RenderGraphPass {
     int layerMask = kRenderLayerAll,
     List<Plane> cullingPlanes = const [],
     bool skinnedMotion = true,
-  }) : _renderScene = renderScene,
+  }) : _camera = camera,
+       _renderScene = renderScene,
        _dimensions = dimensions,
        _currentViewProjection = currentViewProjection,
        _previousViewProjection = previousViewProjection,
@@ -81,6 +85,9 @@ class VelocityPass extends RenderGraphPass {
        _cullingPlanes = cullingPlanes,
        _skinnedMotion = skinnedMotion;
 
+  // The view's camera, for its culling frustum and depth raster. Null draws
+  // with the standard mapping and culls against [_currentViewProjection].
+  final Camera? _camera;
   final RenderScene _renderScene;
   final ui.Size _dimensions;
   final Matrix4 _currentViewProjection;
@@ -107,19 +114,19 @@ class VelocityPass extends RenderGraphPass {
     final height = _dimensions.height.toInt();
     if (width <= 0 || height <= 0) return;
 
+    final depthTexture = context.blackboard.get<gpu.Texture>(
+      kPrepassDepthStencilBlackboardKey,
+    );
     final velocityTexture = context.texturePool.acquire(
       TransientTextureDescriptor(
         width: width,
         height: height,
         format: gpu.PixelFormat.r16g16b16a16Float,
         debugName: 'velocity_pass_output',
+        attachmentKey: depthTexture != null ? 'prepass_depth' : 'no_depth',
       ),
     );
     context.blackboard.set(kVelocityBlackboardKey, velocityTexture);
-
-    final depthTexture = context.blackboard.get<gpu.Texture>(
-      kPrepassDepthStencilBlackboardKey,
-    );
 
     final target = gpu.RenderTarget.singleColor(
       gpu.ColorAttachment(texture: velocityTexture, clearValue: Vector4.zero()),
@@ -138,27 +145,42 @@ class VelocityPass extends RenderGraphPass {
     renderPass.setDepthWriteEnable(false);
     renderPass.setColorBlendEnable(false);
     if (depthTexture != null) {
+      // TODO(depth-invariance): Metal compiles these shaders with fast math and
+      // no invariance, so this pass and the prepass may round one position
+      // differently and drop its motion vectors. Declare `invariant
+      // gl_Position` in both once Impeller preserves invariance at runtime.
       renderPass.setDepthCompareOperation(gpu.CompareFunction.equal);
     } else {
       renderPass.setDepthCompareOperation(gpu.CompareFunction.always);
     }
     renderPass.setCullMode(gpu.CullMode.backFace);
 
-    final frameInfoData = Float32List(36);
+    final camera = _camera;
+    final raster = camera == null
+        ? DepthRaster.standard
+        : depthRasterOf(camera);
+    final frameInfoData = Float32List(40);
     frameInfoData.setRange(0, 16, _currentViewProjection.storage);
     frameInfoData.setRange(16, 32, _previousViewProjection.storage);
     frameInfoData[32] = _currentJitterNdc.x;
     frameInfoData[33] = _currentJitterNdc.y;
     frameInfoData[34] = _previousJitterNdc.x;
     frameInfoData[35] = _previousJitterNdc.y;
+    if (camera != null) {
+      frameInfoData[36] = camera.position.x;
+      frameInfoData[37] = camera.position.y;
+      frameInfoData[38] = camera.position.z;
+    }
     final frameInfoView = context.transientsBuffer.emplace(
       ByteData.sublistView(frameInfoData),
     );
 
-    final skinnedModelInfo = Float32List(36);
-    final unskinnedModelInfo = Float32List(32);
+    final skinnedModelInfo = Float32List(40);
+    final unskinnedModelInfo = Float32List(40);
 
-    final frustum = Frustum.matrix(_currentViewProjection);
+    final frustum = camera == null
+        ? cullingFrustum(_currentViewProjection)
+        : cullingFrustumOf(camera, _dimensions);
 
     void submitItem(RenderItem item) {
       if (!item.drawsColor) return;
@@ -175,8 +197,9 @@ class VelocityPass extends RenderGraphPass {
           : _unskinnedVertexShader;
       final vertexLayout = isSkinned
           ? _kSkinnedVelocityLayout
-          : (item.geometry.depthOnlyVertex?.layout ??
-                kUnskinnedPositionOnlyLayout);
+          : item.geometry.velocityPositionLayout;
+      // A packed first stream has no position this shader can read.
+      if (vertexLayout == null) return;
       final pipeline = resolvePipeline(
         vertexShader,
         _fragmentShader,
@@ -186,12 +209,18 @@ class VelocityPass extends RenderGraphPass {
       renderPass.clearBindings();
       renderPass.bindPipeline(pipeline);
       renderPass.setPrimitiveType(item.geometry.primitiveType);
+      // Match the prepass offset, or the equal test drops layered surfaces.
+      setCurrentDrawDepthOffset(
+        raster,
+        item.material.depthLayer,
+        item.material.tieBreakRank,
+      );
       renderPass.bindUniform(
-        vertexShader.getUniformSlot('VelocityFrameInfo'),
+        vertexShader.cachedUniformSlot('VelocityFrameInfo'),
         frameInfoView,
       );
       renderPass.bindUniform(
-        _fragmentShader.getUniformSlot('VelocityFrameInfo'),
+        _fragmentShader.cachedUniformSlot('VelocityFrameInfo'),
         frameInfoView,
       );
 
@@ -201,24 +230,28 @@ class VelocityPass extends RenderGraphPass {
         skinnedModelInfo[32] = item.jointsTextureWidth.toDouble();
         skinnedModelInfo[33] = item.jointsTextureWidth.toDouble();
         skinnedModelInfo[34] = 1.0;
-        skinnedModelInfo[35] = 0.0;
+        skinnedModelInfo[35] = item.material.depthBias;
+        skinnedModelInfo.setRange(36, 40, currentDrawDepthOffset);
         renderPass.bindUniform(
-          vertexShader.getUniformSlot('VelocitySkinnedModelInfo'),
+          vertexShader.cachedUniformSlot('VelocitySkinnedModelInfo'),
           context.transientsBuffer.emplace(
             ByteData.sublistView(skinnedModelInfo),
           ),
         );
         renderPass.bindTexture(
-          vertexShader.getUniformSlot('current_joints_texture'),
+          vertexShader.cachedUniformSlot('current_joints_texture'),
           item.jointsTexture!,
           sampler: _nearestClamp,
         );
         renderPass.bindTexture(
-          vertexShader.getUniformSlot('previous_joints_texture'),
+          vertexShader.cachedUniformSlot('previous_joints_texture'),
           item.previousJointsTexture ?? item.jointsTexture!,
           sampler: _nearestClamp,
         );
-        item.geometry.bindGeometryBuffers(renderPass);
+        // The velocity shaders read no custom attributes.
+        item.geometry
+          ..useVertexAttributes(VertexAttributeSchema.none)
+          ..bindGeometryBuffers(renderPass);
       } else {
         unskinnedModelInfo.setRange(0, 16, item.worldTransform.storage);
         unskinnedModelInfo.setRange(
@@ -226,8 +259,10 @@ class VelocityPass extends RenderGraphPass {
           32,
           item.previousWorldTransform.storage,
         );
+        unskinnedModelInfo.setRange(32, 36, currentDrawDepthOffset);
+        unskinnedModelInfo[36] = item.material.depthBias;
         renderPass.bindUniform(
-          vertexShader.getUniformSlot('VelocityModelInfo'),
+          vertexShader.cachedUniformSlot('VelocityModelInfo'),
           context.transientsBuffer.emplace(
             ByteData.sublistView(unskinnedModelInfo),
           ),

@@ -7,6 +7,7 @@ import 'package:flutter_scene/src/gpu/render_pass_compat.dart';
 
 import 'package:flutter_scene/src/ambient_occlusion.dart';
 import 'package:flutter_scene/src/render/depth_prepass.dart';
+import 'package:flutter_scene/src/render/projection_params.dart';
 import 'package:flutter_scene/src/render/scene_pass.dart'
     show kSceneColorBlackboardKey;
 import 'package:flutter_scene/src/render/render_graph.dart';
@@ -15,6 +16,7 @@ import 'package:flutter_scene/src/render/frame_transients.dart';
 import 'package:flutter_scene/src/material/material.dart';
 import 'package:flutter_scene/src/scene_encoder.dart' show resolvePipeline;
 import 'package:vector_math/vector_math.dart';
+import 'package:flutter_scene/src/render/uniform_slots.dart';
 
 /// Render-graph blackboard key under which [SsaoBlurPass] publishes the
 /// final ambient-occlusion texture (occlusion factor in `.r`, 1 =
@@ -123,18 +125,14 @@ class SsaoPass extends RenderGraphPass {
   SsaoPass({
     required ui.Size dimensions,
     required AmbientOcclusionSettings settings,
-    required double fovRadiansY,
-    required double near,
-    required double far,
+    required ProjectionParams projection,
     Vector3? contactDirectionView,
     double contactDistance = 0.0,
     gpu.Texture? sceneRadiance,
     Matrix4? ssgiReprojection,
   }) : _dimensions = dimensions,
        _settings = settings,
-       _fovRadiansY = fovRadiansY,
-       _near = near,
-       _far = far,
+       _projection = projection,
        _contactDirectionView = contactDirectionView,
        _contactDistance = contactDistance,
        _sceneRadiance = sceneRadiance,
@@ -142,9 +140,7 @@ class SsaoPass extends RenderGraphPass {
 
   final ui.Size _dimensions;
   final AmbientOcclusionSettings _settings;
-  final double _fovRadiansY;
-  final double _near;
-  final double _far;
+  final ProjectionParams _projection;
 
   // View-space direction toward the sun and the march distance for the
   // contact-shadow term; distance 0 leaves it off.
@@ -198,7 +194,7 @@ class SsaoPass extends RenderGraphPass {
     renderPass.setColorBlendEnable(false);
     bindVertexBufferCompat(renderPass, _fullscreenQuad(), 6);
     renderPass.bindTexture(
-      _downsampleShader.getUniformSlot('source'),
+      _downsampleShader.cachedUniformSlot('source'),
       source,
       sampler: _nearestClamp,
     );
@@ -278,24 +274,27 @@ class SsaoPass extends RenderGraphPass {
     renderPass.setColorBlendEnable(false);
     bindVertexBufferCompat(renderPass, _fullscreenQuad(), 6);
 
-    final tanHalfFovY = math.tan(_fovRadiansY * 0.5);
-    final aspect = _dimensions.width / _dimensions.height;
-    final tanHalfFovX = tanHalfFovY * aspect;
-    // Pixels per world unit at depth 1, used to project the world radius to a
-    // screen-space disk. Based on the occlusion target's own height.
-    final projScale = aoHeight / (2.0 * tanHalfFovY);
+    final projection = _projection;
+    // Pixels per world unit at depth 1 (at any depth for an orthographic
+    // camera), used to project the world radius to a screen-space disk. Based
+    // on the occlusion target's own height.
+    final projScale = aoHeight / (2.0 * projection.scaleY);
 
     // The ground-truth path appends the mat4 reprojection for the
-    // indirect-light history sample; the obscurance struct stays 6 vec4s.
-    final info = Float32List(groundTruth ? 40 : 24)
+    // indirect-light history sample; both end with the projection offset.
+    final offsetIndex = groundTruth ? 40 : 24;
+    final info = Float32List(offsetIndex + 4)
       ..[0] = aoWidth.toDouble()
       ..[1] = aoHeight.toDouble()
       ..[2] = 1.0 / aoWidth
       ..[3] = 1.0 / aoHeight
-      ..[4] = tanHalfFovX
-      ..[5] = tanHalfFovY
-      ..[6] = _near
-      ..[7] = _far;
+      ..[4] = projection.scaleX
+      ..[5] = projection.scaleY
+      ..[6] = projection.near
+      ..[7] = projection.far
+      ..[offsetIndex] = projection.offsetX
+      ..[offsetIndex + 1] = projection.offsetY
+      ..[offsetIndex + 2] = projection.orthographicFlag;
     if (groundTruth) {
       // Must match the GtaoInfo layout in flutter_scene_gtao.frag.
       info
@@ -340,32 +339,32 @@ class SsaoPass extends RenderGraphPass {
       (_ssgiReprojection ?? Matrix4.identity()).copyIntoArray(info, 24);
     }
     renderPass.bindUniform(
-      fragmentShader.getUniformSlot(groundTruth ? 'GtaoInfo' : 'SsaoInfo'),
+      fragmentShader.cachedUniformSlot(groundTruth ? 'GtaoInfo' : 'SsaoInfo'),
       context.transientsBuffer.emplace(ByteData.sublistView(info)),
     );
     renderPass.bindTexture(
-      fragmentShader.getUniformSlot('depth_mip1'),
+      fragmentShader.cachedUniformSlot('depth_mip1'),
       mip1,
       sampler: _nearestClamp,
     );
     renderPass.bindTexture(
-      fragmentShader.getUniformSlot('depth_mip2'),
+      fragmentShader.cachedUniformSlot('depth_mip2'),
       mip2,
       sampler: _nearestClamp,
     );
     renderPass.bindTexture(
-      fragmentShader.getUniformSlot('depth_mip3'),
+      fragmentShader.cachedUniformSlot('depth_mip3'),
       mip3,
       sampler: _nearestClamp,
     );
     renderPass.bindTexture(
-      fragmentShader.getUniformSlot('linear_depth'),
+      fragmentShader.cachedUniformSlot('linear_depth'),
       baseDepth,
       sampler: _nearestClamp,
     );
     if (groundTruth) {
       renderPass.bindTexture(
-        fragmentShader.getUniformSlot('scene_radiance'),
+        fragmentShader.cachedUniformSlot('scene_radiance'),
         _sceneRadiance ?? Material.getBlackPlaceholderTexture(),
         sampler: _linearClamp,
       );
@@ -450,16 +449,16 @@ class SsaoBlurPass extends RenderGraphPass {
         ..[5] = axisY
         ..[6] = ambientOcclusionCarriesBentNormals(_settings) ? 1.0 : 0.0;
       renderPass.bindUniform(
-        _fragmentShader.getUniformSlot('BlurInfo'),
+        _fragmentShader.cachedUniformSlot('BlurInfo'),
         context.transientsBuffer.emplace(ByteData.sublistView(info)),
       );
       renderPass.bindTexture(
-        _fragmentShader.getUniformSlot('ao_texture'),
+        _fragmentShader.cachedUniformSlot('ao_texture'),
         source,
         sampler: _linearClamp,
       );
       renderPass.bindTexture(
-        _fragmentShader.getUniformSlot('linear_depth'),
+        _fragmentShader.cachedUniformSlot('linear_depth'),
         linearDepth,
         sampler: _nearestClamp,
       );
@@ -535,7 +534,7 @@ class SceneColorHistoryPass extends RenderGraphPass {
     renderPass.setColorBlendEnable(false);
     bindVertexBufferCompat(renderPass, _fullscreenQuad(), 6);
     renderPass.bindTexture(
-      _copyShader.getUniformSlot('source_texture'),
+      _copyShader.cachedUniformSlot('source_texture'),
       source,
       sampler: _nearestClamp,
     );

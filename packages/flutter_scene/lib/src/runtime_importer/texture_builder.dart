@@ -1,5 +1,3 @@
-import 'dart:ui' as ui;
-
 import 'package:flutter/foundation.dart';
 import 'package:flutter_scene/src/gpu/gpu.dart' as gpu;
 import 'package:flutter_scene/src/importer/gltf.dart';
@@ -9,7 +7,6 @@ import '../texture/basisu/basis_ktx2.dart';
 import '../texture/basisu/basis_ktx2_loader.dart';
 import '../texture/compressed_texture.dart';
 import '../texture/ktx2/ktx2.dart';
-import '../texture/mipmap.dart';
 import '../texture/texture2d.dart';
 import 'gltf_resources.dart';
 
@@ -74,6 +71,7 @@ Future<List<Texture2D>> buildTextures(
   Uint8List bufferData, {
   GltfResourceResolver? resolveUri,
   GltfWarningCallback? onWarning,
+  int? maxTextureSize,
 }) async {
   void warn(String message) {
     if (onWarning != null) {
@@ -124,7 +122,11 @@ Future<List<Texture2D>> buildTextures(
       continue;
     }
     try {
-      results[i] = await _decodeAndUpload(imageBytes, contents[i]);
+      results[i] = await Texture2D.fromEncodedBytes(
+        imageBytes,
+        content: contents[i],
+        maxSize: maxTextureSize,
+      );
     } catch (e, st) {
       warn('Failed to decode glTF image $imageIdx: $e\n$st');
     }
@@ -145,20 +147,92 @@ Future<List<Texture2D>> buildTextures(
       warn('Failed to load glTF KTX2 texture: $e');
     }
   }
-  return [for (final result in results) result ?? _placeholder()];
+  return [
+    for (int i = 0; i < results.length; i++)
+      _withGltfSampler(results[i], doc, i) ?? _placeholder(),
+  ];
 }
 
-Future<Texture2D> _decodeAndUpload(
-  Uint8List bytes,
-  TextureContent content,
-) async {
-  final codec = await ui.instantiateImageCodec(bytes);
-  final frame = await codec.getNextFrame();
-  try {
-    return await Texture2D.fromImage(frame.image, content: content);
-  } finally {
-    frame.image.dispose();
+/// Applies glTF texture [textureIndex]'s sampler (wrap and filter modes) to
+/// [texture], which was created with the engine's default sampling.
+Texture2D? _withGltfSampler(
+  Texture2D? texture,
+  GltfDocument doc,
+  int textureIndex,
+) {
+  if (texture == null) return null;
+  final samplerIndex = doc.textures[textureIndex].sampler;
+  if (samplerIndex == null ||
+      samplerIndex < 0 ||
+      samplerIndex >= doc.samplers.length) {
+    return texture;
   }
+  final options = gltfSamplerOptions(
+    doc.samplers[samplerIndex],
+    texture.sampledSampler,
+  );
+  return identical(options, texture.sampledSampler)
+      ? texture
+      : texture.withSampler(options);
+}
+
+/// glTF sampler [sampler] as Flutter GPU sampler options, starting from
+/// [base] (the texture's default sampling) for anything glTF leaves unset.
+///
+/// Wrap modes map directly (33071 CLAMP_TO_EDGE, 33648 MIRRORED_REPEAT,
+/// 10497 REPEAT). An unset filter keeps [base]'s. Anisotropy survives only
+/// when every filter stays linear, since pairing it with a nearest filter is
+/// invalid. Returns [base] itself when the sampler changes nothing.
+gpu.SamplerOptions gltfSamplerOptions(
+  GltfSampler sampler,
+  gpu.SamplerOptions base,
+) {
+  gpu.SamplerAddressMode wrap(int mode) => switch (mode) {
+    33071 => gpu.SamplerAddressMode.clampToEdge,
+    33648 => gpu.SamplerAddressMode.mirror,
+    _ => gpu.SamplerAddressMode.repeat,
+  };
+  final mag = switch (sampler.magFilter) {
+    9728 => gpu.MinMagFilter.nearest,
+    9729 => gpu.MinMagFilter.linear,
+    _ => base.magFilter,
+  };
+  // minFilter also selects the mip filter (9984-9987 are the mipmapped
+  // variants).
+  // TODO(gltf-sampler): plain NEAREST/LINEAR (9728/9729) mean base level only,
+  // but keep the base mip filter since SamplerOptions has no base-only mip
+  // mode. Honor it by building such textures with `mipmaps: false`, which
+  // needs the sampler resolved before upload.
+  final (min, mip) = switch (sampler.minFilter) {
+    9728 => (gpu.MinMagFilter.nearest, base.mipFilter),
+    9729 => (gpu.MinMagFilter.linear, base.mipFilter),
+    9984 => (gpu.MinMagFilter.nearest, gpu.MipFilter.nearest),
+    9985 => (gpu.MinMagFilter.linear, gpu.MipFilter.nearest),
+    9986 => (gpu.MinMagFilter.nearest, gpu.MipFilter.linear),
+    9987 => (gpu.MinMagFilter.linear, gpu.MipFilter.linear),
+    _ => (base.minFilter, base.mipFilter),
+  };
+  final width = wrap(sampler.wrapS);
+  final height = wrap(sampler.wrapT);
+  if (width == base.widthAddressMode &&
+      height == base.heightAddressMode &&
+      min == base.minFilter &&
+      mag == base.magFilter &&
+      mip == base.mipFilter) {
+    return base;
+  }
+  final allLinear =
+      min == gpu.MinMagFilter.linear &&
+      mag == gpu.MinMagFilter.linear &&
+      mip == gpu.MipFilter.linear;
+  return gpu.SamplerOptions(
+    minFilter: min,
+    magFilter: mag,
+    mipFilter: mip,
+    widthAddressMode: width,
+    heightAddressMode: height,
+    maxAnisotropy: allLinear ? base.maxAnisotropy : 1,
+  );
 }
 
 Texture2D _placeholder() {

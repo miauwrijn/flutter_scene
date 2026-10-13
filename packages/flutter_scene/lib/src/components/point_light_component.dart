@@ -39,6 +39,11 @@ class PointLightComponent extends Component {
   /// translation.
   Vector3 get worldPosition => node.globalTransform.getTranslation();
 
+  /// [PointLight.photometryAxis] in world space (the node's rotation
+  /// applied), normalized.
+  Vector3 get worldPhotometryAxis =>
+      (node.globalTransform.getRotation() * light.photometryAxis)..normalize();
+
   /// Clones carry the light, sharing the light object like other clone
   /// payloads (geometry, materials).
   @override

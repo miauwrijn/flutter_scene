@@ -63,6 +63,9 @@ class MeshComponent extends Component {
         markMaterialSceneInputsChanged();
       }
       item.material = material;
+      // Now, not at the next tick, so a capture before it never reaches a
+      // material that cannot draw yet.
+      item.visible = !material.drawsNothing;
       staticShadowChanged |= item.shadowStatic && item.castsShadows;
     }
     if (staticShadowChanged) {
@@ -105,10 +108,10 @@ class MeshComponent extends Component {
     final renderScene = node.internalRenderScene;
     if (renderScene == null) return;
     for (final primitive in _mesh.primitives) {
-      final item = RenderItem(
-        geometry: primitive.geometry,
-        material: primitive.material,
-      )..sourceNode = node;
+      final item =
+          RenderItem(geometry: primitive.geometry, material: primitive.material)
+            ..sourceNode = node
+            ..drawSource = primitive;
       _renderItems.add(item);
       _boundsVersions.add(-1);
       renderScene.add(item);
@@ -158,6 +161,15 @@ class MeshComponent extends Component {
   @internal
   void refreshRenderItems() {
     if (_renderItems.isEmpty) return;
+    // The debug view override is a plain per-frame copy; it never touches the
+    // shadow or bounds state below, and the walk is skipped while no node
+    // anywhere sets one.
+    final debugView = Node.debugViewOverrideCount == 0
+        ? null
+        : node.effectiveDebugView;
+    for (final item in _renderItems) {
+      item.debugView = debugView;
+    }
     final worldTransformVersion = node.worldTransformVersion;
     var staticStateUnchanged =
         node.skin == null &&
@@ -177,6 +189,7 @@ class MeshComponent extends Component {
           item.primitiveVisible == primitive.visible &&
           item.frustumCulled == node.frustumCulled &&
           item.layers == node.layers &&
+          item.renderOrder == node.renderOrder &&
           item.lightChannelMask == node.lightChannelMask &&
           item.shadowStatic == node.shadowStatic &&
           item.shadowCastingMode == node.shadowCastingMode &&
@@ -185,21 +198,30 @@ class MeshComponent extends Component {
           _boundsVersions[index] == item.geometry.localBoundsVersion;
     }
     if (staticStateUnchanged) {
+      // Still since the last refresh, so last frame's motion is spent;
+      // otherwise a node that stops keeps reporting its final step.
+      for (final item in _renderItems) {
+        if (!item.isMoving) continue;
+        item.isMoving = false;
+        item.previousWorldTransform.setFrom(item.worldTransform);
+      }
       return;
     }
     final worldTransform = node.globalTransform;
     final transformChanged = worldTransformVersion != _worldTransformVersion;
     final windingFlipped = node.windingFlipped;
 
-    // A skinned node uploads its joint matrices once per frame. The texture
+    // A skinned node computes its joint matrices once per frame. The texture
     // rides on the render items, not the geometry, so nodes sharing one
     // skinned geometry (clones) each draw with their own skeleton; the
-    // render passes apply it to the geometry per draw.
+    // render passes apply it to the geometry per draw. The upload waits for
+    // the scene to commit to drawing the frame (RenderScene.flushJointUploads).
     final skin = node.skin;
+    final renderScene = node.internalRenderScene;
     final jointsTexture = skin?.getJointsTexture();
     final jointsTextureWidth = skin?.getTextureWidth() ?? 0;
+    if (skin != null) renderScene?.pendingJointUploads.add(skin);
 
-    final renderScene = node.internalRenderScene;
     final frustumCulled = node.frustumCulled;
     final layers = node.layers;
     final lightChannelMask = node.lightChannelMask;
@@ -229,6 +251,7 @@ class MeshComponent extends Component {
       final frustumCulledChanged = item.frustumCulled != frustumCulled;
       item.frustumCulled = frustumCulled;
       item.layers = layers;
+      item.renderOrder = node.renderOrder;
       item.lightChannelMask = lightChannelMask;
       final isMoving =
           transformChanged || (skin != null && jointsTexture != null);
@@ -247,7 +270,11 @@ class MeshComponent extends Component {
         item.jointsTexture = jointsTexture;
         item.jointsTextureWidth = jointsTextureWidth;
       }
-      item.morphWeights = node.internalMorphWeights;
+      final morphWeights = node.internalMorphWeights;
+      item.morphWeights = morphWeights;
+      // Grow the bounds before this frame culls against them.
+      if (morphWeights != null) item.geometry.coverMorphWeights(morphWeights);
+      if (transformChanged) item.geometry.coverWorldTransform(worldTransform);
       if (staticShadowChanged) renderScene?.markStaticShadowDirty();
 
       final boundsVersion = item.geometry.localBoundsVersion;

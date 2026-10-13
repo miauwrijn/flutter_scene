@@ -1,15 +1,10 @@
-import 'package:flutter/foundation.dart' show visibleForTesting;
-import 'package:flutter/services.dart'
-    show AssetBundle, AssetManifest, rootBundle;
+import 'package:flutter/foundation.dart' show internal, visibleForTesting;
+import 'package:flutter/services.dart' show AssetBundle;
 import 'package:flutter_scene/src/generated_assets/generated_asset_lookup.dart';
 import 'package:flutter_scene/src/generated_assets/generated_assets.dart';
 import 'package:flutter_scene/src/gpu/gpu.dart' as gpu;
-
-/// The key flutter_scene's own hook registers when the toolchain has Dart data
-/// assets. Follows `flutter_gpu_shaders`' data-asset naming; a test guards the
-/// two against drifting apart.
-const String _kBaseShaderBundleDataAssetPath =
-    'packages/flutter_scene/flutter_gpu_shaders/shaderbundles/base.shaderbundle';
+import 'package:flutter_scene/src/material/shader_interface.dart'
+    show markEngineShaderLibrary;
 
 gpu.ShaderLibrary? _baseShaderLibrary;
 
@@ -56,27 +51,21 @@ gpu.ShaderLibrary get baseShaderLibrary {
   return cached;
 }
 
-/// Resolves the asset key the base shader bundle shipped under: the data asset
-/// when the toolchain registered one, then the app's own generated tree, then
-/// flutter_scene's, which its own hook always fills.
+/// Resolves the asset key the base shader bundle shipped under: the app's own
+/// generated tree, then flutter_scene's, which its own hook always fills.
 @visibleForTesting
 Future<String?> resolveBaseShaderBundleKey({AssetBundle? bundle}) async {
-  try {
-    final manifest = await AssetManifest.loadFromAssetBundle(
-      bundle ?? rootBundle,
-    );
-    if (manifest.listAssets().contains(_kBaseShaderBundleDataAssetPath)) {
-      return _kBaseShaderBundleDataAssetPath;
-    }
-  } catch (_) {
-    // Nothing to scan; the generated trees below are the only source.
-  }
   return (await loadGeneratedAssetIndex(bundle)).resolveFirstKey(
     GeneratedAssetFamily.shaderBundle,
     'base',
     package: 'flutter_scene',
   );
 }
+
+/// The base shader library once it has loaded, else null. For code that may
+/// run before [Scene.initializeStaticResources] completes.
+@internal
+gpu.ShaderLibrary? get loadedBaseShaderLibrary => _baseShaderLibrary;
 
 /// Asynchronously loads and caches the base shader bundle. Idempotent.
 /// Called by [Scene.initializeStaticResources] so the synchronous
@@ -122,6 +111,7 @@ Future<void> _loadBaseShaderLibrary(AssetBundle? bundle) async {
   if (lib[baseShaderBundleProbeName] == null) {
     throw Exception(baseShaderBundleUnusableMessage(key));
   }
+  markEngineShaderLibrary(lib);
   _baseShaderLibrary = lib;
 }
 

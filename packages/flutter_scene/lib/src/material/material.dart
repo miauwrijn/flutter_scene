@@ -4,22 +4,28 @@ import 'package:flutter/services.dart' show rootBundle;
 import 'dart:math' as math;
 import 'dart:typed_data';
 
-import 'package:vector_math/vector_math.dart' show Matrix4;
+import 'package:vector_math/vector_math.dart' show Matrix4, Vector3;
 
+import 'package:flutter_scene/src/render/depth_raster.dart';
+import 'package:flutter_scene/src/fmat/fmat_ast.dart' show DepthSurfaceKind;
 import 'package:flutter_scene/src/gpu/gpu.dart' as gpu;
+import 'package:flutter_scene/src/geometry/geometry.dart';
 import 'package:flutter_scene/src/light.dart';
 import 'package:flutter_scene/src/material/dfg_lut.dart';
+import 'package:flutter_scene/src/material/dfg_lut_data.dart';
 
 import 'package:flutter_scene/src/material/environment.dart';
 import 'package:flutter_scene/src/material/instance_attributes.dart';
 import 'package:flutter_scene/src/material/physically_based_material.dart';
 import 'package:flutter_scene/src/material/unlit_material.dart';
+import 'package:flutter_scene/src/material/vertex_attributes.dart';
 import 'package:flutter_scene/src/render/custom_render_pass.dart';
 import 'package:flutter_scene/src/render/planar_reflection.dart';
 import 'package:flutter_scene/src/render_texture.dart';
 import 'package:flutter_scene/src/shaders.dart';
 import 'package:flutter_scene/src/texture/texture2d.dart';
 import 'package:flutter_scene/src/render/frame_transients.dart';
+import 'package:flutter_scene/src/render/uniform_slots.dart';
 
 int _sceneInputsRevision = 0;
 
@@ -87,6 +93,26 @@ abstract class Material {
   /// Returns [texture] if non-null, otherwise [getWhitePlaceholderTexture].
   static gpu.Texture whitePlaceholder(gpu.Texture? texture) {
     return texture ?? getWhitePlaceholderTexture();
+  }
+
+  static gpu.Texture? _transparentPlaceholderTexture;
+
+  /// Returns a 1x1 fully transparent texture, lazily created on first use.
+  ///
+  /// Composites as a no-op under premultiplied source-over, so a pass whose
+  /// layer is absent this frame can bind it and blend nothing.
+  static gpu.Texture getTransparentPlaceholderTexture() {
+    if (_transparentPlaceholderTexture != null) {
+      return _transparentPlaceholderTexture!;
+    }
+    final texture = gpu.gpuContext.createTexture(
+      gpu.StorageMode.hostVisible,
+      1,
+      1,
+    );
+    texture.overwrite(Uint32List.fromList(<int>[0]).buffer.asByteData());
+    _transparentPlaceholderTexture = texture;
+    return texture;
   }
 
   static gpu.Texture? _normalPlaceholderTexture;
@@ -168,24 +194,69 @@ abstract class Material {
     return _defaultEnvironmentMap ??= EnvironmentMap.studio();
   }
 
-  /// Builds the BRDF lookup texture and loads the physical shader variants.
+  /// Builds the shared BRDF/LTC lookup atlas.
   ///
   /// Called by the [Scene] constructor; rendering is gated on the returned
-  /// [Future] completing. The texture is built once and reused.
+  /// [Future] completing. The texture is built once and reused. The physical
+  /// material shaders load separately, on first use or through
+  /// `Scene.preload`.
   static Future<void> initializeStaticResources() async {
     if (_brdfLutTexture == null) {
       final ltc = await rootBundle.load(
         'packages/flutter_scene/assets/ltc.bin',
       );
+      final dfg = await _loadDfgTable();
       _brdfLutTexture = buildBrdfLutTexture(
         ltcHalfData: ltc.buffer.asUint16List(
           ltc.offsetInBytes,
           ltc.lengthInBytes ~/ 2,
         ),
+        dfgHalfData: dfg,
       );
     }
-    await PhysicallyBasedMaterial.initializeStaticResources();
   }
+
+  /// Reads the precomputed DFG table, or integrates it off the current isolate
+  /// when the asset is missing (an app bundling its own trimmed copy of the
+  /// package's assets).
+  ///
+  /// The integration is 4.19 M Monte-Carlo samples, a few hundred
+  /// milliseconds of solid CPU, which is why it never runs on the isolate that
+  /// renders. It is also why the fallback is loud. Losing the asset costs
+  /// every cold start that time for a table that is the same bytes on every
+  /// device, and silently paying it is worse than being told.
+  static Future<Uint16List> _loadDfgTable() async {
+    String? fallbackReason;
+    try {
+      final data = await rootBundle.load(
+        'packages/flutter_scene/assets/dfg.bin',
+      );
+      if (data.lengthInBytes == kDfgLutTileBytes) {
+        return data.buffer.asUint16List(
+          data.offsetInBytes,
+          data.lengthInBytes ~/ 2,
+        );
+      }
+      fallbackReason =
+          'it is ${data.lengthInBytes} bytes, expected $kDfgLutTileBytes';
+    } catch (error) {
+      fallbackReason = 'it could not be read ($error)';
+    }
+    final message =
+        'flutter_scene: packages/flutter_scene/assets/dfg.bin is unusable, '
+        '$fallbackReason. Integrating the environment BRDF instead, which '
+        'costs a few hundred milliseconds of CPU at every cold start. Ship '
+        "the package's assets unmodified to avoid it.";
+    debugPrint(message);
+    assert(false, message);
+    return compute<Object?, Uint16List>(
+      _integrateDfgTable,
+      null,
+      debugLabel: 'flutter_scene environment BRDF integration',
+    );
+  }
+
+  static Uint16List _integrateDfgTable(Object? _) => buildDfgLutHalfData();
 
   /// The name of this material, used for identification.
   ///
@@ -198,25 +269,74 @@ abstract class Material {
   /// culling so the geometry is visible from both sides; otherwise back faces
   /// are culled. Defaults to false. The runtime importer sets it from the glTF
   /// material.
+  ///
+  /// Turn it on only for geometry that needs it: culling is what hides the
+  /// coincident faces of pieces placed back to back, which flicker against
+  /// each other once both sides draw.
   bool doubleSided = false;
 
   /// World-space offset toward the camera used for coplanar surface details.
   /// Positive values keep an overlay in front of its supporting surface
   /// without modifying its node transform. Zero and negative values leave the
-  /// draw position unchanged. A fixed world offset provides fewer depth-buffer
-  /// units as camera distance grows, so distant coplanar surfaces may need a
-  /// larger value.
-  // TODO(depth-bias-distance): add a distance or slope-scaled mode for decals
-  // that must remain separated across a large depth range.
+  /// draw position unchanged.
+  ///
+  /// A fixed world offset buys fewer depth-buffer steps as camera distance
+  /// grows, so an overlay that holds up close can flicker far away. Prefer
+  /// [depthLayer], which holds at every distance. Billboards, sprites, line
+  /// segments, and splats ignore this; they honor [depthLayer].
   double depthBias = 0.0;
 
-  /// Per-draw level-of-detail cross-fade coverage, set by the encoder right
-  /// before [bind] and written into the material's `FragInfo.fade`. 1 draws
-  /// every fragment; a value in (0, 1) keeps that dithered fraction and a
-  /// negative value keeps the complement (see lod_fade.glsl). Only the
-  /// built-in lit and unlit materials honor it.
+  /// Which surface wins where this material's geometry and another's lie in
+  /// the same plane. A surface with a higher layer draws over coplanar
+  /// surfaces with a lower one, at any distance and on every backend.
+  ///
+  /// Use it for overlays that sit on a surface (a sign or screen on a wall,
+  /// a road marking, a decal quad, a rug): place the overlay at the surface or
+  /// slightly in front of it and give it layer 1, an overlay on that overlay
+  /// layer 2, and so on. Negative layers let a ground yield to everything
+  /// placed on it. Two different materials at the same layer that overlap in
+  /// one plane flicker (z-fighting), so give them different layers or keep
+  /// them apart.
+  ///
+  /// Each layer moves the surface toward the camera in the vertex stage by a
+  /// quarter of a pixel's worth of its own depth slope plus a few
+  /// depth-buffer steps (more far from the world origin, where float rounding
+  /// is coarser). That beats the rasterizer's rounding on a surface seen at a
+  /// grazing angle, costs nothing per fragment, and never moves anything on
+  /// screen by more than a fraction of a pixel. Curved layered meshes get a
+  /// larger offset near their silhouettes. Clamped to `-8..8`. Shadow maps
+  /// ignore it. Defaults to 0.
+  int get depthLayer => _depthLayer;
+  set depthLayer(int value) {
+    _depthLayer = value.clamp(-kMaxDepthLayer, kMaxDepthLayer);
+  }
+
+  int _depthLayer = 0;
+
+  /// A rank in `0..2` from this material's creation order, which the
+  /// automatic coplanar tie-break (`Scene.coplanarTieBreak`) turns into a
+  /// small depth offset. Consecutively created materials always differ.
+  @internal
+  final int tieBreakRank = _nextTieBreakRank();
+
+  static int _tieBreakCounter = 0;
+  static int _nextTieBreakRank() => _tieBreakCounter++ % 3;
+
+  /// Per-draw level-of-detail cross-fade coverage for a blended draw, set by
+  /// the encoder right before [bind] and written into the material's
+  /// `FragInfo.fade`, which scales its opacity. 1 draws at full opacity; a
+  /// value in (0, 1) or its negative complement (see lod_fade.glsl) draws at
+  /// that fraction. Opaque draws always bind 1, since their dithered coverage
+  /// comes from the main pass's coverage pre-draw. Only materials with
+  /// [lodCrossFades] honor it.
   @internal
   double lodFade = 1.0;
+
+  /// Whether this material cross-fades between levels of detail. An opaque
+  /// draw of one that is mid-fade takes the coverage pre-draw, which dithers
+  /// it against the adjacent level. The built-in lit and unlit materials do.
+  @internal
+  bool get lodCrossFades => false;
 
   /// The owning render item's punctual-light slice, set by the encoder right
   /// before [bind] and written into `FragInfo.radiance_blend.zw`. The lit
@@ -291,6 +411,7 @@ abstract class Material {
     _noShadowFragmentShaderName = null;
     _noShadowRadianceCubeFragmentShader = null;
     _noShadowRadianceCubeFragmentShaderName = null;
+    _leanShaders = null;
   }
 
   /// Assigns the fragment shader by [name] from [baseShaderLibrary].
@@ -321,6 +442,59 @@ abstract class Material {
     _noShadowFragmentShader = null;
     _noShadowRadianceCubeFragmentShaderName = noShadowCubeName;
     _noShadowRadianceCubeFragmentShader = null;
+    _leanShaders = null;
+  }
+
+  _LeanFragmentShaders? _leanShaders;
+
+  /// Assigns the `FLUTTER_SCENE_LEAN_LIGHTING` twins of the four entries
+  /// named by [setFragmentShaderName], by name from [baseShaderLibrary].
+  /// Call after [setFragmentShaderName], which clears them.
+  ///
+  /// The twins keep their full entries' binding interface, so every binding
+  /// decision stays the same; only the shader differs.
+  @internal
+  void setLeanFragmentShaderNames(
+    String name, {
+    required String cubeName,
+    required String noShadowName,
+    required String noShadowCubeName,
+  }) {
+    _leanShaders = _LeanFragmentShaders(
+      name,
+      cubeName,
+      noShadowName,
+      noShadowCubeName,
+    );
+  }
+
+  /// The environment this material lights a draw with: its own override, or
+  /// the scene's.
+  @internal
+  EnvironmentMap drawEnvironment(Lighting lighting) => lighting.environmentMap;
+
+  /// Whether [fragmentShaderForLighting] picks a lean twin for [lighting]:
+  /// the material carries twins, every feature they compile out is off this
+  /// frame ([Lighting.allowsLeanShading]), and the draw's environment has no
+  /// parallax box. A bundle built without the twins keeps the full entries.
+  // TODO(lean-lighting-fallback): draw with the full entry until the lean
+  // pipeline is ready once Flutter GPU can build a pipeline off the calling
+  // thread and report when it is done. Today the backend pipeline is created
+  // inside the first draw that uses it, so there is nothing to wait on; a
+  // runtime tier switch costs that draw's frame unless warmUp compiled both
+  // tiers (Scene.warmUp's allShadingTiers).
+  // TODO(lean-lighting-pruning): a hook user-define that leaves the full or
+  // the lean entries out of the bundle for apps that never need them.
+  @internal
+  bool usesLeanVariant(Lighting lighting) {
+    final lean = _leanShaders;
+    if (lean == null || !lean.available) return false;
+    // A warm-up override forces its tier past the per-draw checks too.
+    final override = shadingTierOverride;
+    if (override != null) return override;
+    if (!lighting.allowsLeanShading) return false;
+    final env = drawEnvironment(lighting);
+    return env.parallaxBoxCenter == null || env.parallaxBoxHalfExtents == null;
   }
 
   gpu.Shader? _radianceCubeFragmentShader;
@@ -405,7 +579,14 @@ abstract class Material {
   @internal
   gpu.Shader fragmentShaderForLighting(Lighting lighting) {
     final noShadow = usesNoShadowVariant(lighting);
-    if (usesRadianceCubeVariant(lighting)) {
+    final cube = usesRadianceCubeVariant(lighting);
+    if (usesLeanVariant(lighting)) {
+      final lean = _leanShaders!;
+      return cube
+          ? (noShadow ? lean.noShadowCube! : lean.cube!)
+          : (noShadow ? lean.noShadow! : lean.base!);
+    }
+    if (cube) {
       return noShadow
           ? noShadowRadianceCubeFragmentShader!
           : radianceCubeFragmentShader!;
@@ -433,6 +614,32 @@ abstract class Material {
   /// pipeline's vertex layout as well as of what an instanced mesh accepts.
   @internal
   InstanceAttributeSchema? get instanceAttributes => null;
+
+  /// Whether the depth-style passes (shadow maps, the depth prepass) must run
+  /// this material's full vertex variant for [geometry] rather than the
+  /// position-only one. True when a `vertex { }` stage can read custom or
+  /// per-instance attributes, which the position-only path does not fetch, so
+  /// geometry built in the vertex shader casts the shadow it draws.
+  @internal
+  bool needsFullVertexForDepth(Geometry geometry) =>
+      materialVertexShader(geometry.materialVertexVariant) != null &&
+      (geometry.hasCustomAttributes || instanceAttributes != null);
+
+  /// The custom vertex attributes this material's own vertex shaders read, or
+  /// null to bind every stream the geometry carries (a raw `ShaderMaterial`,
+  /// whose inputs the engine cannot see).
+  ///
+  /// TODO(raw-shader-vertex-attributes): let a raw `ShaderMaterial` declare
+  /// its attributes so a geometry's extra streams stop breaking its pipeline.
+  @internal
+  VertexAttributeSchema? get vertexAttributes => null;
+
+  /// The custom vertex attributes a draw reads when it runs [materialVertex]
+  /// (this material's vertex shader for the pass, or null for the engine's).
+  /// Engine vertex shaders read none.
+  @internal
+  VertexAttributeSchema? vertexAttributesFor(gpu.Shader? materialVertex) =>
+      materialVertex == null ? VertexAttributeSchema.none : vertexAttributes;
 
   /// Binds this material's vertex-stage uniforms to [vertexShader], called by
   /// the encoder only when it used a material-supplied vertex shader (see
@@ -487,6 +694,12 @@ abstract class Material {
   @internal
   bool get translucentDepthWrite => false;
 
+  /// Whether this translucent material joins the visible-surface depth that
+  /// depth of field and depth-reading custom passes see. Defaults to
+  /// [translucentDepthWrite].
+  @internal
+  bool get translucentEffectsDepth => translucentDepthWrite;
+
   /// Whether this material's geometry joins the camera depth prepass that
   /// feeds the screen-space chain (ambient occlusion, contact shadows,
   /// reflections, depth of field).
@@ -496,7 +709,9 @@ abstract class Material {
   /// screen-space chain, the shadow catcher, overrides this to true so
   /// occlusion is evaluated at its own depth instead of the backdrop's.
   @internal
-  bool get depthPrepassParticipates => isOpaque();
+  // A display-referred surface is composited past the scene's depth, so it
+  // must not seed the prepass that ambient occlusion and reflections read.
+  bool get depthPrepassParticipates => isOpaque() && !displayReferred;
 
   /// Whether this material currently draws nothing at all, keeping its render
   /// items out of every pass (color, depth prepass, shadows).
@@ -506,6 +721,12 @@ abstract class Material {
   /// `shadowIntensity == 0` as a true early-out.
   @internal
   bool get drawsNothing => false;
+
+  /// Whether this material needs a resource that is still loading (the
+  /// physical shader bundle) to draw correctly. A scene holds its frames while
+  /// any of its materials says so.
+  @internal
+  bool get awaitsDeferredResources => false;
 
   /// The depth test geometry drawn with this material uses in the translucent
   /// pass. `lessEqual` (the default) occludes against the opaque scene;
@@ -523,6 +744,47 @@ abstract class Material {
   bool isOpaque() {
     return true;
   }
+
+  /// Whether this material's color is display-referred (already final screen
+  /// values) rather than scene-referred radiance.
+  ///
+  /// A display-referred surface is drawn into its own layer past the tone
+  /// curve and composited onto the resolved image, so its colors survive
+  /// exactly. Captured widgets are the motivating case, and
+  /// `WidgetComponent` turns it on for the material it owns. The surface is
+  /// still depth-tested against the scene, but it receives no exposure,
+  /// grading, tone mapping, fog, bloom or depth of field, and it is not
+  /// ordered against translucent geometry.
+  ///
+  /// A material that returns true must write display-encoded color
+  /// premultiplied by alpha, not linear HDR.
+  bool get displayReferred => false;
+
+  /// Whether this material's fragment shader declares the `DebugViewInfo`
+  /// block and switches on it (see `material_debug.glsl`), so the scene's
+  /// surface debug views can show its resolved surface.
+  ///
+  /// Every engine material and every `.fmat` participates. A raw
+  /// [ShaderMaterial] opts in through its constructor after including the
+  /// hook; one that does not is drawn through the engine's fallback debug
+  /// shader while a view is active, which serves the geometry and identity
+  /// channels and stripes everything else.
+  @internal
+  bool get participatesInDebugViews => false;
+
+  /// Whether this material draws the surface debug views itself under
+  /// [lighting]: it participates, and the shader it draws with was built with
+  /// them (flutter_scene's `debug_views` hook user-define, or the shader's own
+  /// `FLUTTER_SCENE_DEBUG_VIEWS`). Otherwise an active view draws it through
+  /// the fallback debug shader. Both decisions, the shader and whether to bind
+  /// `DebugViewInfo`, must come from here.
+  @internal
+  bool drawsDebugViews(Lighting lighting) =>
+      participatesInDebugViews &&
+      fragmentShaderForLighting(
+            lighting,
+          ).cachedUniformSlot('DebugViewInfo').sizeInBytes !=
+          null;
 
   /// Per-frame engine inputs this material samples, produced only when a
   /// visible material asks for them: [RenderInput.depth] binds the linear
@@ -592,6 +854,23 @@ abstract class Material {
   @internal
   double get reflectionRoughnessFactor => 1.0;
 
+  /// The roughness the reflections see for a surface of [roughness] under
+  /// a clear coat of strength [clearcoat] and [clearcoatRoughness]: the
+  /// two blended by the coat's strength. A lacquered floor reflects
+  /// through its coat — with the base roughness alone the trace faded it
+  /// out as matte and it reflected nothing — but a coat at 0.6 is not a
+  /// mirror laid over the wood: taking the coat's roughness outright made
+  /// the parquet one.
+  static double coatedReflectionRoughness(
+    double roughness,
+    double clearcoat,
+    double clearcoatRoughness,
+  ) {
+    if (clearcoat <= 0 || clearcoatRoughness >= roughness) return roughness;
+    final c = clearcoat.clamp(0.0, 1.0);
+    return roughness + (clearcoatRoughness - roughness) * c;
+  }
+
   /// Whether the depth-writing passes (the shadow map and the camera depth
   /// prepass) must alpha-test this material's coverage instead of writing its
   /// full geometry, so cutout surfaces (foliage, fences) occlude, shadow, and
@@ -601,6 +880,27 @@ abstract class Material {
   /// call [bindDepthAlphaMask]. The base material writes full geometry.
   @internal
   bool get depthAlphaMasked => false;
+
+  /// The material's own fragment for a depth-writing pass, or null to use
+  /// the engine's. A cutout `.fmat` supplies one that runs its `Surface()` and
+  /// drops what it leaves uncovered, so the depth prepass and shadow maps
+  /// match its visible coverage. Such a draw uses the full vertex path and
+  /// binds through [bindDepthSurface].
+  @internal
+  gpu.Shader? depthSurfaceShader(DepthSurfaceKind kind) => null;
+
+  /// Binds what a [depthSurfaceShader] reads besides the pass's own info
+  /// block: the material parameters and any engine block its `Surface()`
+  /// kept, filled with the pass camera at [cameraPosition] looking along
+  /// [cameraForward].
+  @internal
+  void bindDepthSurface(
+    gpu.RenderPass pass,
+    gpu.Shader shader,
+    TransientWriter transientsBuffer, {
+    required Vector3 cameraPosition,
+    required Vector3 cameraForward,
+  }) {}
 
   /// Binds the mask texture and MaskInfo parameters consumed by the masked
   /// depth fragment shaders; [shader] is the masked variant the pass drew
@@ -708,19 +1008,19 @@ abstract class Material {
       info.setRange(12, 20, normalTransform);
     }
     pass.bindUniform(
-      shader.getUniformSlot('MaskSurfaceInfo'),
+      shader.cachedUniformSlot('MaskSurfaceInfo'),
       transientsBuffer.emplace(ByteData.sublistView(info)),
     );
     if (bindBaseColor) {
       pass.bindTexture(
-        shader.getUniformSlot('base_color_texture'),
+        shader.cachedUniformSlot('base_color_texture'),
         whitePlaceholder(baseColorTexture),
         sampler: baseColorSampler ?? _maskRepeatSampler,
       );
     }
     if (bindNormal) {
       pass.bindTexture(
-        shader.getUniformSlot('normal_texture'),
+        shader.cachedUniformSlot('normal_texture'),
         normalPlaceholder(normalTexture),
         sampler: normalSampler ?? _maskRepeatSampler,
       );
@@ -732,4 +1032,35 @@ abstract class Material {
     widthAddressMode: gpu.SamplerAddressMode.repeat,
     heightAddressMode: gpu.SamplerAddressMode.repeat,
   );
+}
+
+// The lean twins of a material's four standard entries, resolved on first use.
+class _LeanFragmentShaders {
+  _LeanFragmentShaders(
+    this._name,
+    this._cubeName,
+    this._noShadowName,
+    this._noShadowCubeName,
+  );
+
+  final String _name;
+  final String _cubeName;
+  final String _noShadowName;
+  final String _noShadowCubeName;
+
+  gpu.Shader? _base;
+  gpu.Shader? _cube;
+  gpu.Shader? _noShadow;
+  gpu.Shader? _noShadowCube;
+
+  gpu.Shader? get base => _base ??= baseShaderLibrary[_name];
+  gpu.Shader? get cube => _cube ??= baseShaderLibrary[_cubeName];
+  gpu.Shader? get noShadow => _noShadow ??= baseShaderLibrary[_noShadowName];
+  gpu.Shader? get noShadowCube =>
+      _noShadowCube ??= baseShaderLibrary[_noShadowCubeName];
+
+  /// Whether the bundle carries all four. Asked only at draw time, after the
+  /// base bundle has loaded.
+  late final bool available =
+      base != null && cube != null && noShadow != null && noShadowCube != null;
 }

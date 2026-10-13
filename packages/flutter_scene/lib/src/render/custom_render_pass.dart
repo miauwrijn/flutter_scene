@@ -1,4 +1,3 @@
-import 'dart:math' as math;
 import 'dart:typed_data';
 import 'dart:ui' as ui;
 
@@ -10,6 +9,7 @@ import 'package:flutter_scene/src/camera.dart';
 import 'package:flutter_scene/src/light.dart';
 import 'package:flutter_scene/src/render/depth_prepass.dart';
 import 'package:flutter_scene/src/render/object_filter.dart';
+import 'package:flutter_scene/src/render/projection_params.dart';
 import 'package:flutter_scene/src/render/render_graph.dart';
 import 'package:flutter_scene/src/render/render_graph_capture.dart'
     show RenderGraphDebug;
@@ -21,6 +21,7 @@ import 'package:flutter_scene/src/shader_uniform_bindings.dart';
 import 'package:flutter_scene/src/shaders.dart';
 import 'package:flutter_scene/src/render/frame_transients.dart';
 import 'package:flutter_scene/src/scene_encoder.dart' show resolvePipeline;
+import 'package:flutter_scene/src/render/uniform_slots.dart';
 
 /// Packs the `PostShadowInfo` std140 block a depth-aware custom pass reads
 /// (exposed as [RenderPassContext.shadowInfo]) from the frame's [cascades],
@@ -86,8 +87,9 @@ enum RenderStage {
 /// {@category Rendering}
 enum RenderInput {
   /// The linear (view-space) depth buffer, on
-  /// [RenderPassContext.sceneDepthLinear]. Needs a perspective camera;
-  /// reconstruct positions with [RenderPassContext.cameraInfo].
+  /// [RenderPassContext.sceneDepthLinear]. Reconstruct positions with
+  /// [RenderPassContext.cameraInfo]. It holds the nearest visible surface,
+  /// including translucent materials that write depth.
   depth,
 
   /// View-space normals, octahedral-packed into the green/blue channels of the
@@ -113,6 +115,14 @@ enum RenderInput {
   /// current material draw. Materials use it for rough refraction. This
   /// implies [opaqueSceneColor] capture and is produced only when requested.
   filteredSceneColor,
+
+  /// The nearest **translucent** depth-carrying surface (glass) in front of
+  /// the opaque scene, on [RenderPassContext.translucentSurface]: the same
+  /// layout as the linear depth with normals (planar depth, octahedral
+  /// view-space normal, roughness), the far plane where there is none.
+  /// Implies [normals]. For effects that shade the pane itself — its
+  /// reflection — while everything else reads the scene behind it.
+  translucentSurface,
 }
 
 /// A user-supplied render pass inserted into the built-in pipeline at a
@@ -242,17 +252,31 @@ class RenderPassContext {
   /// The linear (view-space) depth buffer: planar view-space depth (world
   /// units) in the red channel, with the octahedral-packed view-space normal in
   /// green/blue when [RenderInput.normals] was requested. Non-null when the pass
-  /// declared [RenderInput.depth] (or [RenderInput.normals]) and the camera is
-  /// perspective; also present when ambient occlusion or reflections ran.
+  /// declared [RenderInput.depth] (or [RenderInput.normals]); also present when
+  /// ambient occlusion or reflections ran.
   gpu.Texture? get sceneDepthLinear =>
       _context.blackboard.get<gpu.Texture>(kLinearDepthBlackboardKey);
 
-  /// The directional light's cascaded shadow map atlas (a horizontal strip of
-  /// `shadowInfo` cascade tiles, window-space depth in the red channel).
-  /// Non-null when the pass declared [RenderInput.shadowMap] and the scene has
-  /// a shadow-casting directional light. Pair with [shadowInfo].
+  /// The nearest translucent depth-carrying surface in front of the opaque
+  /// scene (see [RenderInput.translucentSurface]); null unless requested,
+  /// and when no such surface is in view.
+  gpu.Texture? get translucentSurface =>
+      _context.blackboard.get<gpu.Texture>(kTranslucentSurfaceBlackboardKey);
+
+  /// The shared shadow atlas (a horizontal strip of tiles, window-space depth
+  /// in the red channel): the directional cascades first, then one tile per
+  /// casting spot (see [spotShadows]). Non-null when the pass declared
+  /// [RenderInput.shadowMap] and a light cast this frame. Pair with
+  /// [shadowInfo] for the cascades.
   gpu.Texture? get shadowMap =>
       _context.blackboard.get<gpu.Texture>(kShadowMapBlackboardKey);
+
+  /// The spot shadows' place in [shadowMap] (their matrices and tiles), or
+  /// null when no spot cast this frame. Spot tiles share the atlas with the
+  /// directional cascades, so a pass that samples spot shadows declares
+  /// [RenderInput.shadowMap] and reads the atlas from [shadowMap].
+  SpotShadowInfo? get spotShadows =>
+      _context.blackboard.get<SpotShadowInfo>(kSpotShadowInfoBlackboardKey);
 
   /// The packed `PostShadowInfo` std140 uniform block matching [shadowMap]:
   /// four `mat4` world->cascade-clip matrices, a `vec4` of the cascades'
@@ -264,23 +288,34 @@ class RenderPassContext {
       _context.blackboard.get<ByteData>(kShadowUniformBlackboardKey);
 
   /// A packed `PostCameraInfo` std140 uniform block for reconstructing world
-  /// positions from [sceneDepthLinear]. Layout: a `vec4` `(tan(fovX/2),
-  /// tan(fovY/2), near, far)`, then the camera basis as three `vec4`s (right,
-  /// up, forward, matching the depth prepass's view space: the eye at the origin
-  /// looking down +forward), then a `vec4` camera world position. Reconstruct
-  /// with `viewZ = depth; viewXY = (2*uv - 1 flipped) * viewZ * tangents;
-  /// world = position + right*viewX + up*viewY + forward*viewZ`. Bind it under a
-  /// `PostCameraInfo` block via [applyShader]'s `uniforms`. The projection terms
-  /// are zero for a non-perspective camera (where depth is unavailable).
+  /// positions from [sceneDepthLinear], for any camera projection. Layout:
+  ///
+  /// * `vec4 projection`: xy the view-space extent per unit of NDC (the half-fov
+  ///   tangents for perspective, the half width and height for orthographic),
+  ///   z near, w far.
+  /// * `vec4 camera_right`, `vec4 camera_up`, `vec4 camera_forward`: the camera
+  ///   basis in xyz, matching the depth prepass's view space (the eye at the
+  ///   origin looking down +forward). `camera_right.w` and `camera_up.w` are the
+  ///   NDC position of the view axis (zero unless off-center), and
+  ///   `camera_forward.w` is 1 for an orthographic camera and 0 for perspective.
+  /// * `vec4 camera_position`: the eye in xyz.
+  ///
+  /// `#include <view_projection.glsl>` and reconstruct with
+  /// `ViewPositionFromUv(uv, depth, projection.xy, offset)`, where `offset` is
+  /// `vec3(camera_right.w, camera_up.w, camera_forward.w)`, then
+  /// `world = position + right * view.x + up * view.y + forward * view.z`. Bind
+  /// it under a `PostCameraInfo` block via [applyShader]'s `uniforms`.
   ByteData get cameraInfo {
     final f = Float32List(20); // 5 vec4
-    final projection = camera.projection;
-    if (projection is PerspectiveProjection && dimensions.height > 0) {
-      final tanY = math.tan(projection.fovRadiansY * 0.5);
-      f[0] = tanY * (dimensions.width / dimensions.height);
-      f[1] = tanY;
+    if (dimensions.height > 0) {
+      final projection = ProjectionParams.of(camera.projection, dimensions);
+      f[0] = projection.scaleX;
+      f[1] = projection.scaleY;
       f[2] = projection.near;
       f[3] = projection.far;
+      f[7] = projection.offsetX;
+      f[11] = projection.offsetY;
+      f[15] = projection.orthographicFlag;
     }
     // The same view basis the depth prepass encodes against (eye at origin
     // looking down +forward), so a reconstructed view point maps to world.
@@ -418,7 +453,7 @@ class RenderPassContext {
     bindVertexBufferCompat(renderPass, _quadView, 6);
 
     renderPass.bindTexture(
-      fragmentShader.getUniformSlot('input_color'),
+      fragmentShader.cachedUniformSlot('input_color'),
       input,
       sampler: _linearClamp,
     );
@@ -433,7 +468,7 @@ class RenderPassContext {
         ..[3] = h == 0 ? 0.0 : 1.0 / h
         ..[4] = _time;
       renderPass.bindUniform(
-        fragmentShader.getUniformSlot('PostFrameInfo'),
+        fragmentShader.cachedUniformSlot('PostFrameInfo'),
         _context.transientsBuffer.emplace(ByteData.sublistView(info)),
       );
     }

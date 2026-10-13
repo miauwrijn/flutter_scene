@@ -19,8 +19,8 @@ dependencies:
   flutter:
     sdk: flutter
   file_selector: ^1.0.0
-  flutter_scene: ^0.23.0
-  scene: ^0.3.0
+  flutter_scene: ^0.24.0
+  scene: ^0.4.0
   flutter_scene_editor_core:
     path: ../flutter_scene_editor_core
   flutter_scene_mcp:
@@ -31,7 +31,8 @@ dependencies:
   native_mouse_cursor: ^1.2.1
   two_dimensional_scrollables: ^0.5.0
   vector_math: ^2.1.4
-  forui: ^0.25.0
+  forui: ^0.27.2
+  material_ui: ^1.0.0
 
 dev_dependencies:
   file_selector_platform_interface: ^2.7.0

@@ -4,9 +4,12 @@
 // encoded n * 0.5 + 0.5. Alpha is the per-item color's alpha. Pairs with
 // the engine's full vertex shaders; MaskInfo matches flutter_scene_mask.frag.
 
+// Varyings only; nothing here reads the view axis.
+#define FLUTTER_SCENE_NO_VIEW_INFO
 #include <material_varyings.glsl>
 #include <material_inputs.glsl>
 #include <normals.glsl>
+#define MASK_SURFACE_NORMAL
 #include <mask_surface.glsl>
 
 uniform MaskInfo {

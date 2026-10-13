@@ -108,10 +108,12 @@ class SceneView extends StatefulWidget {
     this.pixelRatio,
     this.onTick,
     this.clock,
+    this.maxFrameRate,
     this.loading,
     this.loadingBuilder,
     this.revealMinDuration = Duration.zero,
     this.warmUp = false,
+    this.warmUpAllShadingTiers = false,
     this.debugWidgetInput = false,
     this.children = const [],
   }) : environment = null,
@@ -153,10 +155,12 @@ class SceneView extends StatefulWidget {
     this.pixelRatio,
     this.onTick,
     this.clock,
+    this.maxFrameRate,
     this.loading,
     this.loadingBuilder,
     this.revealMinDuration = Duration.zero,
     this.warmUp = false,
+    this.warmUpAllShadingTiers = false,
     this.debugWidgetInput = false,
     this.children = const [],
   }) : scene = null,
@@ -169,7 +173,8 @@ class SceneView extends StatefulWidget {
        );
 
   /// The scene to render, owned and mutated by the application. Null when
-  /// the view owns its scene ([SceneView.declarative]).
+  /// the view owns its scene ([SceneView.declarative]), which it disposes
+  /// when it is disposed. An app-owned scene is the app's to dispose.
   final Scene? scene;
 
   /// Declarative scene widgets mounted at the scene root (via [SceneScope]).
@@ -237,6 +242,15 @@ class SceneView extends StatefulWidget {
   /// controls time itself.
   final Clock? clock;
 
+  /// Caps how often the view ticks and renders, in frames per second. Null
+  /// renders every display frame.
+  ///
+  /// Each frame renders on the display refresh nearest its deadline, so a
+  /// cap that divides the refresh rate gives an even cadence (60 on a 120 Hz
+  /// display renders every other refresh), which suits screen recording and
+  /// saves power. Skipped refreshes neither call [onTick] nor repaint.
+  final double? maxFrameRate;
+
   /// Resources this view waits for before it reveals the scene.
   ///
   /// While the group is loading (and while the engine's shared static
@@ -266,6 +280,12 @@ class SceneView extends StatefulWidget {
   /// view even without a [loading] group or [loadingBuilder]. Populate the
   /// scene before warm-up runs (loads tracked by [loading] are awaited first).
   final bool warmUp;
+
+  /// With [warmUp], also compile the lit shader tier the scene is not using
+  /// yet (see [Scene.warmUp]'s `allShadingTiers`), so turning ambient
+  /// occlusion or another tier-switching feature on or off later does not
+  /// stall a frame. Lengthens warm-up.
+  final bool warmUpAllShadingTiers;
 
   /// Resolves the camera for a single-view frame.
   ///
@@ -320,6 +340,10 @@ class _SceneViewState extends State<SceneView>
   // deltas; null until the first revealed tick.
   DateTime? _lastTickTime;
 
+  // When the next frame is due under [SceneView.maxFrameRate], in ticker
+  // time; null renders the next tick.
+  Duration? _frameDue;
+
   Clock get _clock => widget.clock ?? clock;
 
   // Zero-based clock: the ticker's raw elapsed at the moment the scene is
@@ -357,6 +381,7 @@ class _SceneViewState extends State<SceneView>
     _scene.renderScene.semanticsComponentsChanged.addListener(
       _onSemanticsChanged,
     );
+    _scene.repaintRequested.addListener(_onRepaintRequested);
     if (widget.autoTick) {
       _ticker = createTicker(_onTick)..start();
     }
@@ -374,6 +399,9 @@ class _SceneViewState extends State<SceneView>
   }
 
   void _onAssetsRefreshed() => _repaint.notify();
+
+  // A paced frame's GPU work finished; paint the frame the view held.
+  void _onRepaintRequested() => _repaint.notify();
 
   // Creates the owned scene for the declarative form and applies every scene
   // prop, the single creation path for initState and constructor-form
@@ -415,6 +443,7 @@ class _SceneViewState extends State<SceneView>
   @override
   void didUpdateWidget(SceneView oldWidget) {
     super.didUpdateWidget(oldWidget);
+    if (widget.maxFrameRate != oldWidget.maxFrameRate) _frameDue = null;
     if (widget.autoTick != oldWidget.autoTick) {
       _ticker?.dispose();
       _ticker = widget.autoTick ? (createTicker(_onTick)..start()) : null;
@@ -432,6 +461,7 @@ class _SceneViewState extends State<SceneView>
     } else if (_ownedScene != null) {
       // Switched from the declarative form to an app-owned scene; drop the
       // owned scene so a later switch back starts fresh.
+      _ownedScene!.dispose();
       _ownedScene = null;
       _ownedDefaultEnvironment = null;
     }
@@ -439,9 +469,11 @@ class _SceneViewState extends State<SceneView>
       oldScene?.renderScene.semanticsComponentsChanged.removeListener(
         _onSemanticsChanged,
       );
+      oldScene?.repaintRequested.removeListener(_onRepaintRequested);
       _scene.renderScene.semanticsComponentsChanged.addListener(
         _onSemanticsChanged,
       );
+      _scene.repaintRequested.addListener(_onRepaintRequested);
       _sceneSemantics = SceneSemanticsCoordinator(_scene);
       _autoPointer = null;
     }
@@ -500,10 +532,19 @@ class _SceneViewState extends State<SceneView>
     if (!mounted || generation != _revealGeneration) return;
     await _childLoads.ready;
     if (!mounted || generation != _revealGeneration) return;
+    // Shaders the content started loading on first use (the physical
+    // materials) decide which pipelines warm-up compiles.
+    await _scene.deferredResourcesSettled(_warmUpViews());
+    if (!mounted || generation != _revealGeneration) return;
     // Compile the pipelines the first frame needs while the loading widget is
     // still up, so the reveal frame does not stall.
     if (widget.warmUp) {
-      await _scene.warmUp(_warmUpViews());
+      // In slices, so a slow device keeps answering input while it compiles.
+      await _scene.warmUp(
+        _warmUpViews(),
+        sliceBudget: const Duration(milliseconds: 50),
+        allShadingTiers: widget.warmUpAllShadingTiers,
+      );
       if (!mounted || generation != _revealGeneration) return;
     }
     final remaining =
@@ -528,6 +569,18 @@ class _SceneViewState extends State<SceneView>
       _tickOrigin = elapsed;
       _lastTickTime = now;
       return;
+    }
+    final rate = widget.maxFrameRate;
+    if (rate != null && rate > 0) {
+      final period = Duration(microseconds: (1e6 / rate).round());
+      final due = _frameDue;
+      // A quarter period of slack picks the refresh nearest the deadline.
+      if (due != null && elapsed < due - period ~/ 4) return;
+      // Deadlines advance by whole periods to hold the average rate; one
+      // missed by more than a period restarts from this frame.
+      _frameDue = due == null || elapsed - due > period
+          ? elapsed + period
+          : due + period;
     }
     final revealElapsed = elapsed - _tickOrigin;
     final deltaSeconds = _lastTickTime == null
@@ -653,9 +706,11 @@ class _SceneViewState extends State<SceneView>
     _scene.renderScene.semanticsComponentsChanged.removeListener(
       _onSemanticsChanged,
     );
+    _scene.repaintRequested.removeListener(_onRepaintRequested);
     _ticker?.dispose();
     _repaint.dispose();
     _elapsed.dispose();
+    _ownedScene?.dispose();
     super.dispose();
   }
 

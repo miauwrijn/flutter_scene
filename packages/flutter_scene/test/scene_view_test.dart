@@ -157,6 +157,62 @@ void main() {
     }
   });
 
+  testWidgets('maxFrameRate renders every other refresh at half rate', (
+    tester,
+  ) async {
+    final scene = _tryScene();
+    if (scene == null) {
+      markTestSkipped('No Impeller GPU context');
+      return;
+    }
+    final ticks = <Duration>[];
+    await tester.pumpWidget(
+      _sized(
+        SceneView(
+          scene,
+          camera: PerspectiveCamera(),
+          maxFrameRate: 60,
+          onTick: (elapsed, _) => ticks.add(elapsed),
+        ),
+      ),
+    );
+    // A 120 Hz display, with a little timestamp jitter.
+    for (var i = 0; i < 120; i++) {
+      await tester.pump(Duration(microseconds: 8333 + (i % 3 - 1) * 400));
+    }
+    expect(ticks.length, inInclusiveRange(59, 61));
+    for (var i = 2; i < ticks.length; i++) {
+      final gap = (ticks[i] - ticks[i - 1]).inMicroseconds;
+      expect(gap, inInclusiveRange(15800, 17600));
+    }
+  });
+
+  testWidgets('maxFrameRate holds its average on a mismatched refresh', (
+    tester,
+  ) async {
+    final scene = _tryScene();
+    if (scene == null) {
+      markTestSkipped('No Impeller GPU context');
+      return;
+    }
+    var count = 0;
+    await tester.pumpWidget(
+      _sized(
+        SceneView(
+          scene,
+          camera: PerspectiveCamera(),
+          maxFrameRate: 60,
+          onTick: (_, __) => count++,
+        ),
+      ),
+    );
+    // Two seconds of a 90 Hz display.
+    for (var i = 0; i < 180; i++) {
+      await tester.pump(const Duration(microseconds: 11111));
+    }
+    expect(count, inInclusiveRange(118, 122));
+  });
+
   testWidgets('autoTick: false does not tick', (tester) async {
     final scene = _tryScene();
     if (scene == null) {
@@ -194,5 +250,32 @@ void main() {
     // Replacing the subtree disposes the SceneView's State; a leaked Ticker
     // would trip the test binding's debug assertions.
     await tester.pumpWidget(_sized(const SizedBox()));
+  });
+
+  testWidgets('disposes the scene it owns, not an app-owned one', (
+    tester,
+  ) async {
+    final appScene = _tryScene();
+    if (appScene == null) {
+      markTestSkipped('No Impeller GPU context');
+      return;
+    }
+    Scene scopeScene() =>
+        tester.widget<SceneScope>(find.byType(SceneScope)).scene;
+
+    await tester.pumpWidget(_sized(const SceneView.declarative()));
+    final owned = scopeScene();
+    await tester.pumpWidget(_sized(const SizedBox()));
+    expect(owned.isDisposed, isTrue);
+
+    // Switching to an app-owned scene drops the owned one.
+    await tester.pumpWidget(_sized(const SceneView.declarative()));
+    final replaced = scopeScene();
+    await tester.pumpWidget(_sized(SceneView(appScene)));
+    expect(replaced.isDisposed, isTrue);
+    expect(appScene.isDisposed, isFalse);
+
+    await tester.pumpWidget(_sized(const SizedBox()));
+    expect(appScene.isDisposed, isFalse);
   });
 }

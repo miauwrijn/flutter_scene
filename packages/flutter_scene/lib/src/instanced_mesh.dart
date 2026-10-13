@@ -5,6 +5,7 @@ import 'package:flutter_scene/src/fmat/fmat_ast.dart';
 import 'package:flutter_scene/src/geometry/geometry.dart';
 import 'package:flutter_scene/src/material/instance_attributes.dart';
 import 'package:flutter_scene/src/material/material.dart';
+import 'package:flutter_scene/src/mesh_draw.dart';
 import 'package:vector_math/vector_math.dart';
 
 /// Many copies of one [Geometry] / [Material] pair, each placed by its
@@ -15,8 +16,11 @@ import 'package:vector_math/vector_math.dart';
 /// [InstancedMeshComponent]; the whole set is then one render item, one
 /// pipeline, and one cull test rather than one node per copy.
 ///
+/// Instances with different colors whose faces overlap in one plane flicker
+/// against each other (z-fighting); place repeated pieces so they abut.
+///
 /// {@category Scene graph}
-class InstancedMesh {
+class InstancedMesh implements MeshDrawSource {
   /// Creates an instanced mesh that draws [geometry] shaded by
   /// [material]. It starts with no instances; add them with
   /// [addInstance].
@@ -46,6 +50,12 @@ class InstancedMesh {
   /// the sort costs more than the small blending difference it produces.
   final bool sortTransparentInstances;
 
+  /// Picks how many leading instances and which index range each draw uses,
+  /// or null to draw everything. Order instances so the ones worth keeping
+  /// come first. See [MeshDrawSelector].
+  @override
+  MeshDrawSelector? drawSelector;
+
   final List<Matrix4> _instances = [];
   final List<Vector4> _colors = [];
   final List<bool> _windingFlipped = [];
@@ -56,12 +66,12 @@ class InstancedMesh {
   int _boundsGeometryVersion = -1;
   int _revision = 0;
 
-  /// The number of instances.
   /// The instance transforms, in instance order, read-only — for a reader
   /// that rebuilds the scene from the graph (a light cache) and wants each
   /// placement of the geometry.
   Iterable<Matrix4> get instanceTransforms => _instances;
 
+  /// The number of instances.
   int get instanceCount => _instances.length;
 
   /// Adds an instance placed by [transform] and returns its index.

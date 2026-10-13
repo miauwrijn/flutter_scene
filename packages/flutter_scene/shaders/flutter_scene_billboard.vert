@@ -1,14 +1,20 @@
 uniform FrameInfo {
   mat4 camera_transform; // view-projection
   mat4 model_transform;  // emitter / node world transform
-  vec4 camera_position;  // world-space camera position (xyz)
+  vec4 camera_position;  // xyz: world-space camera position.
+                         // w: the node's scale, applied to instance sizes.
   vec4 world_up;         // xyz: world up axis for the billboard basis.
                          // w: 1 to crossfade adjacent flipbook frames.
   // x: facing mode (0 spherical, 1 axis-locked, 2 velocity-stretched).
   // y: flipbook columns. z: flipbook rows. w: velocity stretch factor.
   vec4 params;
+  // The material's depth-layer offset (xy), see ApplyDepthOffset.
+  vec4 depth_offset;
 }
 frame_info;
+
+#include <view_vector.glsl>
+#include <depth_bias.glsl>
 
 // Per-vertex unit quad (slot 0): corner in [-0.5, 0.5] and its UV in [0, 1].
 in vec2 corner;
@@ -16,7 +22,7 @@ in vec2 quad_uv;
 
 // Per-instance attributes (slot 1).
 in vec3 i_center;   // position in the geometry's local space
-in vec2 i_size;     // width/height in world units
+in vec2 i_size;     // width/height in the geometry's local units
 in float i_rotation; // in-plane rotation, radians
 in vec4 i_color;    // linear RGBA tint
 in float i_frame;   // flipbook frame index
@@ -43,15 +49,13 @@ void main() {
 
   vec3 world_up = frame_info.world_up.xyz;
   vec3 world_center = (frame_info.model_transform * vec4(i_center, 1.0)).xyz;
-  vec3 view_dir = world_center - frame_info.camera_position.xyz;
-  // Guard the degenerate case of a particle at the eye.
-  vec3 to_eye = dot(view_dir, view_dir) > 1e-12
-      ? normalize(-view_dir)
-      : vec3(0.0, 0.0, 1.0);
+  vec3 to_eye = DirectionToViewer(frame_info.camera_transform,
+                                  frame_info.camera_position.xyz, world_center);
 
   vec3 right;
   vec3 up;
-  vec2 scaled = corner * i_size;
+  vec2 size = i_size * frame_info.camera_position.w;
+  vec2 scaled = corner * size;
 
   if (facing == kVelocityStretched) {
     vec3 world_vel = mat3(frame_info.model_transform) * i_velocity;
@@ -66,7 +70,7 @@ void main() {
           ? right / rl
           : normalize(cross(up, world_up));
       // Stretch the long axis (corner.y) by speed; rotation is ignored here.
-      scaled = vec2(corner.x * i_size.x, corner.y * (i_size.y + speed * stretch));
+      scaled = vec2(corner.x * size.x, corner.y * (size.y + speed * stretch));
     } else {
       vec3 fwd = to_eye;
       right = normalize(cross(world_up, fwd));
@@ -93,7 +97,10 @@ void main() {
   }
 
   vec3 world_pos = world_center + right * scaled.x + up * scaled.y;
-  gl_Position = frame_info.camera_transform * vec4(world_pos, 1.0);
+  vec4 clip_position = frame_info.camera_transform * vec4(world_pos, 1.0);
+  gl_Position = ApplyDepthOffset(
+      clip_position, vec4(frame_info.depth_offset.xy, 0.0, 0.0), vec3(0.0),
+      frame_info.camera_transform, world_pos, frame_info.camera_position.xyz);
   // For a perspective projection clip w is the planar view-space depth.
   v_view_depth = gl_Position.w;
 

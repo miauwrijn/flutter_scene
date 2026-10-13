@@ -23,7 +23,12 @@ uniform MaskSurfaceInfo {
 mask_surface;
 
 uniform sampler2D base_color_texture;
+// Declared only by the shader that reads it (the normal content defines
+// MASK_SURFACE_NORMAL): declared but unread, a sampler gets no binding and
+// reflects at 0, where it collides with the vertex stage's FrameInfo.
+#ifdef MASK_SURFACE_NORMAL
 uniform sampler2D normal_texture;
+#endif
 
 // Discards the fragment where a cut-out material's coverage falls below
 // its cutoff, so a mask of a leaf card is the leaf and not its quad: the
