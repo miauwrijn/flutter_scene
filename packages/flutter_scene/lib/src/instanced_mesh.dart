@@ -66,6 +66,11 @@ class InstancedMesh implements MeshDrawSource {
   int _boundsGeometryVersion = -1;
   int _revision = 0;
 
+  /// The instance transforms, in instance order, read-only — for a reader
+  /// that rebuilds the scene from the graph (a light cache) and wants each
+  /// placement of the geometry.
+  Iterable<Matrix4> get instanceTransforms => _instances;
+
   /// The number of instances.
   int get instanceCount => _instances.length;
 
