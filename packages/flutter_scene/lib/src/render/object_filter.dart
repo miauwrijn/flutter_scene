@@ -53,6 +53,26 @@ class NodeFilter {
   }
 }
 
+/// What an object-filtered draw writes for each covered pixel.
+///
+/// {@category Rendering}
+enum MaskContent {
+  /// The per-item color as given: a flat silhouette.
+  flat,
+
+  /// The per-item color multiplied by the material's textured base color
+  /// (linear; base color factor, texture and weighted vertex color), so a
+  /// pass can shade with the surface's own albedo at full resolution. Alpha
+  /// is the per-item color's alpha.
+  albedo,
+
+  /// The material's shading normal — the geometric normal perturbed by its
+  /// normal map, as the color pass lights with — in world space, encoded
+  /// `n * 0.5 + 0.5` in rgb. Alpha is the per-item color's alpha. The
+  /// per-item rgb is ignored.
+  normal,
+}
+
 /// Draws a filtered set of the scene's geometry flat into [target], each
 /// item filled with a solid color (coverage in alpha), with its own cleared
 /// depth so the filtered objects self-occlude but are not occluded by the
@@ -99,6 +119,9 @@ void renderObjectMask({
   // position-only one, to reproduce the color pass's depth exactly, and cuts
   // alpha-masked materials to their coverage as the depth passes do.
   bool fullVertex = false,
+  // What a covered pixel holds. The surface contents sample the material
+  // through the full varyings, so they imply [fullVertex].
+  MaskContent content = MaskContent.flat,
 }) {
   final renderTarget = gpu.RenderTarget.singleColor(
     gpu.ColorAttachment(texture: target, clearValue: clearColor),
@@ -123,7 +146,8 @@ void renderObjectMask({
     include,
     nudge,
     pixelSlope,
-    fullVertex,
+    fullVertex || content != MaskContent.flat,
+    content,
   );
   if (reverseOrder) {
     final visible = <RenderItem>[];
@@ -156,6 +180,7 @@ class _ObjectMaskEncoder {
     this._nudge,
     this._pixelSlope,
     this._fullVertex,
+    this._content,
   ) {
     _renderPass.setDepthWriteEnable(true);
     _renderPass.setColorBlendEnable(false);
@@ -177,10 +202,15 @@ class _ObjectMaskEncoder {
   final double Function(RenderItem item)? _nudge;
   final double _pixelSlope;
   final bool _fullVertex;
+  final MaskContent _content;
 
   static final gpu.Shader _maskShader = baseShaderLibrary['MaskFragment']!;
   static final gpu.Shader _maskedMaskShader =
       baseShaderLibrary['MaskMaskedFragment']!;
+  static final gpu.Shader _albedoShader =
+      baseShaderLibrary['MaskAlbedoFragment']!;
+  static final gpu.Shader _normalShader =
+      baseShaderLibrary['MaskNormalFragment']!;
   static final Vector4 _white = Vector4(1, 1, 1, 1);
 
   final Frustum frustum;
@@ -212,15 +242,30 @@ class _ObjectMaskEncoder {
         ? item.material.vertexAttributesFor(materialVertex)
         : VertexAttributeSchema.none;
     geometry.useVertexAttributes(attributes);
-    // The masked fragment reads the full-vertex varyings.
-    final masked = _fullVertex && item.material.depthAlphaMasked;
-    final fragmentShader = masked ? _maskedMaskShader : _maskShader;
+    // The full vertex stage runs the material's color vertex variant, which
+    // declares its per-instance attribute inputs, so the instance record is
+    // as wide here as in the color pass (see the depth prepass encoder).
+    final instanceSchema = depthVertex == null
+        ? item.material.instanceAttributes
+        : null;
+    final attributeFloats = instanceSchema?.floatCount ?? 0;
+    // The surface contents cut a cut-out material themselves (their
+    // MaskSurfaceInfo carries its coverage test); the flat fill reuses the
+    // depth passes' masked fragment. Both read the full-vertex varyings.
+    final surfaceContent = _content != MaskContent.flat;
+    final masked =
+        !surfaceContent && _fullVertex && item.material.depthAlphaMasked;
+    final fragmentShader = switch (_content) {
+      MaskContent.albedo => _albedoShader,
+      MaskContent.normal => _normalShader,
+      MaskContent.flat => masked ? _maskedMaskShader : _maskShader,
+    };
     final pipeline = resolvePipeline(
       activeVertex,
       fragmentShader,
       vertexLayout:
           depthVertex?.layout ??
-          geometry.instancedVertexLayoutFor(null, attributes),
+          geometry.instancedVertexLayoutFor(instanceSchema, attributes),
     );
     if (!identical(_boundPipeline, pipeline)) {
       _renderPass.bindPipeline(pipeline);
@@ -252,6 +297,18 @@ class _ObjectMaskEncoder {
         _renderPass,
         fragmentShader,
         _transientsBuffer,
+      );
+    }
+    if (surfaceContent) {
+      // Each surface shader declares only the samplers it reads (see
+      // Material.bindMaskSurface for why the others must not be bound).
+      // Both read the base color: its alpha is the cut-out test.
+      item.material.bindMaskSurface(
+        _renderPass,
+        fragmentShader,
+        _transientsBuffer,
+        baseColor: true,
+        normal: _content == MaskContent.normal,
       );
     }
 
@@ -309,14 +366,37 @@ class _ObjectMaskEncoder {
     if (instances != null) {
       if (dataSlot != null) {
         bindDraw(item.worldTransform);
-        final packed = packInstanceData(
-          item.worldTransform,
-          instances,
-          item.instanceColors ??
-              List.filled(instances.length, _white, growable: false),
-          nodeWindingFlipped: item.windingFlipped,
-          scratch: transientInstancePackingScratch,
-        );
+        // The world records the item packed once (see
+        // RenderItem.refreshInstanceData) when it has them, as the depth
+        // prepass does: recomposing every instance here was a Matrix4
+        // multiply per instance per frame, most of a frame on a site with a
+        // few hundred thousand grass clumps.
+        final packedWorldData = item.instanceWorldData;
+        final packedWinding = item.instanceWorldWindingFlipped;
+        final cached = packedWorldData == null || packedWinding == null
+            ? null
+            : transientInstancePackingScratch.singleCachedBatch(
+                packedWorldData: packedWorldData,
+                packedWindingFlipped: packedWinding,
+                attributeFloats: item.instanceAttributeFloats,
+              );
+        final packed = cached == null
+            ? packInstanceData(
+                item.worldTransform,
+                instances,
+                item.instanceColors ??
+                    List.filled(instances.length, _white, growable: false),
+                nodeWindingFlipped: item.windingFlipped,
+                instanceWindingFlipped: item.instanceWindingFlipped,
+                attributeData: item.instanceAttributeData,
+                attributeFloats: attributeFloats,
+                scratch: transientInstancePackingScratch,
+              )
+            : packInstanceDataBatches(
+                cached,
+                attributeFloats: attributeFloats,
+                scratch: transientInstancePackingScratch,
+              );
         transientInstancePackingScratch.releaseSingleBatch();
         if (packed.ccwCount > 0) {
           bindInstanceData(_renderPass, packed.ccw, slot: dataSlot);
@@ -371,7 +451,12 @@ class _ObjectMaskEncoder {
     // would clobber slot 1 and the shader would read its instance attributes as
     // a transform matrix.
     if (dataSlot != null) {
-      bindSingleInstanceData(_renderPass, item.worldTransform, slot: dataSlot);
+      bindSingleInstanceData(
+        _renderPass,
+        item.worldTransform,
+        slot: dataSlot,
+        attributeFloats: attributeFloats,
+      );
     } else if (geometry.instancedVertexLayout != null &&
         geometry.bindsModelTransformInstance) {
       bindSingleInstanceTransform(_renderPass, item.worldTransform);

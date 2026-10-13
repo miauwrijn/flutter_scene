@@ -155,6 +155,14 @@
     "type": "fragment",
     "file": "shaders/flutter_scene_mask_masked.frag"
   },
+  "MaskAlbedoFragment": {
+    "type": "fragment",
+    "file": "shaders/flutter_scene_mask_albedo.frag"
+  },
+  "MaskNormalFragment": {
+    "type": "fragment",
+    "file": "shaders/flutter_scene_mask_normal.frag"
+  },
   "DebugSurfaceFragment": {
     "type": "fragment",
     "file": "shaders/flutter_scene_debug_surface.frag"
