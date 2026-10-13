@@ -8,6 +8,7 @@ Patches this fork carries on top of upstream master.
 * `AmbientOcclusionSettings.quarterResolution` (and `EnvironmentSettings.ambientOcclusionQuarterResolution`) runs SSAO at a quarter of the render size.
 * `Material.coatedReflectionRoughness`: reflections see a clear coat's roughness blended in by its strength, so a lacquered floor reflects.
 * TAA sharpens in tone-mapped space, so sub-pixel HDR glints no longer grow black fringes.
+* WebGL draws keep each cached VAO's attribute enables and divisors, key the VAO cache with a precomputed-hash object instead of a per-draw string, re-point instance streams only when their buffer or offset changed, and check framebuffer completeness once per attachment shape.
 * WebGL uploads set `UNPACK_ALIGNMENT` to 1, so single-byte textures of any width upload instead of being rejected.
 
 ## 0.24.4

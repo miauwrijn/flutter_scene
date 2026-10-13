@@ -61,10 +61,12 @@ final class WebGlContext extends GpuContext {
   late final web.WebGL2RenderingContext _gl;
 
   /// Cached vertex-array objects keyed by (pipeline, vertex streams, index
-  /// buffer), in least-recently-used order; see WebGlRenderPass._applyVertexState.
+  /// buffer); see WebGlRenderPass._applyVertexState. Each entry remembers
+  /// when it was last drawn with, and the least recently used one goes when
+  /// the cache is full.
   static const int _kMaxCachedVaos = 512;
-  final Map<String, web.WebGLVertexArrayObject> _vaoCache =
-      <String, web.WebGLVertexArrayObject>{};
+  final Map<VaoKey, VaoEntry> _vaoCache = <VaoKey, VaoEntry>{};
+  int _vaoUse = 0;
 
   int _maxSupportedAnisotropy = 1;
 
@@ -468,4 +470,68 @@ _createGeometryBuffers(int vertexBytes, int indexBytes) {
 /// `EXT_clip_control`, which sets the clip-space origin and depth range.
 extension type _ExtClipControl._(JSObject _) implements JSObject {
   external void clipControlEXT(int origin, int depth);
+}
+
+/// The attribute state a VAO holds: which attribute locations are enabled
+/// and each one's divisor. Both are VAO state, so a draw on a cached VAO need
+/// not repeat the enable and divisor calls it made when the VAO was built.
+final class VaoAttributeState {
+  final Set<int> enabled = {};
+  final Map<int, int> divisors = {};
+}
+
+/// A cached VAO with its attribute state and the draw counter at its last
+/// use (see `WebGlContext._vaoCache`).
+final class VaoEntry {
+  VaoEntry(this.vao);
+  final web.WebGLVertexArrayObject vao;
+  final VaoAttributeState state = VaoAttributeState();
+  int lastUsed = 0;
+
+  /// Per instance-rate slot: the buffer and byte offset its attributes were
+  /// last pointed at. A GL buffer is created once per [DeviceBuffer] and
+  /// never replaced, so the same buffer at the same offset means the VAO's
+  /// pointers are already right. Re-pointing an instance stream is five to
+  /// six `vertexAttribPointer` calls, each a varargs call on the web.
+  final Map<int, (DeviceBuffer, int)> instanceStreams = {};
+}
+
+/// The identity of a cached VAO: the pipeline, then per geometry stream its
+/// buffer, byte offset and slot, then the index buffer and its offset (or
+/// nothing). Objects compare by identity, ints by value; the hash is
+/// computed once, when the key is built.
+final class VaoKey {
+  VaoKey(this.parts) : hashCode = _hashOf(parts);
+
+  final List<Object> parts;
+
+  @override
+  final int hashCode;
+
+  @override
+  bool operator ==(Object other) {
+    if (other is! VaoKey ||
+        other.hashCode != hashCode ||
+        other.parts.length != parts.length) {
+      return false;
+    }
+    for (var i = 0; i < parts.length; i++) {
+      final a = parts[i];
+      final b = other.parts[i];
+      if (a is int ? a != b : !identical(a, b)) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  static int _hashOf(List<Object> parts) {
+    var h = parts.length;
+    for (final part in parts) {
+      final v = part is int ? part : identityHashCode(part);
+      // Stays within 30 bits: an exact small integer on every backend.
+      h = (h * 31 + v) & 0x3FFFFFFF;
+    }
+    return h;
+  }
 }

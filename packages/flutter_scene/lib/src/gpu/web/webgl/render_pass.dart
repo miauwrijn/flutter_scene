@@ -61,6 +61,34 @@ final class WebGlRenderPass extends RenderPass {
     final gl = _gpuContext._gl;
     _vao ??= gl.createVertexArray();
     gl.bindVertexArray(_vao);
+    _vaoState = _ownVaoState ??= VaoAttributeState();
+  }
+
+  /// The attribute state of the VAO bound for the draw being issued.
+  VaoAttributeState? _vaoState;
+
+  /// The state of the pass's own VAO (`_vao`, the inline-vertex path).
+  VaoAttributeState? _ownVaoState;
+
+  /// enableVertexAttribArray and vertexAttribDivisor are VAO state: issued
+  /// only when the bound VAO does not hold them already. Per draw, every
+  /// attribute of every pass re-enabling itself was a quarter of the UI
+  /// thread on a building of 150 draws.
+  void _enableAttribute(int location, int divisor) {
+    final gl = _gpuContext._gl;
+    final state = _vaoState;
+    if (state == null) {
+      gl.enableVertexAttribArray(location);
+      gl.vertexAttribDivisor(location, divisor);
+      return;
+    }
+    if (state.enabled.add(location)) {
+      gl.enableVertexAttribArray(location);
+    }
+    if (state.divisors[location] != divisor) {
+      state.divisors[location] = divisor;
+      gl.vertexAttribDivisor(location, divisor);
+    }
   }
 
   // ---- framebuffer setup ---------------------------------------------------
@@ -166,16 +194,33 @@ final class WebGlRenderPass extends RenderPass {
       }
     }
 
-    final status = gl.checkFramebufferStatus(
-      web.WebGL2RenderingContext.FRAMEBUFFER,
-    );
-    if (status != web.WebGL2RenderingContext.FRAMEBUFFER_COMPLETE) {
-      throw Exception(
-        'Framebuffer incomplete (status 0x${status.toRadixString(16)})',
+    // Completeness is a property of the attachment *shapes* (formats, sizes,
+    // sample counts, the mip level), not of the texture objects: once a
+    // combination has passed, another framebuffer of the same shape will
+    // too. The framebuffer cache is keyed by texture identity, so passes
+    // that allocate transient targets every frame (the depth downsample,
+    // the transmission filter, the sky prefilter) would still pay this
+    // synchronous GPU round trip per frame. Ask once per shape.
+    final shape =
+        '${color.format}/${color.width}x${color.height}/${color.sampleCount}'
+        '/$mipLevel/${depth?.format}/${depth?.width}x${depth?.height}'
+        '/${depth?.sampleCount}';
+    if (!_completeShapes.contains(shape)) {
+      final status = gl.checkFramebufferStatus(
+        web.WebGL2RenderingContext.FRAMEBUFFER,
       );
+      if (status != web.WebGL2RenderingContext.FRAMEBUFFER_COMPLETE) {
+        throw Exception(
+          'Framebuffer incomplete (status 0x${status.toRadixString(16)})',
+        );
+      }
+      _completeShapes.add(shape);
     }
     return fbo;
   }
+
+  /// Attachment shapes whose framebuffers have checked complete.
+  static final Set<String> _completeShapes = {};
 
   void _applyLoadActions() {
     final gl = _gpuContext._gl;
@@ -296,7 +341,7 @@ final class WebGlRenderPass extends RenderPass {
             'Vertex shader has no input named "${attribute.name}"',
           );
         }
-        gl.enableVertexAttribArray(input.location);
+        _enableAttribute(input.location, divisor);
         final name = attribute.format.name;
         final unsigned = name.startsWith('uint');
         if (unsigned || name.startsWith('sint')) {
@@ -321,7 +366,6 @@ final class WebGlRenderPass extends RenderPass {
             bufferView.offsetInBytes + attribute.offsetInBytes,
           );
         }
-        gl.vertexAttribDivisor(input.location, divisor);
       }
       return;
     }
@@ -329,7 +373,9 @@ final class WebGlRenderPass extends RenderPass {
     final inputs = pipeline.vertexShader.vertexInputs;
     final stride = pipeline.vertexShader.vertexStride;
     for (final input in inputs) {
-      gl.enableVertexAttribArray(input.location);
+      // Divisor state lives in the VAO and may be left over from an
+      // instanced layout; vertex-rate inputs want 0.
+      _enableAttribute(input.location, 0);
       gl.vertexAttribPointer(
         input.location,
         input.componentCount,
@@ -338,9 +384,6 @@ final class WebGlRenderPass extends RenderPass {
         stride,
         bufferView.offsetInBytes + input.offsetInBytes,
       );
-      // Divisor state lives in the VAO and may be left over from an
-      // instanced layout; reset it for vertex-rate inputs.
-      gl.vertexAttribDivisor(input.location, 0);
     }
   }
 
@@ -354,10 +397,15 @@ final class WebGlRenderPass extends RenderPass {
   /// (pipeline, buffers, offsets), so their full attribute state is captured
   /// in a VAO once and re-bound with a single call thereafter.
   ///
-  /// Instance-rate streams are excluded from the cache key and re-pointed on
-  /// the bound VAO every draw: they ride the per-frame bump allocator, so
-  /// their offset changes per draw and every instanced draw re-points them
-  /// anyway.
+  /// Instance-rate streams are excluded from the cache key: they ride the
+  /// per-frame bump allocator. Each VAO remembers where its instance streams
+  /// point and re-points one only when its buffer or offset changed, which
+  /// for a static scene (instance data at the same offsets frame after
+  /// frame) is almost never.
+  ///
+  /// The key is a small object with its hash computed once; a string built
+  /// and hashed per draw (dart2js does not cache string hashes) was a third
+  /// of the UI thread on a building of a thousand draws.
   void _applyVertexState({required bool needsIndex}) {
     if (_inlineVertexBufferView != null) {
       _ensureVao();
@@ -365,38 +413,37 @@ final class WebGlRenderPass extends RenderPass {
     }
     final gl = _gpuContext._gl;
     final pipeline = _boundPipeline!;
-    final key = StringBuffer()..write(identityHashCode(pipeline));
+    final parts = <Object>[pipeline];
     for (final (view, slot, instanceRate) in _pendingVertexBindings) {
       if (instanceRate) continue;
-      key
-        ..write('|')
-        ..write(identityHashCode(view.buffer))
-        ..write(':')
-        ..write(view.offsetInBytes)
-        ..write(':')
-        ..write(slot);
+      parts
+        ..add(view.buffer)
+        ..add(view.offsetInBytes)
+        ..add(slot);
     }
     final indexView = needsIndex ? _indexBufferView : null;
     if (indexView != null) {
-      key
-        ..write('#')
-        ..write(identityHashCode(indexView.buffer))
-        ..write(':')
-        ..write(indexView.offsetInBytes);
+      parts
+        ..add(indexView.buffer)
+        ..add(indexView.offsetInBytes);
     }
-    final cacheKey = key.toString();
-    final cache = _gpuContext._vaoCache;
-    // Remove-and-reinsert keeps the map in least-recently-used order.
-    var vao = cache.remove(cacheKey);
-    if (vao != null) {
-      cache[cacheKey] = vao;
-      gl.bindVertexArray(vao);
+    final cacheKey = VaoKey(parts);
+    final context = _gpuContext;
+    final cache = context._vaoCache;
+    final use = ++context._vaoUse;
+    var entry = cache[cacheKey];
+    if (entry != null) {
+      entry.lastUsed = use;
+      gl.bindVertexArray(entry.vao);
+      _vaoState = entry.state;
     } else {
-      vao = gl.createVertexArray();
+      final vao = gl.createVertexArray();
       if (vao == null) {
         throw StateError('Failed to create WebGL vertex array');
       }
+      entry = VaoEntry(vao)..lastUsed = use;
       gl.bindVertexArray(vao);
+      _vaoState = entry.state;
       for (final (view, slot, instanceRate) in _pendingVertexBindings) {
         if (instanceRate) continue;
         _applyVertexBinding(view, slot);
@@ -405,14 +452,32 @@ final class WebGlRenderPass extends RenderPass {
       indexView?.buffer.webGl._bindForTarget(
         web.WebGL2RenderingContext.ELEMENT_ARRAY_BUFFER,
       );
-      cache[cacheKey] = vao;
+      cache[cacheKey] = entry;
       if (cache.length > WebGlContext._kMaxCachedVaos) {
-        final oldest = cache.keys.first;
-        gl.deleteVertexArray(cache.remove(oldest)!);
+        // Evict the least recently drawn with (a miss is rare: a scan).
+        VaoKey? oldestKey;
+        var oldestUse = use;
+        for (final MapEntry(:key, :value) in cache.entries) {
+          if (value.lastUsed < oldestUse) {
+            oldestUse = value.lastUsed;
+            oldestKey = key;
+          }
+        }
+        if (oldestKey != null) {
+          gl.deleteVertexArray(cache.remove(oldestKey)!.vao);
+        }
       }
     }
     for (final (view, slot, instanceRate) in _pendingVertexBindings) {
-      if (instanceRate) _applyVertexBinding(view, slot);
+      if (!instanceRate) continue;
+      final last = entry.instanceStreams[slot];
+      if (last != null &&
+          identical(last.$1, view.buffer) &&
+          last.$2 == view.offsetInBytes) {
+        continue;
+      }
+      _applyVertexBinding(view, slot);
+      entry.instanceStreams[slot] = (view.buffer, view.offsetInBytes);
     }
   }
 
@@ -951,7 +1016,7 @@ final class WebGlRenderPass extends RenderPass {
     bufferView.buffer.webGl._bindForTarget(
       web.WebGL2RenderingContext.ARRAY_BUFFER,
     );
-    gl.enableVertexAttribArray(location);
+    _enableAttribute(location, 0);
     gl.vertexAttribPointer(
       location,
       components,
