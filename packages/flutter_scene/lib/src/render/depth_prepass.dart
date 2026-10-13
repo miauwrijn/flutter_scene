@@ -29,6 +29,9 @@ const String kLinearDepthBlackboardKey = 'linear_depth';
 /// translucent surfaces against the opaque scene.
 const String kPrepassDepthStencilBlackboardKey = 'prepass_depth_stencil';
 
+/// Blackboard key for [TranslucentSurfacePass]'s target.
+const String kTranslucentSurfaceBlackboardKey = 'translucent_surface';
+
 /// Renders the opaque scene's depth from the camera into a linear-depth
 /// color target and publishes it on the render-graph blackboard.
 ///
@@ -286,6 +289,122 @@ class TranslucentDepthPatchPass extends RenderGraphPass {
     }
     encoder.flush();
     rendererSubmissions.submit(commandBuffer);
+  }
+}
+
+/// The nearest translucent depth-carrying surface (glass) in front of the
+/// opaque scene, into a target of its own: planar depth, octahedral
+/// view-space normal and roughness, as [DepthPrepass] writes them with
+/// normals, and the far plane where nothing translucent is in view.
+///
+/// Unlike [TranslucentDepthPatchPass] it leaves the scene's linear depth
+/// alone: reflections, occlusion and the like keep reading the opaque scene
+/// (what is seen through the pane), and an effect that wants the pane
+/// itself — its reflection — reads this. Depth-tested against the opaque
+/// scene through the prepass depth-stencil, which it needs kept.
+class TranslucentSurfacePass extends RenderGraphPass {
+  TranslucentSurfacePass({
+    required Camera camera,
+    required RenderScene renderScene,
+    required Vector3 cameraForward,
+    required Vector3 cameraRight,
+    required Vector3 cameraUp,
+    required double farDepth,
+    int layerMask = kRenderLayerAll,
+    List<Plane> cullingPlanes = const [],
+    Matrix4? cameraTransform,
+  }) : _camera = camera,
+       _cameraTransform = cameraTransform,
+       _renderScene = renderScene,
+       _cameraForward = cameraForward,
+       _cameraRight = cameraRight,
+       _cameraUp = cameraUp,
+       _farDepth = farDepth,
+       _layerMask = layerMask,
+       _cullingPlanes = cullingPlanes;
+
+  final Camera _camera;
+  final RenderScene _renderScene;
+  final Vector3 _cameraForward, _cameraRight, _cameraUp;
+  final double _farDepth;
+  final int _layerMask;
+  final List<Plane> _cullingPlanes;
+
+  /// The prepass's (jittered, under TAA) view-projection, so the depth test
+  /// against its depth-stencil lines up texel for texel.
+  final Matrix4? _cameraTransform;
+
+  @override
+  String get name => 'TranslucentSurfacePass';
+
+  @override
+  void execute(RenderGraphContext context) {
+    final linearDepth = context.blackboard.get<gpu.Texture>(
+      kLinearDepthBlackboardKey,
+    );
+    final depthStencil = context.blackboard.get<gpu.Texture>(
+      kPrepassDepthStencilBlackboardKey,
+    );
+    if (linearDepth == null || depthStencil == null) return;
+    final dimensions = ui.Size(
+      linearDepth.width.toDouble(),
+      linearDepth.height.toDouble(),
+    );
+    final viewTransform =
+        _cameraTransform ?? _camera.getViewTransform(dimensions);
+    final frustum = Frustum.matrix(viewTransform);
+    final records = <RenderItem>[];
+    _renderScene.cull(frustum, (item) {
+      if (!item.drawsColor) return;
+      if ((item.layers & _layerMask) == 0) return;
+      if (!TranslucentDepthPatchPass._qualifies(item)) return;
+      if (!item.cullVisibleInstances(frustum, _cullingPlanes)) return;
+      records.add(item);
+    }, additionalPlanes: _cullingPlanes);
+    // No pane in view: nothing to publish, and consumers skip their work.
+    if (records.isEmpty) return;
+
+    final surface = gpu.gpuContext.createTexture(
+      gpu.StorageMode.devicePrivate,
+      linearDepth.width,
+      linearDepth.height,
+      format: linearDepth.format,
+      enableRenderTargetUsage: true,
+      enableShaderReadUsage: true,
+    );
+    final target = gpu.RenderTarget.singleColor(
+      gpu.ColorAttachment(
+        texture: surface,
+        clearValue: Vector4(_farDepth, 0.0, 0.0, 1.0),
+      ),
+      depthStencilAttachment: gpu.DepthStencilAttachment(
+        texture: depthStencil,
+        depthLoadAction: gpu.LoadAction.load,
+        // Kept: depth of field's patch tests against it later.
+        depthStoreAction: gpu.StoreAction.store,
+      ),
+    );
+    final commandBuffer = gpu.gpuContext.createCommandBuffer();
+    final renderPass = commandBuffer.createRenderPass(target);
+    final encoder = _DepthPrepassEncoder(
+      renderPass,
+      context.transientsBuffer,
+      viewTransform,
+      _camera.position,
+      _cameraForward,
+      _layerMask,
+      _cullingPlanes,
+      writeNormals: true,
+      cameraRight: _cameraRight,
+      cameraUp: _cameraUp,
+      translucentPatch: true,
+    );
+    for (final item in records) {
+      encoder.submit(item);
+    }
+    encoder.flush();
+    rendererSubmissions.submit(commandBuffer);
+    context.blackboard.set(kTranslucentSurfaceBlackboardKey, surface);
   }
 }
 

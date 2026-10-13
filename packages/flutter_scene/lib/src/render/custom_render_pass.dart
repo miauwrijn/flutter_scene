@@ -113,6 +113,14 @@ enum RenderInput {
   /// current material draw. Materials use it for rough refraction. This
   /// implies [opaqueSceneColor] capture and is produced only when requested.
   filteredSceneColor,
+
+  /// The nearest **translucent** depth-carrying surface (glass) in front of
+  /// the opaque scene, on [RenderPassContext.translucentSurface]: the same
+  /// layout as the linear depth with normals (planar depth, octahedral
+  /// view-space normal, roughness), the far plane where there is none.
+  /// Implies [normals]. For effects that shade the pane itself — its
+  /// reflection — while everything else reads the scene behind it.
+  translucentSurface,
 }
 
 /// A user-supplied render pass inserted into the built-in pipeline at a
@@ -246,6 +254,12 @@ class RenderPassContext {
   /// perspective; also present when ambient occlusion or reflections ran.
   gpu.Texture? get sceneDepthLinear =>
       _context.blackboard.get<gpu.Texture>(kLinearDepthBlackboardKey);
+
+  /// The nearest translucent depth-carrying surface in front of the opaque
+  /// scene (see [RenderInput.translucentSurface]); null unless requested,
+  /// and when no such surface is in view.
+  gpu.Texture? get translucentSurface =>
+      _context.blackboard.get<gpu.Texture>(kTranslucentSurfaceBlackboardKey);
 
   /// The directional light's cascaded shadow map atlas (a horizontal strip of
   /// `shadowInfo` cascade tiles, window-space depth in the red channel).

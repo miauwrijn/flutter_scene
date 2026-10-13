@@ -1783,7 +1783,11 @@ class PhysicallyBasedMaterial extends Material {
       textureSourceSampler(metallicRoughnessTexture);
 
   @override
-  double get reflectionRoughnessFactor => roughnessFactor;
+  double get reflectionRoughnessFactor => Material.coatedReflectionRoughness(
+    roughnessFactor,
+    clearcoat,
+    clearcoatRoughness,
+  );
 
   @override
   bool get depthAlphaMasked => alphaMode == AlphaMode.mask;

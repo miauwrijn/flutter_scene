@@ -2416,7 +2416,11 @@ base class Scene implements SceneGraph {
         perspectiveCamera != null &&
         screenSpaceReflections.enabled;
     // A custom pass may request depth/normals; normals imply depth.
-    final wantCustomNormals = customInputs.contains(RenderInput.normals);
+    final wantTranslucentSurface =
+        perspectiveCamera != null &&
+        customInputs.contains(RenderInput.translucentSurface);
+    final wantCustomNormals =
+        wantTranslucentSurface || customInputs.contains(RenderInput.normals);
     final wantCustomDepth =
         wantCustomNormals || customInputs.contains(RenderInput.depth);
     // Flutter GPU does not expose whether a stored depth/stencil attachment is
@@ -2499,6 +2503,7 @@ base class Scene implements SceneGraph {
             // is paid whenever depth of field is on, patch or no patch.
             keepDepthStencil:
                 depthOfField.enabled ||
+                wantTranslucentSurface ||
                 (enableTaa && temporalAntiAliasing.objectMotion),
             cameraRight: cameraRight,
             cameraUp: cameraUp,
@@ -2506,6 +2511,21 @@ base class Scene implements SceneGraph {
             cameraTransform: currentJitteredViewProjection,
           ),
         );
+        if (wantTranslucentSurface) {
+          graph.addPass(
+            TranslucentSurfacePass(
+              camera: camera,
+              renderScene: renderScene,
+              cameraForward: cameraForward,
+              cameraRight: cameraRight,
+              cameraUp: cameraUp,
+              farDepth: perspectiveCamera.far,
+              layerMask: view.layerMask,
+              cullingPlanes: view.cullingPlanes,
+              cameraTransform: currentJitteredViewProjection,
+            ),
+          );
+        }
       }
       if (enableTaa && temporalAntiAliasing.objectMotion) {
         final prevViewProj =

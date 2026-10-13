@@ -592,6 +592,23 @@ abstract class Material {
   @internal
   double get reflectionRoughnessFactor => 1.0;
 
+  /// The roughness the reflections see for a surface of [roughness] under
+  /// a clear coat of strength [clearcoat] and [clearcoatRoughness]: the
+  /// two blended by the coat's strength. A lacquered floor reflects
+  /// through its coat — with the base roughness alone the trace faded it
+  /// out as matte and it reflected nothing — but a coat at 0.6 is not a
+  /// mirror laid over the wood: taking the coat's roughness outright made
+  /// the parquet one.
+  static double coatedReflectionRoughness(
+    double roughness,
+    double clearcoat,
+    double clearcoatRoughness,
+  ) {
+    if (clearcoat <= 0 || clearcoatRoughness >= roughness) return roughness;
+    final c = clearcoat.clamp(0.0, 1.0);
+    return roughness + (clearcoatRoughness - roughness) * c;
+  }
+
   /// Whether the depth-writing passes (the shadow map and the camera depth
   /// prepass) must alpha-test this material's coverage instead of writing its
   /// full geometry, so cutout surfaces (foliage, fences) occlude, shadow, and
