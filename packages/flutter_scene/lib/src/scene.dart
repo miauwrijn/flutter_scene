@@ -3510,6 +3510,11 @@ base class Scene implements SceneGraph {
                   effectiveCascades,
                   lightDirection ?? light!.direction,
                   light!.color * light.intensity,
+                  totalTiles:
+                      effectiveCascades.length +
+                      (spotShadowFrame?.matrices.length ?? 0) +
+                      (pointShadowFrame?.casters.length ?? 0) *
+                          kPointShadowTilesPerLight,
                 )
               : null,
         ),

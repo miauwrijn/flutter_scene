@@ -37,8 +37,10 @@ double shadowReceiverMargin(
 ) {
   final texel = boxSize / light.shadowMapResolution;
   final softness = maxSoftness.abs();
-  // BiasDirectionalShadowPosition caps its slope term at 8.
-  final normalOffset = light.shadowNormalBias.abs() + softness * 8.0;
+  // BiasDirectionalShadowPosition grows the normal bias by at most 2x its
+  // own size toward grazing light; the kernel follows the receiver's plane in
+  // depth, which moves no tap sideways.
+  final normalOffset = light.shadowNormalBias.abs() * 3.0;
   // The kernel radius floors at a texel; bilinear taps and texel rounding
   // add up to two more.
   final kernel = math.max(softness, texel) + 2.0 * texel;

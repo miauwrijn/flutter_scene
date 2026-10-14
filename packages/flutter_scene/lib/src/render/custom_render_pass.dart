@@ -28,12 +28,15 @@ import 'package:flutter_scene/src/render/uniform_slots.dart';
 /// the light's world-space travel [direction], and its [color] premultiplied by
 /// intensity. Layout: `mat4 light_space_matrix[4]` (world -> cascade clip),
 /// `vec4 cascade_splits` (view-space split distance per cascade), `vec4
-/// light_direction` (xyz direction, w = cascade count), `vec4 light_color`.
+/// light_direction` (xyz direction, w = cascade count), `vec4 light_color`
+/// (rgb, w = the atlas's tile count [totalTiles], for its
+/// [ShadowAtlasLayout]; the cascade count when omitted).
 ByteData packPostShadowInfo(
   List<ShadowCascade> cascades,
   Vector3 direction,
-  Vector3 color,
-) {
+  Vector3 color, {
+  int? totalTiles,
+}) {
   final f = Float32List(76); // 4 mat4 + 3 vec4
   final count = cascades.length < 4 ? cascades.length : 4;
   for (var i = 0; i < count; i++) {
@@ -47,6 +50,7 @@ ByteData packPostShadowInfo(
   f[72] = color.x;
   f[73] = color.y;
   f[74] = color.z;
+  f[75] = (totalTiles ?? count).toDouble();
   return ByteData.sublistView(f);
 }
 

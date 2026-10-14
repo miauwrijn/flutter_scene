@@ -82,9 +82,12 @@ vec3 ViewPositionAt(vec2 uv) {
     vec3 proj = lc.xyz / lc.w;                                             \
     if (abs(proj.x) < 1.0 && abs(proj.y) < 1.0) {                          \
       vec2 tile_uv = proj.xy * 0.5 + 0.5;                                  \
-      vec2 atlas_uv = vec2((float(IDX) + tile_uv.x) / float(COUNT),        \
-                           tile_uv.y);                                     \
-      atlas_uv.y = 1.0 - atlas_uv.y; /* atlas stored top-down */           \
+      /* tiles wrap four to a row (ShadowAtlasLayout), stored top-down */ \
+      float tiles = max(shadow.light_color.w, float(COUNT));               \
+      float row0 = floor((float(IDX) + 0.5) / 4.0);                        \
+      vec2 atlas_uv = vec2(                                                \
+          (float(IDX) - row0 * 4.0 + tile_uv.x) / min(tiles, 4.0),         \
+          (row0 + 1.0 - tile_uv.y) / ceil(tiles / 4.0));                   \
       float caster = texture(input_shadow, atlas_uv).r;                    \
       RESULT = (proj.z - kShadowBias) <= caster ? 1.0 : 0.0;               \
       return RESULT;                                                       \
