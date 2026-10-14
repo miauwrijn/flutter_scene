@@ -82,10 +82,13 @@ import 'render/irradiance_pass.dart';
 import 'render/render_graph.dart';
 import 'render/render_graph_capture.dart';
 import 'render/render_stats.dart';
+import 'package:flutter_scene/src/gpu/shared/shader_library_sources.dart'
+    show knownShaderLibraries;
 import 'scene_encoder.dart'
     show
         beginDrawFailureFrame,
         deferredPipelineBuilds,
+        deferredPipelineKeys,
         pipelineCacheSize,
         withPipelineBuildBudget;
 import 'render/render_scene.dart';
@@ -2154,10 +2157,12 @@ base class Scene implements SceneGraph {
         encode,
         maxBuilds: maxPipelineBuildsPerSlice,
       );
+      final waiting = deferredPipelineKeys;
       onProgress?.call(
         WarmUpProgress(
           built: pipelineCacheSize - cacheBefore,
-          waiting: deferredPipelineBuilds,
+          waiting: waiting.length,
+          next: waiting.isEmpty ? null : _shaderName(waiting.first.$2),
         ),
       );
       if (_pacedFrameCount == paced && deferredPipelineBuilds == 0) {
@@ -4604,13 +4609,34 @@ class _NearFitState {
 /// {@category Assets and loading}
 final class WarmUpProgress {
   /// Creates a progress report.
-  const WarmUpProgress({required this.built, required this.waiting});
+  const WarmUpProgress({required this.built, required this.waiting, this.next});
 
   /// Pipelines this warm-up has built so far.
   final int built;
 
-  /// Draws the last slice skipped because their pipeline is not built yet.
-  /// Several draws can wait on one pipeline, so this overstates the pipelines
-  /// left; zero once the warm-up is done.
+  /// Pipelines still to build, as far as the last slice got: the distinct
+  /// ones its skipped draws were waiting on. Zero once the warm-up is done.
+  /// A pipeline only appears once the slice reaches a draw that needs it, so
+  /// the total ([built] + [waiting]) can still grow by a few as it goes.
   final int waiting;
+
+  /// The fragment shader the next slice compiles (its name in its shader
+  /// bundle), or null when none is waiting or the name is not known.
+  final String? next;
+}
+
+/// [shader]'s entry name in whichever loaded shader library holds it, for a
+/// progress label; null when no library knows it.
+String? _shaderName(gpu.Shader shader) {
+  for (final library in knownShaderLibraries()) {
+    try {
+      final shaders = (library as dynamic).shaders_ as Map;
+      for (final entry in shaders.entries) {
+        if (identical(entry.value, shader)) return '${entry.key}';
+      }
+    } on Object {
+      // A backend whose library keeps its shaders otherwise: no name.
+    }
+  }
+  return null;
 }

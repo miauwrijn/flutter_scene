@@ -447,6 +447,10 @@ int? _maxSliceBuilds;
 final Stopwatch _buildClock = Stopwatch();
 int _deferredBuilds = 0;
 int _sliceBuilds = 0;
+// The distinct pipelines the last slice deferred, in the order it met them:
+// what a warm-up still has to build (draws can share one, so the draw count
+// in [_deferredBuilds] overstates it).
+final Set<(gpu.Shader, gpu.Shader, int)> _deferredKeys = {};
 
 /// Runs [body] with new pipeline builds capped at [budget] of slice time,
 /// and at [maxBuilds] new pipelines when given; draws past either are skipped
@@ -464,6 +468,7 @@ T withPipelineBuildBudget<T>(
     ..start();
   _deferredBuilds = 0;
   _sliceBuilds = 0;
+  _deferredKeys.clear();
   try {
     return body();
   } finally {
@@ -477,16 +482,27 @@ T withPipelineBuildBudget<T>(
 @internal
 int get deferredPipelineBuilds => _deferredBuilds;
 
+/// The distinct pipelines (vertex shader, fragment shader, layout) the last
+/// [withPipelineBuildBudget] deferred, in the order they were met.
+@internal
+Iterable<(gpu.Shader, gpu.Shader, int)> get deferredPipelineKeys =>
+    _deferredKeys;
+
 bool _deferBuild((gpu.Shader, gpu.Shader, int) key) {
   final budget = _buildBudget;
   if (budget == null || _pipelineCache.containsKey(key)) return false;
+  // Counted where a pipeline is actually built (see [resolvePipeline]), not
+  // here: a caller can still decline after this says yes (a pairing whose
+  // stage reflection is still loading), and counting that as the slice's one
+  // build deferred everything else behind a pipeline that never got built --
+  // every slice, so the warm-up never finished.
   final max = _maxSliceBuilds;
   if (_sliceBuilds == 0 ||
       (_buildClock.elapsed < budget && (max == null || _sliceBuilds < max))) {
-    _sliceBuilds++;
     return false;
   }
   _deferredBuilds++;
+  _deferredKeys.add(key);
   return true;
 }
 
@@ -510,6 +526,7 @@ gpu.RenderPipeline resolvePipeline(
   if (cached != null) return cached;
   final key = (vertexShader, fragmentShader, layoutId);
   activeRenderCounters.pipelineBuilds++;
+  if (_buildBudget != null) _sliceBuilds++;
   final stopwatch = kDebugMode || profileRendering
       ? (Stopwatch()..start())
       : null;
