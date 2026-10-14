@@ -3,6 +3,8 @@ import 'dart:typed_data';
 
 import 'package:flutter/foundation.dart';
 import 'package:flutter_scene/src/gpu/gpu.dart' as gpu;
+import 'package:flutter_scene/src/render/render_graph.dart' show activePassStats;
+import 'package:flutter_scene/src/render/render_stats.dart' show RenderStats;
 // Whether GPU commands execute while passes are encoded (the WebGL2 backend)
 // rather than after submission. Decides the default transients strategy.
 import 'package:flutter_scene/src/render/transients_execution_native.dart'
@@ -87,6 +89,7 @@ class GpuSubmissionTracker {
 
   /// Submits [commandBuffer] and records it for completion tracking.
   void submit(gpu.CommandBuffer commandBuffer) {
+    RenderStats.onSubmit?.call(activePassStats?.name ?? 'engine');
     final int id = record();
     try {
       commandBuffer.submit(completionCallback: (_) => complete(id));

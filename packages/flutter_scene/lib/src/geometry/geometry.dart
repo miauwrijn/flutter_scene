@@ -881,8 +881,14 @@ abstract class Geometry {
   /// returns bind-pose positions and no joint data.
   ///
   /// Throws a [StateError] when [isReadable] is false.
+  ///
+  /// [share] hands back the retained structure-of-arrays attributes and
+  /// indices themselves (views, not copies) where the geometry holds them
+  /// that way — for a reader that only reads them on this isolate and wants
+  /// no second copy of a large mesh. Nothing may write to them. Interleaved
+  /// geometry is always copied out.
   /// {@category Geometry}
-  MeshData extractMeshData() {
+  MeshData extractMeshData({bool share = false}) {
     final interleaved = _cpuVertices;
     final soaPositions = _cpuPositions;
     if (interleaved == null && soaPositions == null) {
@@ -931,6 +937,13 @@ abstract class Geometry {
         tangents[v * 4 + 2] = floats[base + 16];
         tangents[v * 4 + 3] = floats[base + 17];
       }
+    } else if (share) {
+      positions = soaPositions!;
+      normals = _cpuNormals;
+      texCoords = _cpuTexCoords;
+      texCoords1 = _cpuTexCoords1;
+      colors = _cpuColors;
+      tangents = _cpuTangents;
     } else {
       positions = Float32List.fromList(soaPositions!);
       final n = _cpuNormals;
@@ -948,9 +961,14 @@ abstract class Geometry {
     List<int>? indices;
     final indexBytes = _cpuIndices;
     if (indexBytes != null && _indexCount > 0) {
+      final shared = share && interleaved == null;
       indices = _indexType == gpu.IndexType.int32
-          ? Uint32List.fromList(Uint32List.sublistView(indexBytes))
-          : Uint16List.fromList(Uint16List.sublistView(indexBytes));
+          ? (shared
+                ? Uint32List.sublistView(indexBytes)
+                : Uint32List.fromList(Uint32List.sublistView(indexBytes)))
+          : (shared
+                ? Uint16List.sublistView(indexBytes)
+                : Uint16List.fromList(Uint16List.sublistView(indexBytes)));
     }
 
     return MeshData(

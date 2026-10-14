@@ -266,6 +266,13 @@ class RenderStats {
   static void Function(String? vertexShader, String? fragmentShader)?
   onPipelineBuilt;
 
+  /// Called at every command buffer the renderer submits, with what
+  /// submitted it (the executing render-graph pass's name, or a custom
+  /// pass's step). For lining a GPU trace's unlabelled command buffers up
+  /// with the passes that produced them: flutter_gpu cannot label them.
+  /// Null (the default) costs one test per submission.
+  static void Function(String label)? onSubmit;
+
   RenderFrameStats? _latest;
   final List<RenderFrameStats> _history = [];
   int _frameCount = 0;

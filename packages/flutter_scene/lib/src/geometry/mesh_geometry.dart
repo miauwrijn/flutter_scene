@@ -28,6 +28,29 @@ enum GeometryStorage {
   updatable,
 }
 
+/// Which vertex data a [MeshGeometry] keeps on the CPU after its upload.
+/// {@category Geometry}
+enum CpuRetention {
+  /// Nothing: the mesh cannot be raycast or extracted. What
+  /// `retainCpuData: false` asks for.
+  none,
+
+  /// Positions, normals, texture coordinates and indices — what a raycast
+  /// and a reader of the surface (a tracer, a collider) use — held as the
+  /// **caller's own arrays**, not copies, and an attribute the caller left
+  /// out stays absent rather than being filled with its default.
+  ///
+  /// For a large static mesh whose arrays the caller keeps anyway: the
+  /// retained data costs nothing beyond them. The caller must not write the
+  /// arrays afterwards. [MeshGeometry.extractMeshData] returns null for the
+  /// attributes not held; [MeshGeometry.packedData] and
+  /// [MeshGeometry.soaData] need [all].
+  surface,
+
+  /// Every attribute, copied, with defaults filled in for those not given.
+  all,
+}
+
 /// A triangle mesh built at runtime from vertex attribute arrays.
 ///
 /// `MeshGeometry` is the general-purpose [Geometry] for procedurally
@@ -72,7 +95,9 @@ class MeshGeometry extends UnskinnedGeometry {
   /// meshes. Set [retainCpuData] to false when the mesh does not need
   /// raycasting or [extractMeshData], avoiding a retained CPU copy after the
   /// upload. Updatable geometry requires retained CPU data and cannot use an
-  /// arena.
+  /// arena. [cpuRetention], when given, decides instead of [retainCpuData]
+  /// (see [CpuRetention.surface] for keeping only what a raycast reads,
+  /// without a copy).
   /// An updatable mesh fixes its indexed-or-not state at construction:
   /// supplying [indices] makes [rebuild] require indices thereafter, and
   /// omitting them makes it reject them. To start empty, pass a
@@ -94,12 +119,16 @@ class MeshGeometry extends UnskinnedGeometry {
     Aabb3? bounds,
     this.storage = GeometryStorage.fixed,
     GeometryBufferArena? bufferArena,
-    this.retainCpuData = true,
-  }) {
+    bool retainCpuData = true,
+    CpuRetention? cpuRetention,
+  }) : cpuRetention =
+           cpuRetention ??
+           (retainCpuData ? CpuRetention.all : CpuRetention.none) {
     if (storage == GeometryStorage.updatable && bufferArena != null) {
       throw ArgumentError('Updatable geometry cannot use a buffer arena');
     }
-    if (storage == GeometryStorage.updatable && !retainCpuData) {
+    if (storage == GeometryStorage.updatable &&
+        this.cpuRetention != CpuRetention.all) {
       throw ArgumentError('Updatable geometry must retain CPU data');
     }
     if (positions.length % 3 != 0) {
@@ -195,7 +224,7 @@ class MeshGeometry extends UnskinnedGeometry {
   /// owns the buffers.
   MeshGeometry.sharingVertices(MeshGeometry source, {List<int>? indices})
     : storage = GeometryStorage.fixed,
-      retainCpuData = false {
+      cpuRetention = CpuRetention.none {
     primitiveType = source.primitiveType;
     setVertexStreams(source.vertexStreams, source.boundVertexCount);
     shareCustomAttributesOf(source);
@@ -218,6 +247,7 @@ class MeshGeometry extends UnskinnedGeometry {
     GeometryStorage storage = GeometryStorage.fixed,
     GeometryBufferArena? bufferArena,
     bool retainCpuData = true,
+    CpuRetention? cpuRetention,
   }) {
     final geometry = MeshGeometry.fromArrays(
       positions: data.positions,
@@ -231,6 +261,7 @@ class MeshGeometry extends UnskinnedGeometry {
       storage: storage,
       bufferArena: bufferArena,
       retainCpuData: retainCpuData,
+      cpuRetention: cpuRetention,
     );
     for (final entry in data.customAttributes.entries) {
       geometry.setCustomAttribute(
@@ -270,7 +301,10 @@ class MeshGeometry extends UnskinnedGeometry {
   final GeometryStorage storage;
 
   /// Whether this mesh keeps CPU attributes for raycasting and extraction.
-  final bool retainCpuData;
+  bool get retainCpuData => cpuRetention != CpuRetention.none;
+
+  /// Which CPU vertex data this mesh keeps; see [CpuRetention].
+  final CpuRetention cpuRetention;
 
   // --- Updatable-storage state. Unused while [storage] is fixed. ---
 
@@ -354,12 +388,12 @@ class MeshGeometry extends UnskinnedGeometry {
     );
   }
 
-  Float32List _cpuPositions = Float32List(0);
-  Float32List _cpuNormals = Float32List(0);
-  Float32List _cpuTexCoords = Float32List(0);
-  Float32List _cpuTexCoords1 = Float32List(0);
-  Float32List _cpuColors = Float32List(0);
-  Float32List _cpuTangents = Float32List(0);
+  Float32List _cpuPositions = _absent;
+  Float32List _cpuNormals = _absent;
+  Float32List _cpuTexCoords = _absent;
+  Float32List _cpuTexCoords1 = _absent;
+  Float32List _cpuColors = _absent;
+  Float32List _cpuTangents = _absent;
 
   /// The number of vertices currently drawn.
   int get vertexCount => _liveVertexCount;
@@ -569,7 +603,14 @@ class MeshGeometry extends UnskinnedGeometry {
     // Retain the structure-of-arrays attributes (defaults filled). These back
     // both lazy serialization (interleaved on demand) and raycasting, and they
     // are uploaded straight to per-attribute GPU streams with no interleave.
-    if (retainCpuData) {
+    if (cpuRetention == CpuRetention.surface) {
+      // The caller's arrays as they are, and only what a raycast reads:
+      // copied with every default filled, a mesh kept 72 bytes a vertex on
+      // the Dart heap beside the caller's own arrays.
+      _cpuPositions = positions;
+      _cpuNormals = normals ?? _absent;
+      _cpuTexCoords = texCoords ?? _absent;
+    } else if (cpuRetention == CpuRetention.all) {
       _setCpuStreams(
         positions,
         vertexCount,
@@ -620,11 +661,11 @@ class MeshGeometry extends UnskinnedGeometry {
     if (retainCpuData) {
       setRaycastAttributes(
         positions: _cpuPositions,
-        texCoords: _cpuTexCoords,
-        texCoords1: _cpuTexCoords1,
-        normals: _cpuNormals,
-        colors: _cpuColors,
-        tangents: _cpuTangents,
+        texCoords: _held(_cpuTexCoords),
+        texCoords1: _held(_cpuTexCoords1),
+        normals: _held(_cpuNormals),
+        colors: _held(_cpuColors),
+        tangents: _held(_cpuTangents),
         indices: indexBytes,
       );
     }
@@ -670,10 +711,22 @@ class MeshGeometry extends UnskinnedGeometry {
   }
 
   void _requireReadable(String operation) {
-    if (!retainCpuData) {
-      throw StateError('$operation requires retainCpuData');
+    if (cpuRetention != CpuRetention.all) {
+      throw StateError(
+        '$operation requires retainCpuData (CpuRetention.all)',
+      );
     }
   }
+
+  /// What a [CpuRetention.surface] mesh holds for an attribute it was not
+  /// given (or does not keep).
+  static final Float32List _absent = Float32List(0);
+
+  /// [attribute] as the raycast data holds it: null when not held.
+  Float32List? _held(Float32List attribute) =>
+      cpuRetention == CpuRetention.surface && identical(attribute, _absent)
+      ? null
+      : attribute;
 
   // Writes all attribute streams into their rings and binds them.
   // Used at construction and on rebuild.
@@ -736,11 +789,11 @@ class MeshGeometry extends UnskinnedGeometry {
   void _refreshRaycastData() {
     setRaycastAttributes(
       positions: _cpuPositions,
-      texCoords: _cpuTexCoords,
-      texCoords1: _cpuTexCoords1,
-      normals: _cpuNormals,
-      colors: _cpuColors,
-      tangents: _cpuTangents,
+      texCoords: _held(_cpuTexCoords),
+      texCoords1: _held(_cpuTexCoords1),
+      normals: _held(_cpuNormals),
+      colors: _held(_cpuColors),
+      tangents: _held(_cpuTangents),
       indices: _packedIndexBytes == null
           ? null
           : ByteData.sublistView(_packedIndexBytes!),

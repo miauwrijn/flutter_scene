@@ -43,7 +43,7 @@ export 'src/geometry/mesh_data.dart'
         MeshTriangle,
         UnweldAttribute;
 export 'src/geometry/mesh_geometry.dart'
-    show GeometryBuilder, GeometryStorage, MeshGeometry;
+    show CpuRetention, GeometryBuilder, GeometryStorage, MeshGeometry;
 export 'src/geometry/morph_targets.dart'
     show MorphTargetData, kMaxGpuMorphTargets;
 export 'src/geometry/morphed_geometry.dart'
