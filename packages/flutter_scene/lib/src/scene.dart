@@ -82,12 +82,12 @@ import 'render/irradiance_pass.dart';
 import 'render/render_graph.dart';
 import 'render/render_graph_capture.dart';
 import 'render/render_stats.dart';
-import 'package:flutter_scene/src/gpu/shared/shader_library_sources.dart'
-    show knownShaderLibraries;
+import 'render/shader_names.dart';
 import 'scene_encoder.dart'
     show
         beginDrawFailureFrame,
         deferredPipelineBuilds,
+        slicePipelineKeys,
         deferredPipelineKeys,
         pipelineCacheSize,
         withPipelineBuildBudget;
@@ -2152,17 +2152,21 @@ base class Scene implements SceneGraph {
       if (slice > 0) await awaitRasterThread();
       if (_disposed) return;
       final paced = _pacedFrameCount;
+      final sliceWatch = Stopwatch()..start();
       withPipelineBuildBudget(
         sliceBudget,
         encode,
         maxBuilds: maxPipelineBuildsPerSlice,
       );
+      sliceWatch.stop();
       final waiting = deferredPipelineKeys;
       onProgress?.call(
         WarmUpProgress(
           built: pipelineCacheSize - cacheBefore,
           waiting: waiting.length,
           next: waiting.isEmpty ? null : _shaderName(waiting.first.$2),
+          sliceMicros: sliceWatch.elapsedMicroseconds,
+          compiled: [for (final key in slicePipelineKeys) ?_shaderName(key.$2)],
         ),
       );
       if (_pacedFrameCount == paced && deferredPipelineBuilds == 0) {
@@ -4609,7 +4613,13 @@ class _NearFitState {
 /// {@category Assets and loading}
 final class WarmUpProgress {
   /// Creates a progress report.
-  const WarmUpProgress({required this.built, required this.waiting, this.next});
+  const WarmUpProgress({
+    required this.built,
+    required this.waiting,
+    this.next,
+    this.sliceMicros = 0,
+    this.compiled = const [],
+  });
 
   /// Pipelines this warm-up has built so far.
   final int built;
@@ -4623,20 +4633,14 @@ final class WarmUpProgress {
   /// The fragment shader the next slice compiles (its name in its shader
   /// bundle), or null when none is waiting or the name is not known.
   final String? next;
+
+  /// The wall time of the slice just finished, in microseconds: on GLES
+  /// that is mostly its compiles, which block this thread outside any frame.
+  final int sliceMicros;
+
+  /// The fragment shaders whose pipelines the slice just finished built (their
+  /// names in their shader bundles; unknown ones are left out).
+  final List<String> compiled;
 }
 
-/// [shader]'s entry name in whichever loaded shader library holds it, for a
-/// progress label; null when no library knows it.
-String? _shaderName(gpu.Shader shader) {
-  for (final library in knownShaderLibraries()) {
-    try {
-      final shaders = (library as dynamic).shaders_ as Map;
-      for (final entry in shaders.entries) {
-        if (identical(entry.value, shader)) return '${entry.key}';
-      }
-    } on Object {
-      // A backend whose library keeps its shaders otherwise: no name.
-    }
-  }
-  return null;
-}
+String? _shaderName(gpu.Shader shader) => shaderEntryName(shader);

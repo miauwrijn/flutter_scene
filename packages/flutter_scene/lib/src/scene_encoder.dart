@@ -30,6 +30,7 @@ import 'package:flutter_scene/src/render/lod.dart';
 import 'package:flutter_scene/src/render/render_scene.dart';
 import 'package:flutter_scene/src/render/render_profile.dart';
 import 'package:flutter_scene/src/render/render_stats.dart';
+import 'package:flutter_scene/src/render/shader_names.dart';
 import 'package:flutter_scene/src/render/viewport_camera.dart';
 import 'package:flutter_scene/src/render/frame_transients.dart';
 import 'package:flutter_scene/src/render/instance_batching.dart';
@@ -451,6 +452,8 @@ int _sliceBuilds = 0;
 // what a warm-up still has to build (draws can share one, so the draw count
 // in [_deferredBuilds] overstates it).
 final Set<(gpu.Shader, gpu.Shader, int)> _deferredKeys = {};
+// The pipelines the current (or last) slice built, in build order.
+final List<(gpu.Shader, gpu.Shader, int)> _sliceKeys = [];
 
 /// Runs [body] with new pipeline builds capped at [budget] of slice time,
 /// and at [maxBuilds] new pipelines when given; draws past either are skipped
@@ -469,6 +472,7 @@ T withPipelineBuildBudget<T>(
   _deferredBuilds = 0;
   _sliceBuilds = 0;
   _deferredKeys.clear();
+  _sliceKeys.clear();
   try {
     return body();
   } finally {
@@ -506,6 +510,11 @@ bool _deferBuild((gpu.Shader, gpu.Shader, int) key) {
   return true;
 }
 
+/// The pipelines (vertex shader, fragment shader, layout) the last
+/// [withPipelineBuildBudget] built, in build order.
+@internal
+Iterable<(gpu.Shader, gpu.Shader, int)> get slicePipelineKeys => _sliceKeys;
+
 /// Pipelines currently held in the process-wide cache.
 int get pipelineCacheSize => _pipelineCache.length;
 
@@ -526,7 +535,14 @@ gpu.RenderPipeline resolvePipeline(
   if (cached != null) return cached;
   final key = (vertexShader, fragmentShader, layoutId);
   activeRenderCounters.pipelineBuilds++;
-  if (_buildBudget != null) _sliceBuilds++;
+  if (_buildBudget != null) {
+    _sliceBuilds++;
+    _sliceKeys.add(key);
+  }
+  final onBuilt = RenderStats.onPipelineBuilt;
+  if (onBuilt != null) {
+    onBuilt(shaderEntryName(vertexShader), shaderEntryName(fragmentShader));
+  }
   final stopwatch = kDebugMode || profileRendering
       ? (Stopwatch()..start())
       : null;

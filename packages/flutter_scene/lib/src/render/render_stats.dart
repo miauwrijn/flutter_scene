@@ -224,6 +224,14 @@ class RenderStats {
   /// release builds.
   static bool timelineEvents = true;
 
+  /// Called whenever a render pipeline is built (a pipeline-cache miss), with
+  /// the two shaders' entry names (null when no loaded library knows one).
+  /// For a profiler: on GLES the program is compiled and linked at the
+  /// pipeline's first draw, so the build itself is instant and the stall
+  /// lands in the pass that draws it, right after this fires.
+  static void Function(String? vertexShader, String? fragmentShader)?
+  onPipelineBuilt;
+
   RenderFrameStats? _latest;
   final List<RenderFrameStats> _history = [];
   int _frameCount = 0;
