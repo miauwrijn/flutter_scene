@@ -110,8 +110,15 @@ fragment {
     vec2 g = uv / cell;
     vec2 base = floor(g);
     vec3 best = vec3(0.0);
-    for (int j = -1; j <= 1; j++) {
-      for (int i = -1; i <= 1; i++) {
+    // The nine cells as ONE loop, in the same order (rows of three). Two
+    // nested literal loops were unrolled by fxc (ANGLE on Windows) into nine
+    // copies of this body per call; a count it cannot fold keeps it a loop.
+    // No cell holds a bead when `amount` is 0, so none are asked then.
+    int cells = amount > 0.0 ? 9 : 0;
+    for (int n = 0; n < cells; n++) {
+      {
+        int j = n / 3 - 1;
+        int i = n - (n / 3) * 3 - 1;
         vec2 id = base + vec2(float(i), float(j));
         float h = CloudHash(id + seed);
         float period = mix(6.0, 14.0, CloudHash(id + seed + 0.7));
@@ -215,8 +222,13 @@ fragment {
     float lane = floor(uv.x / width);
     vec4 best = vec4(0.0);
     float swept = 0.0;
-    for (int k = -1; k <= 1; k++) {
-      vec4 r = GlassRunnerIn(uv, lane + float(k), amount, t, push, gust, seed);
+    // The lane and its two neighbours, ONE GlassRunnerIn call: a literal
+    // bound let fxc unroll three copies of it per call. No lane holds a
+    // runner when `amount` is 0.
+    int lanes = amount > 0.0 ? 3 : 0;
+    for (int k = 0; k < lanes; k++) {
+      vec4 r = GlassRunnerIn(uv, lane + float(k - 1), amount, t, push, gust,
+                             seed);
       if (r.z > best.z) best = r;
       swept = max(swept, r.w);
     }
@@ -244,8 +256,21 @@ fragment {
     vec3 out_ = side > 0.3 ? flat_ / side : up;
     // Either face of the pane: rain on the outside shows from indoors too,
     // through the glass. The weather side is whichever the rain reaches.
-    float openOut = WeatherSkyOpen(p + out_ * 0.4, ax, ay, plane);
-    float openIn = WeatherSkyOpen(p - out_ * 0.45, ax, ay, plane);
+    // Both faces through ONE WeatherSkyOpen call (fxc inlines each call
+    // site). With the sky occlusion off it reads every point as open, which is
+    // where both start.
+    float openOut = 1.0;
+    float openIn = 1.0;
+    int faces = frag_info.weather_occ_range.z < 0.5 ? 0 : 2;
+    for (int f = 0; f < faces; f++) {
+      float o = WeatherSkyOpen(f == 0 ? p + out_ * 0.4 : p - out_ * 0.45, ax,
+                               ay, plane);
+      if (f == 0) {
+        openOut = o;
+      } else {
+        openIn = o;
+      }
+    }
     float open = max(openOut, openIn);
     if (open <= 0.001) return vec4(0.0);
     vec3 weatherSide = openOut >= openIn ? out_ : -out_;
@@ -355,11 +380,20 @@ fragment {
       float push = clamp(dot(wind, paneAcross) * 0.02, -0.2, 0.2);
       float gust = clamp(length(wind) / 14.0, 0.0, 1.0);
       float runners = clamp(rainAt.z * 1.5, 0.0, 1.0);
-      vec4 runA = GlassRunners(paneUv, runners, t, push, gust, 0.0);
-      vec4 runB = GlassRunners(paneUv + vec2(0.0275, 0.61), runners * 0.7, t,
-                               push, gust, 5.0);
-      vec4 run = runA.z >= runB.z ? runA : runB;
-      run.w = max(runA.w, runB.w);
+      // Two offset passes of runners, through ONE GlassRunners call: the
+      // stronger drop wins (the first on a tie), the swept paths combine.
+      vec4 run = vec4(0.0);
+      float swept = 0.0;
+      int passes = runners > 0.0 ? 2 : 0;
+      for (int pass = 0; pass < passes; pass++) {
+        vec4 r = pass == 0
+            ? GlassRunners(paneUv, runners, t, push, gust, 0.0)
+            : GlassRunners(paneUv + vec2(0.0275, 0.61), runners * 0.7, t,
+                           push, gust, 5.0);
+        if (pass == 0 || r.z > run.z) run = r;
+        swept = max(swept, r.w);
+      }
+      run.w = swept;
       // The smallest beads go first with distance: under a pixel they only
       // alias into specks.
       // Rain does not land evenly: drops gather in patches where the gusts
@@ -369,14 +403,27 @@ fragment {
       float low = 1.0 - fract(paneUv.y / 3.2);
       float gather = mix(0.35, 1.5, gathered) * mix(0.7, 1.25, low);
       // Many tiny beads, fewer medium ones, a scattering of big ones.
-      vec3 tiny = GlassBeads(paneUv, 0.008, amount * 0.6 * gather, t, 0.0) *
-                  (1.0 - smoothstep(0.0009, 0.0022, footprint));
-      vec3 medium = GlassBeads(paneUv + 0.37, 0.02, amount * 0.35 * gather,
-                               t * 0.8, 7.0);
-      vec3 big = GlassBeads(paneUv + 0.91, 0.045, amount * 0.18 * gather,
-                            t * 0.6, 13.0);
-      vec3 beads = tiny.z > medium.z ? tiny : medium;
-      beads = big.z > beads.z ? big : beads;
+      // The three sizes through ONE GlassBeads call (fxc inlines each call
+      // site): the strongest bead wins, medium over tiny on a tie, then big
+      // only where it is stronger still.
+      vec3 beads = vec3(0.0);
+      int sizes = amount > 0.0 ? 3 : 0;
+      for (int b = 0; b < sizes; b++) {
+        float size = b == 0 ? 0.008 : (b == 1 ? 0.02 : 0.045);
+        float share = b == 0 ? 0.6 : (b == 1 ? 0.35 : 0.18);
+        float clock = b == 0 ? 1.0 : (b == 1 ? 0.8 : 0.6);
+        float seed = b == 0 ? 0.0 : (b == 1 ? 7.0 : 13.0);
+        vec2 shift = vec2(b == 0 ? 0.0 : (b == 1 ? 0.37 : 0.91));
+        vec3 d = GlassBeads(paneUv + shift, size, amount * share * gather,
+                            t * clock, seed);
+        if (b == 0) {
+          beads = d * (1.0 - smoothstep(0.0009, 0.0022, footprint));
+        } else if (b == 1) {
+          beads = beads.z > d.z ? beads : d;
+        } else if (d.z > beads.z) {
+          beads = d;
+        }
+      }
       // A runnel sweeps its path clear of beads.
       beads *= 1.0 - run.w;
       drop = run.z > beads.z ? run.xyz : beads;
@@ -424,13 +471,25 @@ fragment {
     vec2 offset_r = ProjectWorldOffsetToScreenUv(ray_r) - screen_uv;
     vec2 offset_g = ProjectWorldOffsetToScreenUv(ray_g) - screen_uv;
     vec2 offset_b = ProjectWorldOffsetToScreenUv(ray_b) - screen_uv;
-    vec3 transmitted;
-    transmitted.r = GetSceneColorFiltered(
-        offset_r, material.roughness, iors.r).r;
-    transmitted.g = GetSceneColorFiltered(
-        offset_g, material.roughness, iors.g).g;
-    transmitted.b = GetSceneColorFiltered(
-        offset_b, material.roughness, iors.b).b;
+    // One channel per dispersed ray, through ONE GetSceneColorFiltered call:
+    // fxc (ANGLE on Windows) inlines each call site, and this was three
+    // copies of the filtered lookup. With no scene colour bound it reads
+    // black, which is where every channel starts.
+    vec3 transmitted = vec3(0.0);
+    int channels = frag_info.scene_inputs.x < 0.5 ? 0 : 3;
+    for (int c = 0; c < channels; c++) {
+      vec2 offset = c == 0 ? offset_r : (c == 1 ? offset_g : offset_b);
+      float channel_ior = c == 0 ? iors.r : (c == 1 ? iors.g : iors.b);
+      vec3 seen = GetSceneColorFiltered(offset, material.roughness,
+                                        channel_ior);
+      if (c == 0) {
+        transmitted.r = seen.r;
+      } else if (c == 1) {
+        transmitted.g = seen.g;
+      } else {
+        transmitted.b = seen.b;
+      }
+    }
 
     float attenuation_distance = max(material_params.attenuation_distance,
                                      1e-4);

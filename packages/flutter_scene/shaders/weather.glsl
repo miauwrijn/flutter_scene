@@ -56,6 +56,16 @@ vec2 CloudDeckPoint(vec3 origin, vec3 toLight, float deckHeight) {
 }
 // END CloudDensity
 
+// [n], as a count the shader compiler cannot fold. On Windows, ANGLE hands
+// these shaders to fxc, which inlines every call site and unrolls every loop
+// it can count; the weathering below was a third to two thirds of every lit
+// material's link time, from 3x3 drop grids and noise fields unrolled at
+// several call sites each. The deck height is always finite, so this is
+// always [n] -- but fxc cannot know that, and keeps the loop a loop.
+int WeatherCount(int n) {
+  return frag_info.weather_cloud_up.w > -1.0e30 ? n : 0;
+}
+
 // The top of whatever stands over [p] (nearest texel: the channels are packed
 // data), or -1e9 where nothing does.
 float WeatherTopAt(vec3 p) {
@@ -63,7 +73,12 @@ float WeatherTopAt(vec3 p) {
                  dot(p, frag_info.weather_occ_t.xyz) + frag_info.weather_occ_t.w);
   if (st.x < 0.0 || st.y < 0.0 || st.x > 1.0 || st.y > 1.0) return -1e9;
 #ifdef FLUTTER_SCENE_WEATHER_OCCLUSION
-  vec4 e = texture(weather_occlusion, st);
+  // Level 0, explicitly. The texel packs a 16-bit height into its red and
+  // green bytes, so a filtered or mip-mapped read blends bytes into a height
+  // that was never stored. And an implicit-derivative read here sits in
+  // WeatherSkyOpen's loop, which fxc (ANGLE on Windows) can only compile by
+  // unrolling it: that one call was most of the weathering's link time.
+  vec4 e = textureLod(weather_occlusion, st, 0.0);
 #else
   vec4 e = vec4(0.0);  // no map in this variant: open sky
 #endif
@@ -90,7 +105,12 @@ float WeatherSkyOpen(vec3 p, vec3 ax, vec3 ay, vec2 plane) {
   vec2 j = (vec2(CloudNoise(plane * 1.7), CloudNoise(plane * 1.7 + 9.1)) - 0.5) * 0.45;
   q += ax * j.x + ay * j.y;
   float open = 0.0;
-  for (int k = 0; k < 5; k++) {
+  // Five taps (the point and a cross around it), as a loop fxc keeps a loop:
+  // with a literal bound it unrolled them into five copies of WeatherTopAt,
+  // per call site. 5 here (the early return above handled the off case), but
+  // not a constant to the compiler.
+  int taps = 5 * int(step(0.5, frag_info.weather_occ_range.z));
+  for (int k = 0; k < taps; k++) {
     vec2 o = k == 0 ? vec2(0.0)
         : vec2(k == 1 ? 1.0 : (k == 2 ? -1.0 : 0.0),
                k == 3 ? 1.0 : (k == 4 ? -1.0 : 0.0)) * 0.22;
@@ -123,9 +143,11 @@ float WeatherCloudShadow(vec3 p) {
 vec2 WeatherRipples(vec2 p, float t) {
   vec2 g = vec2(0.0);
   vec2 cell = floor(p);
-  for (int j = -1; j <= 1; j++) {
-    for (int i = -1; i <= 1; i++) {
-      vec2 c = cell + vec2(float(i), float(j));
+  // The 3x3 neighbourhood as one loop, rows of three (see WeatherCount).
+  int cells = WeatherCount(9);
+  for (int n = 0; n < cells; n++) {
+    {
+      vec2 c = cell + vec2(float(n - (n / 3) * 3 - 1), float(n / 3 - 1));
       float h = CloudHash(c);
       float size = 0.55 + 0.45 * CloudHash(c + 5.3);
       vec2 centre = c + vec2(CloudHash(c + 3.1), CloudHash(c + 7.7));
@@ -204,15 +226,38 @@ void ApplyWeathering(inout MaterialInputs material, vec3 p) {
     // Hard: everything but the ground — a terrain passes its pooling field
     // and is soft (grass, beds, sand soak the drops up) outside its puddles.
     bool hard = material.pooling < 0.0;
+    // The rain's rings, once: the film and the puddles below read the same
+    // field, and each WeatherRipples call is a whole copy of it to fxc.
+    vec2 rings = level > 0.0 && w.z > 0.01
+        ? WeatherRipples(plane * 2.5, GetTime())
+        : vec2(0.0);
     if (level > 0.0 && hard && w.z > 0.01) {
       // A thin film on flat paving and roofs: faint rings everywhere.
-      vec2 g = WeatherRipples(plane * 2.5, GetTime()) * w.z * 0.06 * level * wet;
+      vec2 g = rings * w.z * 0.06 * level * wet;
       material.normal = normalize(material.normal + ax * g.x + ay * g.y);
     }
     if (level > 0.0) {
+      // Four gradient noises -- two warping the domain, two over the warped
+      // one -- through ONE WeatherGradNoise call (see WeatherCount).
       vec2 q = plane * 0.35;
-      q += vec2(WeatherGradNoise(q * 0.5 + 3.1), WeatherGradNoise(q * 0.5 + 7.3)) * 0.8;
-      float low = WeatherGradNoise(q) * 0.7 + WeatherGradNoise(q * 2.3 + 11.0) * 0.3;
+      vec2 warp = vec2(0.0);
+      float low = 0.0;
+      int noises = WeatherCount(4);
+      for (int k = 0; k < noises; k++) {
+        if (k == 2) q += warp * 0.8;
+        vec2 at = k == 0 ? q * 0.5 + 3.1
+                : k == 1 ? q * 0.5 + 7.3
+                : k == 2 ? q
+                         : q * 2.3 + 11.0;
+        float v = WeatherGradNoise(at);
+        if (k == 0) {
+          warp.x = v;
+        } else if (k == 1) {
+          warp.y = v;
+        } else {
+          low += v * (k == 2 ? 0.7 : 0.3);
+        }
+      }
       low += (1.0 - material.occlusion) * 0.1;
       // Where the surface says water gathers (a terrain's hollows and
       // slope feet), that decides it and the noise only breaks the outline;
@@ -233,7 +278,7 @@ void ApplyWeathering(inout MaterialInputs material, vec3 p) {
         vec3 n = mix(material.normal, ng, puddle);
         float rain = w.z;
         if (rain > 0.01) {
-          vec2 g = WeatherRipples(plane * 2.5, GetTime()) * rain * 0.3 * puddle;
+          vec2 g = rings * rain * 0.3 * puddle;
           n += ax * g.x + ay * g.y;
         }
         material.normal = normalize(n);

@@ -203,7 +203,10 @@ float SampleCascade(int cascade, int count, highp vec3 proj, highp float box,
         max(cone * 7.0 * receiver_depth, frag_info.shadow_texel_size);
     highp float blocker_sum = 0.0;
     float blocker_count = 0.0;
-    for (int i = 0; i < 9; i++) {
+    // A count the compiler cannot fold (see the kernel note below): 9 here,
+    // where filter_index is 2, but not a constant to fxc.
+    int blocker_taps = 9 * int(step(1.5, filter_index));
+    for (int i = 0; i < blocker_taps; i++) {
       highp float caster = ShadowTapDepth(PoissonShadowTap(i), ca, sa, search_radius,
                                     uv, cascade, total, slope);
       float hit = step(caster, receiver_depth);
@@ -216,57 +219,73 @@ float SampleCascade(int cascade, int count, highp vec3 proj, highp float box,
     radius = clamp(penumbra, frag_info.shadow_texel_size, max_radius);
   }
 
+  // The kernels. Each is ONE loop around ONE tap call, with a trip count the
+  // compiler cannot fold. That shape is about compile time, not GPU time: on
+  // Windows, ANGLE hands this to fxc, which inlines every call site and fully
+  // unrolls every loop whose bound it can fold, so the 5 probe taps, the
+  // 17-tap kernel and the 4 bilinear taps were ~26 inlined copies of a tap per
+  // cascade, and four cascades' worth (see SampleShadow). Lit materials took
+  // 10-75 s each to link there; this path was a third of it.
+  //
+  // Most fragments are fully lit or fully shadowed: probe the kernel's centre
+  // and corners first and run the full kernel only where they disagree (the
+  // penumbra), which cuts the shadow-map reads on texture-rate-bound GPUs.
+  // The probes are the loop's first taps. PCSS skips them, since its blocker
+  // search sizes the kernel; the bilinear filter takes its own taps after.
+  //
   // The Poisson positions are selected when fixed_filter is 0, the stable grid
-  // positions when it is 1. The latter preserves the same 17-tap pattern.
+  // positions when it is 1; the latter keeps the same 17-tap pattern.
   //
   // TODO(flutter_scene): use file-scope const arrays once impellerc/SPIRV-Cross
   // emits valid ES 1.00 array constructors for them.
-  float shadow = 0.0;
-  // Most fragments are fully lit or fully shadowed. Probe the kernel's center
-  // and corners first and run the full kernel only where they disagree (the
-  // penumbra), which cuts the shadow-map reads on texture-rate-bound GPUs.
-  // PCSS keeps its own path, since its blocker search sizes the kernel.
+  bool pcss = filter_index > 1.5 && filter_index < 2.5;
+  bool bilinear = filter_index > 2.5;
+  int probe_taps = pcss ? 0 : 5;
+  int kernel_taps = bilinear ? 0 : (fixed_filter > 0.5 ? 17 : 16);
+  int taps = probe_taps + kernel_taps;
+  float probe = 0.0;
+  float lit = 0.0;
   bool settled = false;
-  if (filter_index < 1.5 || filter_index > 2.5) {
-    float probe =
-        ShadowTap(vec2(0.0), ca, sa, radius, uv, cascade, total,
-                  receiver_depth, slope) +
-        ShadowTap(vec2(-1.0, -1.0), ca, sa, radius, uv, cascade, total,
-                  receiver_depth, slope) +
-        ShadowTap(vec2(1.0, -1.0), ca, sa, radius, uv, cascade, total,
-                  receiver_depth, slope) +
-        ShadowTap(vec2(-1.0, 1.0), ca, sa, radius, uv, cascade, total,
-                  receiver_depth, slope) +
-        ShadowTap(vec2(1.0, 1.0), ca, sa, radius, uv, cascade, total,
-                  receiver_depth, slope);
-    settled = probe < 0.5 || probe > 4.5;
-    shadow = probe * 0.2;
+  for (int i = 0; i < taps; i++) {
+    vec2 tap;
+    if (i < probe_taps) {
+      // The centre, then the four corners.
+      tap = i == 0 ? vec2(0.0)
+                   : vec2(i == 1 || i == 3 ? -1.0 : 1.0, i < 3 ? -1.0 : 1.0);
+    } else {
+      int k = i - probe_taps;
+      tap = mix(PoissonShadowTap(k), FixedShadowTap(k), fixed_filter);
+    }
+    float s = ShadowTap(tap, ca, sa, radius, uv, cascade, total,
+                        receiver_depth, slope);
+    if (i < probe_taps) {
+      probe += s;
+      if (i == probe_taps - 1) {
+        settled = probe < 0.5 || probe > 4.5;
+        if (settled) break; // the probes agree, so the kernel would too
+      }
+    } else {
+      lit += s;
+    }
   }
+  float shadow;
   if (settled) {
-    // The probes agree, so the kernel would too.
-  } else if (filter_index > 2.5) {
+    shadow = probe * 0.2;
+  } else if (bilinear) {
     // 4-tap bilinear PCF: 4 taps x 4 texels = 16 samples total (matching the
     // 16-sample budget), producing continuous analog filtering with zero
     // noise rotation or stepped banding.
-    float lit = ShadowTapBilinear(vec2(-0.7071, -0.7071), radius, uv, cascade,
-                                  total, receiver_depth, slope) +
-                ShadowTapBilinear(vec2(0.7071, -0.7071), radius, uv, cascade,
-                                  total, receiver_depth, slope) +
-                ShadowTapBilinear(vec2(-0.7071, 0.7071), radius, uv, cascade,
-                                  total, receiver_depth, slope) +
-                ShadowTapBilinear(vec2(0.7071, 0.7071), radius, uv, cascade,
-                                  total, receiver_depth, slope);
-    shadow = lit * 0.25;
-  } else {
-    int sample_count = fixed_filter > 0.5 ? 17 : 16;
-    float lit = 0.0;
-    for (int i = 0; i < 17; i++) {
-      if (i >= sample_count) break;
-      vec2 tap = mix(PoissonShadowTap(i), FixedShadowTap(i), fixed_filter);
-      lit += ShadowTap(tap, ca, sa, radius, uv, cascade, total,
-                       receiver_depth, slope);
+    int bilinear_taps = 4 * int(step(2.5, filter_index));
+    float bilinear_lit = 0.0;
+    for (int i = 0; i < bilinear_taps; i++) {
+      vec2 p = vec2(i == 0 || i == 2 ? -0.7071 : 0.7071,
+                    i < 2 ? -0.7071 : 0.7071);
+      bilinear_lit += ShadowTapBilinear(p, radius, uv, cascade, total,
+                                        receiver_depth, slope);
     }
-    shadow = lit / float(sample_count);
+    shadow = bilinear_lit * 0.25;
+  } else {
+    shadow = lit / float(kernel_taps);
   }
 
   // Only the last cascade has a real outer edge (inner cascades hand
@@ -297,32 +316,6 @@ float CascadeBlendWeight(highp vec2 uv, highp float margin, highp float band) {
 // shadowed). `world_pos` and `n` are world-space; `n` is the geometric
 // normal. Walks the cascades highest-resolution first, taking from each the
 // weight its tile still has room for.
-// Tries cascade IDX (a literal): if the fragment lies inside its tile with
-// room for the PCF kernel, samples it and accumulates its weight. IDX is a
-// literal so no uniform array or vector is indexed with a dynamic index
-// (invalid in GLSL ES 1.00, and misread for indices past the first by some
-// GLES drivers).
-#define _TRY_CASCADE(IDX)                                                    \
-  if (weight < 1.0 && count > IDX) {                                         \
-    highp mat4 cascade_matrix = frag_info.light_space_matrix[IDX];                 \
-    highp float box = frag_info.cascade_box_sizes[IDX];                            \
-    highp vec4 light_clip = cascade_matrix * vec4(biased_world_pos, 1.0);          \
-    highp vec3 proj = light_clip.xyz / light_clip.w;                              \
-    highp vec2 uv = proj.xy * 0.5 + 0.5;                                           \
-    highp float margin =                                                          \
-        max(frag_info.shadow_softness / box, frag_info.shadow_texel_size);   \
-    if (!(uv.x < margin || uv.x > 1.0 - margin || uv.y < margin ||          \
-          uv.y > 1.0 - margin || proj.z < 0.0 || proj.z > 1.0)) {           \
-      float take = min(CascadeBlendWeight(uv, margin, band),                 \
-                       1.0 - weight);                                        \
-      if (take > 0.0) {                                                      \
-        shadow_sum += take * SampleCascade(IDX, count, proj, box,            \
-                                           ReceiverPlaneSlope(cascade_matrix, n)); \
-        weight += take;                                                      \
-      }                                                                      \
-    }                                                                        \
-  }
-
 float SampleShadow(highp vec3 world_pos, vec3 n) {
   int count = int(frag_info.shadow_cascade_count);
   // Select and sample with the same displaced position. Selecting with the
@@ -330,8 +323,8 @@ float SampleShadow(highp vec3 world_pos, vec3 n) {
   // every PCF tap clamp to one edge texel and producing a visible band.
   highp vec3 biased_world_pos = BiasDirectionalShadowPosition(world_pos, n);
   // Cross-fade half-width in a cascade's UV space, from the light's
-  // cascadeOverlap. At 0 every _TRY_CASCADE takes the full weight, so the
-  // first containing cascade wins outright and the later ones are skipped.
+  // cascadeOverlap. At 0 the first containing cascade takes the full weight
+  // and the later ones are skipped.
   float band = frag_info.directional_light_color.w * 0.5;
   // Fade to lit by view depth before the shadow distance, at least
   // shadow_fade wide and a tenth of the distance. The tiles reach past it,
@@ -346,20 +339,53 @@ float SampleShadow(highp vec3 world_pos, vec3 n) {
   float shadow_sum = 0.0;
   float weight = 0.0;
   // A fully faded fragment would discard its taps, so it skips them.
-  // Unrolled with literal cascade indices: see _TRY_CASCADE. A single `return`
-  // (no early return inside a loop) also avoids a nested-loop pattern that
-  // crashes a Direct3D shader compiler.
+  //
+  // ONE SampleCascade call, in a loop bounded by the uniform cascade count.
+  // This was four literal expansions of a macro, and SampleCascade is the
+  // whole kernel: fxc (ANGLE on Windows) inlines every call site, so each lit
+  // material carried four copies of it. A bound fxc cannot fold keeps it one.
+  //
+  // The cascade's matrix and box are still read with literal indices, chosen
+  // by an if-chain, so no uniform array is indexed with a dynamic index
+  // (misread for indices past the first by some GLES drivers).
   if (fade < 1.0) {
-    _TRY_CASCADE(0)
-    _TRY_CASCADE(1)
-    _TRY_CASCADE(2)
-    _TRY_CASCADE(3)
+    for (int i = 0; i < count; i++) {
+      if (weight >= 1.0) break;
+      highp mat4 cascade_matrix;
+      highp float box;
+      if (i == 0) {
+        cascade_matrix = frag_info.light_space_matrix[0];
+        box = frag_info.cascade_box_sizes[0];
+      } else if (i == 1) {
+        cascade_matrix = frag_info.light_space_matrix[1];
+        box = frag_info.cascade_box_sizes[1];
+      } else if (i == 2) {
+        cascade_matrix = frag_info.light_space_matrix[2];
+        box = frag_info.cascade_box_sizes[2];
+      } else {
+        cascade_matrix = frag_info.light_space_matrix[3];
+        box = frag_info.cascade_box_sizes[3];
+      }
+      highp vec4 light_clip = cascade_matrix * vec4(biased_world_pos, 1.0);
+      highp vec3 proj = light_clip.xyz / light_clip.w;
+      highp vec2 uv = proj.xy * 0.5 + 0.5;
+      highp float margin =
+          max(frag_info.shadow_softness / box, frag_info.shadow_texel_size);
+      if (!(uv.x < margin || uv.x > 1.0 - margin || uv.y < margin ||
+            uv.y > 1.0 - margin || proj.z < 0.0 || proj.z > 1.0)) {
+        float take = min(CascadeBlendWeight(uv, margin, band), 1.0 - weight);
+        if (take > 0.0) {
+          shadow_sum += take * SampleCascade(i, count, proj, box,
+                                             ReceiverPlaneSlope(cascade_matrix, n));
+          weight += take;
+        }
+      }
+    }
   }
   // Weight no cascade covered reads as lit.
   float shadow = shadow_sum + (1.0 - weight);
   return mix(shadow, 1.0, fade);
 }
-#undef _TRY_CASCADE
 #endif
 
 

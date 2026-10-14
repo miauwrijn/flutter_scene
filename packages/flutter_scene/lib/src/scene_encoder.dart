@@ -425,25 +425,51 @@ gpu.RenderPipeline? cachedRenderPipeline(
 final Set<(gpu.Shader, gpu.Shader, int)> _rejectedPipelines = {};
 
 // A sliced warm-up's build budget: while set, new pipelines stop building
-// once builds have taken this long, and the draws that need the rest are
+// once the slice has run this long, and the draws that need the rest are
 // skipped and counted, so the warm-up yields and tries them next slice.
+//
+// The clock is the slice's WALL time, not the time spent inside
+// createRenderPipeline. On GLES that call returns at once and the program is
+// compiled and linked at the pipeline's first draw (ANGLE -> HLSL -> fxc on
+// Windows: seconds for a lit material), so timing only the call saw every
+// build as free, never deferred one, and a "sliced" warm-up compiled every
+// material in one blocking slice. Wall time includes those draws. At least
+// one new pipeline builds per slice, so a slice whose encode alone outlasts
+// the budget still makes progress.
+//
+// Wall time still cannot see a compile that has not happened yet, and a pass
+// that resolves every pipeline while it builds its draw list, then draws, asks
+// for all of them before the first one compiles. [_maxSliceBuilds] caps the
+// new pipelines a slice may build by count, for exactly that: on GLES, one per
+// slice puts a frame between every compile.
 Duration? _buildBudget;
+int? _maxSliceBuilds;
 final Stopwatch _buildClock = Stopwatch();
 int _deferredBuilds = 0;
+int _sliceBuilds = 0;
 
-/// Runs [body] with new pipeline builds capped at [budget] of build time;
-/// draws past it are skipped and counted in [deferredPipelineBuilds].
+/// Runs [body] with new pipeline builds capped at [budget] of slice time,
+/// and at [maxBuilds] new pipelines when given; draws past either are skipped
+/// and counted in [deferredPipelineBuilds].
 @internal
-T withPipelineBuildBudget<T>(Duration budget, T Function() body) {
+T withPipelineBuildBudget<T>(
+  Duration budget,
+  T Function() body, {
+  int? maxBuilds,
+}) {
   _buildBudget = budget;
+  _maxSliceBuilds = maxBuilds;
   _buildClock
-    ..stop()
-    ..reset();
+    ..reset()
+    ..start();
   _deferredBuilds = 0;
+  _sliceBuilds = 0;
   try {
     return body();
   } finally {
     _buildBudget = null;
+    _maxSliceBuilds = null;
+    _buildClock.stop();
   }
 }
 
@@ -454,7 +480,12 @@ int get deferredPipelineBuilds => _deferredBuilds;
 bool _deferBuild((gpu.Shader, gpu.Shader, int) key) {
   final budget = _buildBudget;
   if (budget == null || _pipelineCache.containsKey(key)) return false;
-  if (_buildClock.elapsed < budget) return false;
+  final max = _maxSliceBuilds;
+  if (_sliceBuilds == 0 ||
+      (_buildClock.elapsed < budget && (max == null || _sliceBuilds < max))) {
+    _sliceBuilds++;
+    return false;
+  }
   _deferredBuilds++;
   return true;
 }
@@ -482,13 +513,11 @@ gpu.RenderPipeline resolvePipeline(
   final stopwatch = kDebugMode || profileRendering
       ? (Stopwatch()..start())
       : null;
-  if (_buildBudget != null) _buildClock.start();
   final pipeline = gpu.gpuContext.createRenderPipeline(
     vertexShader,
     fragmentShader,
     vertexLayout: vertexLayout?.toGpuLayout(),
   );
-  _buildClock.stop();
   if (stopwatch != null) {
     stopwatch.stop();
     // A backend pipeline build is synchronous and lands mid-frame the first

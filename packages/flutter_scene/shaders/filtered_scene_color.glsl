@@ -41,10 +41,13 @@ vec3 SampleTransmissionBand(highp vec2 uv, float level, highp vec2 scene_size,
                   minimum, maximum) / atlas_size;
   highp vec2 p3 = clamp(origin + base + vec2(h1.x, h1.y) - 0.5,
                   minimum, maximum) / atlas_size;
-  return g0.y * (g0.x * texture(scene_filtered_color, p0).rgb +
-                 g1.x * texture(scene_filtered_color, p1).rgb) +
-         g1.y * (g0.x * texture(scene_filtered_color, p2).rgb +
-                 g1.x * texture(scene_filtered_color, p3).rgb);
+  // Level-0 reads: the bands are laid out by hand in one single-level
+  // texture, so this is what texture() returns -- and an implicit-derivative
+  // read inside the band loop is one fxc (ANGLE on Windows) unrolls again.
+  return g0.y * (g0.x * textureLod(scene_filtered_color, p0, 0.0).rgb +
+                 g1.x * textureLod(scene_filtered_color, p1, 0.0).rgb) +
+         g1.y * (g0.x * textureLod(scene_filtered_color, p2, 0.0).rgb +
+                 g1.x * textureLod(scene_filtered_color, p3, 0.0).rgb);
 }
 
 // Samples the accumulated scene color with perceptual roughness and
@@ -63,8 +66,22 @@ vec3 GetSceneColorFiltered(highp vec2 uv_offset, float roughness, float ior) {
   highp vec2 atlas_size = 1.0 / frag_info.transmission_info.zw;
   highp float lo = max(floor(lod), 1.0);
   highp float hi = min(lo + 1.0, bands);
-  vec3 lo_color = SampleTransmissionBand(uv, lo, scene_size, atlas_size);
-  vec3 hi_color = SampleTransmissionBand(uv, hi, scene_size, atlas_size);
+  // The two bands the level falls between, through ONE SampleTransmissionBand
+  // call: each is four bicubic taps, and fxc (ANGLE on Windows) inlines every
+  // call site -- with a dispersive material calling this once per channel,
+  // that was six copies. Always two here, but not a count fxc can fold.
+  vec3 lo_color = vec3(0.0);
+  vec3 hi_color = vec3(0.0);
+  int band_taps = bands >= 1.0 ? 2 : 0;
+  for (int b = 0; b < band_taps; b++) {
+    vec3 band = SampleTransmissionBand(uv, b == 0 ? lo : hi, scene_size,
+                                       atlas_size);
+    if (b == 0) {
+      lo_color = band;
+    } else {
+      hi_color = band;
+    }
+  }
   vec3 filtered = mix(lo_color, hi_color, fract(lod));
   return mix(sharp, filtered, min(lod, 1.0));
 }

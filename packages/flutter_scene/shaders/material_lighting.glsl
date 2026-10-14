@@ -650,19 +650,52 @@ highp vec4 EvaluateLighting(MaterialInputs material) {
   // GLSL ES 3.00 or newer, where runtime loop bounds are legal, so no driver
   // can unroll it and the budget is a CPU-side data choice
   // (kMaxPunctualLights per object, kMaxFroxelLights per froxel).
-  for (int i = 0; i < punctual_count; i++) {
+  //
+  // The sun (the shadowed first directional light) is the loop's last slot,
+  // after the slice's lights, so the BRDF below has ONE call site. It used to
+  // shade in a block of its own after the image-based terms, a second copy of
+  // EvaluateAnalyticLight and the clearcoat lobe: fxc (ANGLE on Windows)
+  // inlines every call site, and that copy was a large share of every lit
+  // material's link time. Its visibility (facing x shadow) folds into its
+  // radiance, which the BRDF is linear in; its roughness is the surface's.
+  int sun_slots = 0;
+#ifndef FLUTTER_SCENE_NO_DIRECTIONAL_LIGHT
+  sun_slots = frag_info.has_directional_light > 0.5 ? 1 : 0;
+#endif
+  for (int i = 0; i < punctual_count + sun_slots; i++) {
+    vec3 punctual_light_vector = vec3(0.0);
+    highp vec3 radiance;
+    // A sized point or spot light (radius in texel 3.w) widens the specular
+    // lobe by its apparent half-angle, so a glossy surface reflects a bulb
+    // rather than a point of unbounded radiance.
+    float light_roughness = roughness;
+    // False for a rect area light, which the LTC integral below shades.
+    bool analytic = true;
+    if (i == punctual_count) {
+      // The sun.
+      punctual_light_vector = light_vector;
+      radiance = frag_info.directional_light_color.rgb * sun_visibility;
+#ifdef FLUTTER_SCENE_LIGHTING_HOOKS
+      light_context.color = frag_info.directional_light_color.rgb;
+      light_context.position = vec3(0.0);
+      light_context.direction = -light_vector;
+      light_context.distance_attenuation = 1.0;
+      light_context.cone_attenuation = facing;
+      light_context.shadow = shadow;
+      light_context.type = 0.0;
+      light_context.light_row = -1.0;
+      light_context.shadow_slot = -1.0;
+#endif
+    } else {
     // Resolve this slot to a light row through the per-object index buffer.
     int light_row = int(FetchPunctualIndex(punctual_offset + i) + 0.5);
     highp vec4 l0 = FetchPunctualTexel(light_row, 0); // position.xyz, type
     highp vec4 l1 = FetchPunctualTexel(light_row, 1); // color.rgb, inverse range
     float type = l0.w;
-    highp vec3 radiance = l1.rgb;
-    // A sized point or spot light (radius in texel 3.w) widens the specular
-    // lobe by its apparent half-angle, so a glossy surface reflects a bulb
-    // rather than a point of unbounded radiance.
-    float light_roughness = roughness;
+    radiance = l1.rgb;
 #ifndef FLUTTER_SCENE_LEAN_LIGHTING
     if (type > 2.5) {
+      analytic = false;
 #ifdef FLUTTER_SCENE_CUSTOM_AMBIENT
       // TODO(custom-ambient-area-lights): the LTC tables ride brdf_lut, which
       // a custom-ambient material does not declare, so rect area lights are
@@ -692,29 +725,57 @@ highp vec4 EvaluateLighting(MaterialInputs material) {
       vec4 t2 = texture(brdf_lut, LtcLutUv(ltc_uv, 2.0));
       mat3 inv_m = mat3(
           vec3(t1.x, 0.0, t1.y), vec3(0.0, 1.0, 0.0), vec3(t1.z, 0.0, t1.w));
-      float spec_shape = LtcIntegrate(
-          normal, camera_normal, v_position, inv_m, c0, c1, c2, c3);
-      float diff_shape = LtcIntegrate(
-          normal, camera_normal, v_position, mat3(1.0), c0, c1, c2, c3);
+      // The lobes -- specular, diffuse, and the clearcoat's own -- through ONE
+      // LtcIntegrate call site. fxc (ANGLE on Windows) inlines each call, and
+      // these were three copies of the four-edge integral in every lit
+      // material. A light seen from behind contributes nothing (`facing`
+      // scales all of it), so it takes no lobes at all.
+      float spec_shape = 0.0;
+      float diff_shape = 0.0;
+#ifdef FLUTTER_SCENE_PHYSICAL_MATERIAL
+      // The clearcoat's lobe: the coat's normal and roughness and the
+      // dielectric F0 of 0.04. The base layer's coat attenuation is applied
+      // once at the final composite.
+      float coat_shape = 0.0;
+      vec4 ct2 = vec4(0.0);
+      int ltc_lobes = facing > 0.0 ? (material.clearcoat > 0.0 ? 3 : 2) : 0;
+#else
+      int ltc_lobes = facing > 0.0 ? 2 : 0;
+#endif
+      for (int lobe = 0; lobe < ltc_lobes; lobe++) {
+        vec3 lobe_normal = normal;
+        mat3 lobe_inv_m = lobe == 0 ? inv_m : mat3(1.0);
+#ifdef FLUTTER_SCENE_PHYSICAL_MATERIAL
+        if (lobe == 2) {
+          vec2 coat_ltc_uv = clamp(
+              vec2(coat_roughness, sqrt(1.0 - coat_n_dot_v)), 0.0, 1.0);
+          vec4 ct1 = texture(brdf_lut, LtcLutUv(coat_ltc_uv, 1.0));
+          ct2 = texture(brdf_lut, LtcLutUv(coat_ltc_uv, 2.0));
+          lobe_inv_m = mat3(
+              vec3(ct1.x, 0.0, ct1.y), vec3(0.0, 1.0, 0.0),
+              vec3(ct1.z, 0.0, ct1.w));
+          lobe_normal = coat_normal;
+        }
+#endif
+        float shape = LtcIntegrate(lobe_normal, camera_normal, v_position,
+                                   lobe_inv_m, c0, c1, c2, c3);
+        if (lobe == 0) {
+          spec_shape = shape;
+        } else if (lobe == 1) {
+          diff_shape = shape;
+        }
+#ifdef FLUTTER_SCENE_PHYSICAL_MATERIAL
+        else {
+          coat_shape = shape;
+        }
+#endif
+      }
       vec3 spec_color = reflectance * t2.x + (vec3(1.0) - reflectance) * t2.y;
       direct += radiance * (window * window) * facing *
                 (spec_color * spec_shape * material.specular +
                  albedo * (1.0 - metallic) * diff_shape);
 #ifdef FLUTTER_SCENE_PHYSICAL_MATERIAL
-      // The clearcoat's own LTC lobe over the same rect, with the coat's
-      // normal and roughness and the dielectric F0 of 0.04. The base layer's
-      // coat attenuation is applied once at the final composite.
       if (material.clearcoat > 0.0) {
-        vec2 coat_ltc_uv = clamp(
-            vec2(coat_roughness, sqrt(1.0 - coat_n_dot_v)), 0.0, 1.0);
-        vec4 ct1 = texture(brdf_lut, LtcLutUv(coat_ltc_uv, 1.0));
-        vec4 ct2 = texture(brdf_lut, LtcLutUv(coat_ltc_uv, 2.0));
-        mat3 coat_inv_m = mat3(
-            vec3(ct1.x, 0.0, ct1.y), vec3(0.0, 1.0, 0.0),
-            vec3(ct1.z, 0.0, ct1.w));
-        float coat_shape = LtcIntegrate(
-            coat_normal, camera_normal, v_position, coat_inv_m,
-            c0, c1, c2, c3);
         coat_direct += radiance * (window * window) * facing * coat_shape *
                        (0.04 * ct2.x + 0.96 * ct2.y);
       }
@@ -723,7 +784,6 @@ highp vec4 EvaluateLighting(MaterialInputs material) {
     } else
 #endif  // FLUTTER_SCENE_LEAN_LIGHTING
     {
-    vec3 punctual_light_vector;
 #ifdef FLUTTER_SCENE_LIGHTING_HOOKS
     light_context.color = radiance;
     light_context.position = l0.xyz;
@@ -837,6 +897,10 @@ highp vec4 EvaluateLighting(MaterialInputs material) {
       }
 #endif
     }
+    }
+    }
+    // Every analytic light, the sun included, through this one BRDF.
+    if (analytic) {
 #ifdef FLUTTER_SCENE_LIGHTING_HOOKS
     light_context.light_vector = punctual_light_vector;
     light_context.radiance = radiance;
@@ -978,15 +1042,31 @@ highp vec4 EvaluateLighting(MaterialInputs material) {
 #ifndef FLUTTER_SCENE_LEAN_LIGHTING
   float gi_coverage = IrradianceFieldCoverage(v_position);
   if (gi_coverage > 0.0) {
-    highp vec3 gi = SampleIrradianceField(v_position, normal, camera_normal);
-    irradiance = mix(irradiance, gi, gi_coverage);
+    // The front lobe, and for diffuse transmission the back one, through ONE
+    // SampleIrradianceField call site: fxc (ANGLE on Windows) inlines each
+    // call, and these were two whole copies of the cage walk in every
+    // physical material, opaque ones included. The back lobe only feeds the
+    // diffuse-transmission term (which scales by diffuse_transmission), so a
+    // material without it takes one pass and skips the second at runtime too.
+    // TODO(gi-transmission): the weights only depend on the normal through the
+    // wrap term, so one pass could return both lobes.
 #ifdef FLUTTER_SCENE_PHYSICAL_MATERIAL
-    // TODO(gi-transmission): the transmitted direction repeats the whole
-    // eight-tap cage. The weights only depend on the normal through the wrap
-    // term, so one pass could return both lobes.
-    highp vec3 gi_back = SampleIrradianceField(v_position, -normal, camera_normal);
-    transmitted_irradiance = mix(transmitted_irradiance, gi_back, gi_coverage);
+    int gi_lobes = material.diffuse_transmission > 0.0 ? 2 : 1;
+#else
+    int gi_lobes = 1;
 #endif
+    for (int lobe = 0; lobe < gi_lobes; lobe++) {
+      highp vec3 gi = SampleIrradianceField(
+          v_position, lobe == 0 ? normal : -normal, camera_normal);
+      if (lobe == 0) {
+        irradiance = mix(irradiance, gi, gi_coverage);
+      }
+#ifdef FLUTTER_SCENE_PHYSICAL_MATERIAL
+      else {
+        transmitted_irradiance = mix(transmitted_irradiance, gi, gi_coverage);
+      }
+#endif
+    }
   }
 #endif  // FLUTTER_SCENE_LEAN_LIGHTING
 #endif
@@ -1114,51 +1194,8 @@ highp vec4 EvaluateLighting(MaterialInputs material) {
              ambient_shadow;
 #endif
 
-  // Analytic directional light (Cook-Torrance, layered on top of the IBL
-  // ambient term). The shadowed first directional light shades here; its shadow
-  // visibility multiplies the whole term.
-#ifndef FLUTTER_SCENE_NO_DIRECTIONAL_LIGHT
-  if (frag_info.has_directional_light > 0.5) {
-#ifdef FLUTTER_SCENE_LIGHTING_HOOKS
-    light_context.light_vector = light_vector;
-    light_context.color = frag_info.directional_light_color.rgb;
-    light_context.radiance = light_context.color * sun_visibility;
-    light_context.direction = -light_vector;
-    light_context.distance_attenuation = 1.0;
-    light_context.cone_attenuation = facing;
-    light_context.shadow = shadow;
-    light_context.type = 0.0;
-    light_context.light_row = -1.0;
-    light_context.shadow_slot = -1.0;
-#ifdef FLUTTER_SCENE_HOOK_LIGHT
-    LightTerms sun_terms = Light(material, light_context);
-    direct_diffuse += sun_terms.diffuse;
-    direct_specular += sun_terms.specular;
-#else
-    // No Light() hook: the default BRDF, still split into its lobes.
-    highp vec3 sun_specular;
-    direct_diffuse += EvaluateAnalyticLightTerms(material, light_vector,
-        light_context.radiance, normal, camera_normal, albedo, metallic,
-        roughness, reflectance, n_dot_v, material.specular,
-        anisotropic_tangent, anisotropic_bitangent, sun_specular);
-    direct_specular += sun_specular;
-#endif
-#else
-    direct += EvaluateAnalyticLight(material, light_vector,
-                                   frag_info.directional_light_color.rgb, normal,
-                                   camera_normal, albedo, metallic, roughness,
-                                   reflectance, n_dot_v, material.specular,
-                                   anisotropic_tangent,
-                                   anisotropic_bitangent) *
-             sun_visibility;
-#endif
-#ifdef FLUTTER_SCENE_PHYSICAL_MATERIAL
-    coat_direct += EvaluateClearcoatLight(
-        light_vector, frag_info.directional_light_color.rgb, coat_normal,
-        camera_normal, coat_roughness) * sun_visibility;
-#endif
-  }
-#endif
+  // The analytic directional light shaded in the punctual loop, as its last
+  // slot (see there).
 
 
   highp vec3 emissive = material.emissive;

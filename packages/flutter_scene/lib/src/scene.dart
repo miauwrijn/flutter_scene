@@ -2058,12 +2058,27 @@ base class Scene implements SceneGraph {
   /// [allShadingTiers] to compile both now, so turning one of those features
   /// on or off later does not stall a frame on its first draw. It roughly
   /// doubles the lit pipelines warm-up compiles.
+  ///
+  /// [maxPipelineBuildsPerSlice] also caps each slice by the number of new
+  /// pipelines it builds. Set it on a backend that compiles at the first draw
+  /// (GLES): there a build is free when it is asked for and the time budget
+  /// cannot see the compile coming, so a pass that resolves all its pipelines
+  /// before drawing any compiles them all in one slice. 1 puts a frame
+  /// between every compile.
+  ///
+  /// With [sliceBudget], [onProgress] is called after each slice with the
+  /// pipelines built so far and the draws still waiting on one, so a loading
+  /// screen can say how far the compile has got. The waiting count is of
+  /// draws, and several can wait on one pipeline, so it overstates the
+  /// pipelines left; it is zero once the warm-up is done.
   /// {@category Assets and loading}
   Future<void> warmUp(
     List<RenderView> views, {
     bool includeOffscreen = false,
     Duration? sliceBudget,
     bool allShadingTiers = false,
+    int? maxPipelineBuildsPerSlice,
+    void Function(WarmUpProgress progress)? onProgress,
   }) async {
     _checkNotDisposed('warmUp');
     await initializeStaticResources();
@@ -2116,22 +2131,74 @@ base class Scene implements SceneGraph {
       }
     }
 
+    // What this warm-up covers, read now: items added while it runs are not
+    // covered and should still read as needing one.
+    final covering = _drawnShaderPairs().toList();
     if (sliceBudget == null) {
       encode();
+      _warmedShaderPairs.addAll(covering);
       return;
     }
     // Each slice is a whole offscreen frame; stop once one encodes every view
     // and skips nothing, or after a generous cap if something never finishes
     // building. A view paced by GPU backpressure re-presents its last image
     // and resolves no pipelines, so it proves nothing.
+    final cacheBefore = pipelineCacheSize;
     for (var slice = 0; slice < 1000; slice++) {
       // Each slice compiles pipelines after a yield, so rendezvous again.
       if (slice > 0) await awaitRasterThread();
       if (_disposed) return;
       final paced = _pacedFrameCount;
-      withPipelineBuildBudget(sliceBudget, encode);
-      if (_pacedFrameCount == paced && deferredPipelineBuilds == 0) return;
+      withPipelineBuildBudget(
+        sliceBudget,
+        encode,
+        maxBuilds: maxPipelineBuildsPerSlice,
+      );
+      onProgress?.call(
+        WarmUpProgress(
+          built: pipelineCacheSize - cacheBefore,
+          waiting: deferredPipelineBuilds,
+        ),
+      );
+      if (_pacedFrameCount == paced && deferredPipelineBuilds == 0) {
+        _warmedShaderPairs.addAll(covering);
+        return;
+      }
       await Future<void>.delayed(const Duration(milliseconds: 16));
+    }
+  }
+
+  /// Whether any drawable item uses a vertex/fragment shader pair that no
+  /// completed [warmUp] has covered: the cue to warm up again after the scene
+  /// changed, for a host that wants a loading screen rather than a stall.
+  ///
+  /// On backends that compile a pipeline at its first draw (GLES, where a lit
+  /// material can take seconds to link on Windows), a new pair means the next
+  /// frame that draws it blocks for that compile. The check walks the drawable
+  /// items once and compares base shaders only; a lighting change that picks
+  /// another variant of an already-covered pair (shadows switched on, say)
+  /// does not register here.
+  /// {@category Assets and loading}
+  bool get needsWarmUp {
+    for (final pair in _drawnShaderPairs()) {
+      if (!_warmedShaderPairs.contains(pair)) return true;
+    }
+    return false;
+  }
+
+  final Set<(gpu.Shader, gpu.Shader)> _warmedShaderPairs = {};
+
+  Iterable<(gpu.Shader, gpu.Shader)> _drawnShaderPairs() sync* {
+    for (final item in renderScene.items) {
+      final gpu.Shader vertex;
+      final gpu.Shader fragment;
+      try {
+        vertex = item.geometry.vertexShader;
+        fragment = item.material.fragmentShader;
+      } catch (_) {
+        continue; // not drawable yet (its shader bundle is still loading)
+      }
+      yield (vertex, fragment);
     }
   }
 
@@ -4531,4 +4598,19 @@ class _RepaintRequest extends ChangeNotifier {
 class _NearFitState {
   double? fitted;
   NearPlaneFit? last;
+}
+
+/// How far a sliced [Scene.warmUp] has got, reported after each slice.
+/// {@category Assets and loading}
+final class WarmUpProgress {
+  /// Creates a progress report.
+  const WarmUpProgress({required this.built, required this.waiting});
+
+  /// Pipelines this warm-up has built so far.
+  final int built;
+
+  /// Draws the last slice skipped because their pipeline is not built yet.
+  /// Several draws can wait on one pipeline, so this overstates the pipelines
+  /// left; zero once the warm-up is done.
+  final int waiting;
 }

@@ -62,9 +62,10 @@ highp vec4 IrradianceCageTap(vec3 offset, highp vec3 base_lattice, vec3 alpha,
     // so both are scaled back before the comparison. Skipping that produces
     // banded, distance-dependent leaking that reads as a bias problem.
     highp float scale = frag_info.gi_visibility.z;
-    highp vec2 moments = texture(irradiance_field,
-                           ProbeAtlasUv(-probe_direction, depth_tile,
-                                        kProbeDepthInterior, inverse_atlas))
+    highp vec2 moments = textureLod(irradiance_field,
+                              ProbeAtlasUv(-probe_direction, depth_tile,
+                                           kProbeDepthInterior, inverse_atlas),
+                              0.0)
                        .rg;
     highp float mean = moments.x * scale;
     highp float mean_square = moments.y * scale * scale;
@@ -87,10 +88,14 @@ highp vec4 IrradianceCageTap(vec3 offset, highp vec3 base_lattice, vec3 alpha,
   highp vec2 irradiance_tile =
       ProbeTileOrigin(index, frag_info.gi_counts.w, frag_info.gi_atlas.x,
                       kProbeIrradianceTile);
+  // Level-0 reads: the atlas has one level, so this is the texel texture()
+  // would return -- and an implicit-derivative read inside the cage loop is
+  // one fxc (ANGLE on Windows) compiles by unrolling the loop again.
   highp vec3 irradiance =
-      texture(irradiance_field,
-              ProbeAtlasUv(direction, irradiance_tile,
-                           kProbeIrradianceInterior, inverse_atlas))
+      textureLod(irradiance_field,
+                 ProbeAtlasUv(direction, irradiance_tile,
+                              kProbeIrradianceInterior, inverse_atlas),
+                 0.0)
           .rgb;
   return vec4(max(irradiance, vec3(0.0)) * weight, weight);
 }
@@ -122,23 +127,19 @@ highp vec3 SampleIrradianceField(highp vec3 world_position, vec3 direction,
   highp vec3 base = floor(lattice);
   vec3 alpha = clamp(lattice - base, 0.0, 1.0);
 
-  highp vec4 total =
-      IrradianceCageTap(vec3(0.0, 0.0, 0.0), base, alpha, biased_position,
-                        direction) +
-      IrradianceCageTap(vec3(1.0, 0.0, 0.0), base, alpha, biased_position,
-                        direction) +
-      IrradianceCageTap(vec3(0.0, 1.0, 0.0), base, alpha, biased_position,
-                        direction) +
-      IrradianceCageTap(vec3(1.0, 1.0, 0.0), base, alpha, biased_position,
-                        direction) +
-      IrradianceCageTap(vec3(0.0, 0.0, 1.0), base, alpha, biased_position,
-                        direction) +
-      IrradianceCageTap(vec3(1.0, 0.0, 1.0), base, alpha, biased_position,
-                        direction) +
-      IrradianceCageTap(vec3(0.0, 1.0, 1.0), base, alpha, biased_position,
-                        direction) +
-      IrradianceCageTap(vec3(1.0, 1.0, 1.0), base, alpha, biased_position,
-                        direction);
+  // The eight cage corners, ONE IrradianceCageTap call in a loop. They were
+  // eight literal calls, and fxc (ANGLE on Windows) inlines every call site:
+  // eight copies of the tap (two atlas reads, the octahedral mapping, the
+  // Chebyshev test) per lookup, and a physical material makes two lookups.
+  // The count is 8 whenever the field contributes at all, but not a constant
+  // fxc can fold and unroll back into eight copies.
+  int corners = frag_info.gi_grid.w > 0.0 ? 8 : 0;
+  highp vec4 total = vec4(0.0);
+  for (int i = 0; i < corners; i++) {
+    vec3 offset = vec3(float(i - (i / 2) * 2), float((i / 2) - (i / 4) * 2),
+                       float(i / 4));
+    total += IrradianceCageTap(offset, base, alpha, biased_position, direction);
+  }
 
   highp vec3 result = total.a > 1e-6 ? total.rgb / total.a : vec3(0.0);
   return result * frag_info.gi_grid.w;
