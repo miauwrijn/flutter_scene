@@ -60,6 +60,22 @@ abstract interface class RenderGraphObserver {
   );
 }
 
+/// An observer that also wants the steps a custom pass reports inside
+/// itself ([RenderPassContext.debugStep]): the capture snapshots each step's
+/// output the moment the step was encoded, before a later step can reuse it.
+abstract interface class RenderGraphStepObserver {
+  void onStep(String name, gpu.Texture? output);
+}
+
+/// The stats of the pass executing now, while a graph executes with stats:
+/// where [RenderPassContext.debugStep] files its steps.
+@internal
+RenderPassStats? activePassStats;
+
+/// The step observer of the capture executing now, if any.
+@internal
+RenderGraphStepObserver? activeStepObserver;
+
 /// A [Blackboard] view that reports every access to an observer while
 /// delegating storage to the wrapped board.
 class _RecordingBlackboard extends Blackboard {
@@ -424,6 +440,10 @@ class RenderGraph {
         recorder.clearContext();
         activeDrawRecorder = recorder;
       }
+      activePassStats = passStats;
+      activeStepObserver = observer is RenderGraphStepObserver
+          ? observer as RenderGraphStepObserver
+          : null;
       if (timeline) developer.Timeline.startSync(pass.name);
       stopwatch
         ..reset()
@@ -432,6 +452,8 @@ class RenderGraph {
         pass.execute(context);
       } finally {
         activeDrawRecorder = null;
+        activePassStats = null;
+        activeStepObserver = null;
       }
       stopwatch.stop();
       if (timeline) developer.Timeline.finishSync();

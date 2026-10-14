@@ -272,6 +272,7 @@ export 'src/render/render_graph_capture.dart'
         CapturedPass,
         CapturedResource,
         CapturedSkip,
+        CapturedStep,
         CapturedUniformBlock,
         RenderGraphCaptureRequest,
         RenderGraphCaptureResult;
@@ -291,6 +292,7 @@ export 'src/render/render_stats.dart'
         RenderFrameStats,
         RenderPassStats,
         RenderStats,
+        RenderStepStats,
         RenderViewStats;
 export 'src/shader_reflection/shader_diagnostics.dart'
     show ShaderCompileDiagnostic, parseShaderCompileErrors, shaderSourceWindow;

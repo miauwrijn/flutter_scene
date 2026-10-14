@@ -14,6 +14,7 @@ import 'package:flutter_scene/src/render/render_graph.dart';
 import 'package:flutter_scene/src/render/render_graph_capture.dart'
     show RenderGraphDebug;
 import 'package:flutter_scene/src/render/render_scene.dart';
+import 'package:flutter_scene/src/render/render_stats.dart' show RenderStepStats;
 import 'package:flutter_scene/src/render/resolve_pass.dart';
 import 'package:flutter_scene/src/render/scene_pass.dart';
 import 'package:flutter_scene/src/render/shadow_pass.dart';
@@ -361,6 +362,27 @@ class RenderPassContext {
   gpu.Texture? debugBlackboardTexture(String key) {
     if (!RenderGraphDebug.enabled) return null;
     return _context.blackboard.get<gpu.Texture>(key);
+  }
+
+  /// Reports a named step this pass ran inside itself — one of its own
+  /// full-screen jobs — so profilers can see past the single pass row: the
+  /// step lands in the frame's [RenderPassStats.steps] with [cpuMicros], and
+  /// on a capture frame ([Scene.captureRenderGraph]) [output] is copied now,
+  /// before a later step can overwrite it, as resource `step:<pass>/<name>`.
+  ///
+  /// Call it right after submitting the step's command buffer. Costs one
+  /// small record per call while stats are collected; nothing else outside a
+  /// capture.
+  void debugStep(String name, {gpu.Texture? output, int cpuMicros = 0}) {
+    activePassStats?.steps.add(
+      RenderStepStats(
+        name: name,
+        cpuMicros: cpuMicros,
+        width: output?.width,
+        height: output?.height,
+      ),
+    );
+    activeStepObserver?.onStep(name, output);
   }
 
   /// Draws a filtered set of the scene's geometry flat into a returned mask

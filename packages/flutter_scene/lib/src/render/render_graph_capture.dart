@@ -450,8 +450,41 @@ class CapturedSkip {
   };
 }
 
+/// A step a custom pass reported inside itself
+/// ([RenderPassContext.debugStep]): its name, its position among the pass's
+/// draws, and the resource holding its output when it named one.
+/// {@category Debugging and profiling}
+class CapturedStep {
+  const CapturedStep({
+    required this.name,
+    required this.drawsBefore,
+    this.resourceKey,
+  });
+
+  factory CapturedStep.fromJson(Map<String, Object?> json) => CapturedStep(
+    name: json['name'] as String,
+    drawsBefore: json['drawsBefore'] as int? ?? 0,
+    resourceKey: json['resource'] as String?,
+  );
+
+  final String name;
+
+  /// How many of the pass's draws came before this step ended.
+  final int drawsBefore;
+
+  /// The [CapturedResource.key] of the step's output snapshot, if any.
+  final String? resourceKey;
+
+  Map<String, Object?> toJson() => {
+    'name': name,
+    'drawsBefore': drawsBefore,
+    if (resourceKey != null) 'resource': resourceKey,
+  };
+}
+
 /// One executed pass: identity, CPU time, the blackboard keys it read and
-/// wrote in observation order, and its draws and skipped items.
+/// wrote in observation order, its draws and skipped items, and the steps it
+/// reported inside itself.
 /// {@category Debugging and profiling}
 class CapturedPass {
   CapturedPass({required this.name, required this.indexInGraph});
@@ -463,6 +496,7 @@ class CapturedPass {
   final List<String> writes = [];
   final List<CapturedDraw> draws = [];
   final List<CapturedSkip> skips = [];
+  final List<CapturedStep> steps = [];
 
   factory CapturedPass.fromJson(Map<String, Object?> json) {
     final pass = CapturedPass(
@@ -476,6 +510,9 @@ class CapturedPass {
     }
     for (final skip in json['skips'] as List? ?? const []) {
       pass.skips.add(CapturedSkip.fromJson((skip as Map).cast()));
+    }
+    for (final step in json['steps'] as List? ?? const []) {
+      pass.steps.add(CapturedStep.fromJson((step as Map).cast()));
     }
     return pass;
   }
@@ -491,6 +528,7 @@ class CapturedPass {
         draw.toJson(includeUniformBytes: includeUniformBytes),
     ],
     'skips': [for (final skip in skips) skip.toJson()],
+    if (steps.isNotEmpty) 'steps': [for (final step in steps) step.toJson()],
   };
 }
 
@@ -609,7 +647,8 @@ class RenderGraphCaptureResult {
 /// The observer that performs a capture: records the graph and copies
 /// written textures at pass boundaries.
 /// {@category Debugging and profiling}
-class RenderGraphCapturer implements RenderGraphObserver, DrawRecorder {
+class RenderGraphCapturer
+    implements RenderGraphObserver, RenderGraphStepObserver, DrawRecorder {
   RenderGraphCapturer({required this.request});
 
   final RenderGraphCaptureRequest request;
@@ -752,6 +791,28 @@ class RenderGraphCapturer implements RenderGraphObserver, DrawRecorder {
   }
 
   @override
+  void onStep(String name, gpu.Texture? output) {
+    final current = _current;
+    if (current == null) return;
+    String? key;
+    if (output != null) {
+      key = 'step:${current.name}/$name';
+      // Copied now: the pass may render its next step into this very
+      // target, and the pass-end snapshot would show only the last one.
+      _recordTexture(key, output, current.indexInGraph);
+      // Pass-end must not snapshot it a second time as an internal target.
+      _pendingAcquires.remove(output);
+    }
+    current.steps.add(
+      CapturedStep(
+        name: name,
+        drawsBefore: current.draws.length,
+        resourceKey: key,
+      ),
+    );
+  }
+
+  @override
   void onBlackboardRead(Object key, Object? value) {
     final current = _current;
     if (current == null || value == null) return;
@@ -816,16 +877,27 @@ class RenderGraphCapturer implements RenderGraphObserver, DrawRecorder {
     // pool transients. Submit-time failures are asynchronous and cannot be
     // caught here; this keeps the blit from ever being recorded against a
     // source it cannot sample.
+    // Depth/stencil formats are not colour renderable: the copy's pipeline
+    // fails Metal's descriptor validation, which aborts the process.
     if (texture.storageMode == gpu.StorageMode.deviceTransient ||
         !texture.enableShaderReadUsage ||
-        texture.sampleCount > 1) {
+        texture.sampleCount > 1 ||
+        _depthFormats.contains(texture.format)) {
       resource.snapshotFailed = true;
       return;
     }
     try {
       final thumbnailDim = request.thumbnailMaxDim;
       if (thumbnailDim != null) {
-        resource.thumbnail = _copy(texture, maxDim: thumbnailDim);
+        resource.thumbnail = _copy(
+          texture,
+          maxDim: thumbnailDim,
+          // One-channel float targets cannot become an image to read back
+          // or encode; their thumbnail widens to RGBA (the value in red).
+          format: _singleChannelFloat.contains(texture.format)
+              ? gpu.PixelFormat.r32g32b32a32Float
+              : null,
+        );
       }
       if (request.fullResolution) {
         resource.snapshot = _copy(texture, maxDim: null);
@@ -837,6 +909,12 @@ class RenderGraphCapturer implements RenderGraphObserver, DrawRecorder {
       resource.thumbnail = null;
     }
   }
+
+  static const Set<gpu.PixelFormat> _depthFormats = {
+    gpu.PixelFormat.s8UInt,
+    gpu.PixelFormat.d24UnormS8Uint,
+    gpu.PixelFormat.d32FloatS8UInt,
+  };
 
   static final gpu.Shader _vertex = baseShaderLibrary['FullscreenVertex']!;
   static final gpu.Shader _copyFragment = baseShaderLibrary['CopyFragment']!;
@@ -873,7 +951,15 @@ class RenderGraphCapturer implements RenderGraphObserver, DrawRecorder {
 
   /// Copies [source] into a fresh shader-readable texture of the same
   /// format, at full size or scaled down so the longest edge is [maxDim].
-  gpu.Texture _copy(gpu.Texture source, {required int? maxDim}) {
+  static const Set<gpu.PixelFormat> _singleChannelFloat = {
+    gpu.PixelFormat.r32Float,
+  };
+
+  gpu.Texture _copy(
+    gpu.Texture source, {
+    required int? maxDim,
+    gpu.PixelFormat? format,
+  }) {
     var width = source.width;
     var height = source.height;
     if (maxDim != null && (width > maxDim || height > maxDim)) {
@@ -885,7 +971,7 @@ class RenderGraphCapturer implements RenderGraphObserver, DrawRecorder {
       gpu.StorageMode.devicePrivate,
       width,
       height,
-      format: source.format,
+      format: format ?? source.format,
       enableRenderTargetUsage: true,
       enableShaderReadUsage: true,
     );

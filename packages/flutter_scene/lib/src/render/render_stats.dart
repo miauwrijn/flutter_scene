@@ -132,12 +132,46 @@ class RenderPassStats {
 
   final RenderCounters counters = RenderCounters();
 
+  /// The named steps a custom pass reported inside itself
+  /// ([RenderPassContext.debugStep]), in order: a pass that runs several
+  /// full-screen jobs of its own (a GI or post-effects stack) is otherwise
+  /// one opaque row.
+  final List<RenderStepStats> steps = [];
+
   Map<String, Object?> toJson() => {
     'name': name,
     'index': indexInGraph,
     'cpuMicros': cpuMicros,
     if (gpuMicros != null) 'gpuMicros': gpuMicros,
     'counters': counters.toJson(),
+    if (steps.isNotEmpty) 'steps': [for (final step in steps) step.toJson()],
+  };
+}
+
+/// One step inside a pass: a sub-pass a custom pass ran and named.
+/// {@category Debugging and profiling}
+class RenderStepStats {
+  RenderStepStats({
+    required this.name,
+    required this.cpuMicros,
+    this.width,
+    this.height,
+  });
+
+  final String name;
+
+  /// CPU time the pass spent encoding the step, when it measured it.
+  final int cpuMicros;
+
+  /// The step's output size, when it named an output.
+  final int? width;
+  final int? height;
+
+  Map<String, Object?> toJson() => {
+    'name': name,
+    'cpuMicros': cpuMicros,
+    if (width != null) 'width': width,
+    if (height != null) 'height': height,
   };
 }
 
