@@ -236,20 +236,22 @@ vec3 MultiBounceOcclusion(float visibility, vec3 albedo) {
 
 // Widens a specular lobe to cover unresolved normal variation in one pixel.
 float SpecularAARoughness(vec3 normal, float roughness) {
-  // This toggle is a frame uniform, so the derivatives remain under uniform
-  // control flow.
-  if (frag_info.specular_aa_variance <= 0.0) {
-    return roughness;
-  }
+  // Derivatives come before the branch and the function returns once. An
+  // early return compiles to a one-iteration loop, and ANGLE writes a
+  // derivative inside such a loop as 0.0.
   vec3 d_normal_x = dFdx(normal);
   vec3 d_normal_y = dFdy(normal);
-  float variance = frag_info.specular_aa_variance *
-                   max(dot(d_normal_x, d_normal_x),
-                       dot(d_normal_y, d_normal_y));
-  float kernel = min(2.0 * variance, frag_info.specular_aa_threshold);
-  float square_roughness =
-      clamp(roughness * roughness + kernel, kMinRoughness * kMinRoughness, 1.0);
-  return sqrt(square_roughness);
+  float filtered = roughness;
+  if (frag_info.specular_aa_variance > 0.0) {
+    float variance = frag_info.specular_aa_variance *
+                     max(dot(d_normal_x, d_normal_x),
+                         dot(d_normal_y, d_normal_y));
+    float kernel = min(2.0 * variance, frag_info.specular_aa_threshold);
+    float square_roughness = clamp(roughness * roughness + kernel,
+                                   kMinRoughness * kMinRoughness, 1.0);
+    filtered = sqrt(square_roughness);
+  }
+  return filtered;
 }
 
 #ifdef FLUTTER_SCENE_PHYSICAL_MATERIAL
@@ -721,8 +723,8 @@ highp vec4 EvaluateLighting(MaterialInputs material) {
       float facing =
           step(0.0, dot(cross(c1 - c0, c3 - c0), v_position - c0));
       vec2 ltc_uv = clamp(vec2(roughness, sqrt(1.0 - n_dot_v)), 0.0, 1.0);
-      vec4 t1 = texture(brdf_lut, LtcLutUv(ltc_uv, 1.0));
-      vec4 t2 = texture(brdf_lut, LtcLutUv(ltc_uv, 2.0));
+      vec4 t1 = textureLod(brdf_lut, LtcLutUv(ltc_uv, 1.0), 0.0);
+      vec4 t2 = textureLod(brdf_lut, LtcLutUv(ltc_uv, 2.0), 0.0);
       mat3 inv_m = mat3(
           vec3(t1.x, 0.0, t1.y), vec3(0.0, 1.0, 0.0), vec3(t1.z, 0.0, t1.w));
       // The lobes -- specular, diffuse, and the clearcoat's own -- through ONE
@@ -749,8 +751,8 @@ highp vec4 EvaluateLighting(MaterialInputs material) {
         if (lobe == 2) {
           vec2 coat_ltc_uv = clamp(
               vec2(coat_roughness, sqrt(1.0 - coat_n_dot_v)), 0.0, 1.0);
-          vec4 ct1 = texture(brdf_lut, LtcLutUv(coat_ltc_uv, 1.0));
-          ct2 = texture(brdf_lut, LtcLutUv(coat_ltc_uv, 2.0));
+          vec4 ct1 = textureLod(brdf_lut, LtcLutUv(coat_ltc_uv, 1.0), 0.0);
+          ct2 = textureLod(brdf_lut, LtcLutUv(coat_ltc_uv, 2.0), 0.0);
           lobe_inv_m = mat3(
               vec3(ct1.x, 0.0, ct1.y), vec3(0.0, 1.0, 0.0),
               vec3(ct1.z, 0.0, ct1.w));
