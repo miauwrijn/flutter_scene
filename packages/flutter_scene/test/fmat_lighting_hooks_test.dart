@@ -305,7 +305,14 @@ void main() {
   test('without Light(), the default BRDF keeps its specular lobe', () {
     final lighting = File('shaders/material_lighting.glsl').readAsStringSync();
     // A Composite() that weighs the lobes separately still gets highlights.
-    expect(lighting, contains('direct_specular += sun_specular;'));
+    // The fork evaluates the sun in the same loop as the punctual lights (one
+    // BRDF call site, for fxc link times), so one accumulation covers both.
+    expect(
+      lighting,
+      contains(
+        '// Every analytic light, the sun included, through this one BRDF.',
+      ),
+    );
     expect(lighting, contains('direct_specular += punctual_specular;'));
     expect(
       lighting,

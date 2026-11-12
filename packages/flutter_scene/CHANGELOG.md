@@ -24,11 +24,35 @@ Patches this fork carries on top of upstream master.
 
 ## 0.24.4
 
+* A shader library on the WebGPU web backend loads its WGSL sidecar alone, without downloading the shader bundle.
+* A shader library on the WebGPU web backend compiles each shader when it is first used, so a page no longer waits at load on shaders it never draws.
+* glTF imports read `EXT_texture_webp` textures, so a model whose textures are only WebP loads instead of failing.
+* glTF imports honor `KHR_node_visibility`, so a node marked hidden imports hidden along with its subtree.
+* glTF imports play `KHR_animation_pointer` animations of node visibility, light color, intensity, range, and cone angles, material factors, and texture transforms. A pointer the engine can't drive warns and is skipped.
+* Normal maps on meshes without tangents no longer read their green channel inverted, and anisotropy directions on them are no longer mirrored. The tangent frame derived from screen-space derivatives now matches the one supplied tangents give.
+* `BloomSettings.referenceSize` measures the blur's spread against a shared render size, so views that each show part of one picture (a header and a taller overlay a character moves into) bloom alike.
+* Texture rotation (`KHR_texture_transform`, `TextureTransform.rotation`, and `ApplyMaterialUvTransform` in `.fmat` materials) turns the UVs counter-clockwise as the extension specifies. It turned the other way, so a rotation tuned by eye needs its sign flipped.
+* Rewriting an index buffer on the WebGL2 web backend no longer makes later draws fail with a `glDrawElements` "Insufficient buffer size" or "Vertex buffer is not big enough" error.
 * Additive sprites and `.fmat` materials, bloom, and lens flares show over the content behind a scene with a transparent background, adding light to it. They were discarded wherever nothing opaque was drawn.
 * Billboard, `Sprite`, and particle sizes scale with their node, so scaling an effect node scales its sprites along with their spacing and speed. A non-uniform scale sizes them by its smallest axis, ignoring an axis flattened to a disc. `BillboardGeometry.scaleSizesWithNode` (and `ParticleEmitterComponent.scaleSizesWithNode`) keeps sizes in world units instead.
 * A billboard batch on a scaled node is no longer culled while still on screen.
 * Shadowed and punctual-lit materials no longer run every shadow cascade and filter for every pixel on Windows (ANGLE). A shadowed scene on a ROG Ally went from 93 ms to 41 ms a frame.
+* Lit materials compile about 60% faster on Windows (ANGLE), so the first frame that needs a new lit shader stalls for far less time. Warming up a shadowed scene with ambient occlusion went from 23.6 s to 9.5 s on a Radeon RX 580.
 * Lit materials with shadows and point or spot lights draw faster on mobile GPUs. Shadow filters only run their full kernel at shadow edges, lights that miss a pixel are skipped, and unused emissive and occlusion reads are dropped. A shadowed, point-lit scene on OpenGL ES on a Galaxy A16 went from 7.9 to 10.8 fps.
+* Lit materials on Windows (ANGLE) get their specular anti-aliasing back, and normal maps on meshes without tangents are no longer flattened.
+* Loading a shader library again under the same asset key keeps its shader reflection, so a later `ShaderMaterial` no longer re-parses the bundle or skips its first draws.
+* A widget test no longer fails with "A Timer is still pending" when it ends while a scene waits on the raster thread.
+* A `RenderTexture` view no longer freezes while the GPU is a frame behind and a screen view renders anyway, such as after a resize.
+* The depth prepass writes a single-channel `r32Float` target when no pass needs normals, a quarter of the memory and bandwidth. `RenderPassContext.sceneDepthLinear` keeps four channels when normals are written.
+* Shader bundle reflection parses about 10x faster by copying each backend's output on its first read, so a `ShaderMaterial` on Apple platforms waits far less before its first draw.
+* Build hooks that `flutter test` calls in process (`buildMaterials`, `buildTargetShaderBundleJson`) find the engine's shader includes instead of throwing.
+* A skinned mesh imported offline is no longer culled while on screen in its rest pose, in one of several animations that move the same joint, or when its node sits apart from its skeleton.
+* A skinned mesh loaded at runtime is culled when off screen instead of always drawing.
+* Blended double-sided materials, such as glass, leaves, and cloth, show their back faces, and their near side draws over their far side.
+* A `ShaderMaterial` or `.fmat` material with a vertex shader no longer breaks the line segments, billboards, and Gaussian splats it draws.
+* Builds that share one flutter_scene in the pub cache (two projects, worktrees, or an app and its tests) no longer fail with `errno = 1224` on Windows or ship each other's half-written shaders. The build hook writes its intermediates into the building app's `.dart_tool/` and only its generated assets into the package.
+* Two builds for different platforms saving flutter_scene's generated assets at once no longer drop each other's manifest entries or delete each other's files mid-write.
+* Assigning `MeshPrimitive.material` or `MeshPrimitive.geometry` on a node already in a scene changes what it draws from the next frame. The assignment was ignored until the node left and rejoined a scene or got a new `Mesh`.
 
 ## 0.24.3
 

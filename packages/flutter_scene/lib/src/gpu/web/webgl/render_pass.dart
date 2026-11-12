@@ -626,6 +626,7 @@ final class WebGlRenderPass extends RenderPass {
     Texture texture, {
     SamplerOptions? sampler,
   }) {
+    assert(texture.isValid, 'A released Texture was bound.');
     final pipeline = _boundPipeline;
     if (pipeline == null) {
       throw StateError('bindTexture called before bindPipeline');

@@ -316,6 +316,16 @@ float CascadeBlendWeight(highp vec2 uv, highp float margin, highp float band) {
 // shadowed). `world_pos` and `n` are world-space; `n` is the geometric
 // normal. Walks the cascades highest-resolution first, taking from each the
 // weight its tile still has room for.
+// The cascade is picked by a loop bounded by the cascade count, so
+// SampleCascade is compiled once rather than once per cascade. Its three
+// filters and the soft-shadow blocker search make it by far the largest block
+// of the lit shaders, and four inlined copies of it dominated their compile
+// time on backends that compile at run time (several seconds per pipeline on
+// ANGLE's Direct3D backend).
+//
+// On GLES the cascade's matrix and box size are selected with literal indices,
+// so no uniform array is indexed with a dynamic index (misread for indices past
+// the first by some GLES drivers).
 float SampleShadow(highp vec3 world_pos, vec3 n) {
   int count = int(frag_info.shadow_cascade_count);
   // Select and sample with the same displaced position. Selecting with the
@@ -323,8 +333,8 @@ float SampleShadow(highp vec3 world_pos, vec3 n) {
   // every PCF tap clamp to one edge texel and producing a visible band.
   highp vec3 biased_world_pos = BiasDirectionalShadowPosition(world_pos, n);
   // Cross-fade half-width in a cascade's UV space, from the light's
-  // cascadeOverlap. At 0 the first containing cascade takes the full weight
-  // and the later ones are skipped.
+  // cascadeOverlap. At 0 a cascade takes the full weight, so the first
+  // containing cascade wins outright and the later ones are skipped.
   float band = frag_info.directional_light_color.w * 0.5;
   // Fade to lit by view depth before the shadow distance, at least
   // shadow_fade wide and a tenth of the distance. The tiles reach past it,
@@ -339,45 +349,57 @@ float SampleShadow(highp vec3 world_pos, vec3 n) {
   float shadow_sum = 0.0;
   float weight = 0.0;
   // A fully faded fragment would discard its taps, so it skips them.
-  //
-  // ONE SampleCascade call, in a loop bounded by the uniform cascade count.
-  // This was four literal expansions of a macro, and SampleCascade is the
-  // whole kernel: fxc (ANGLE on Windows) inlines every call site, so each lit
-  // material carried four copies of it. A bound fxc cannot fold keeps it one.
-  //
-  // The cascade's matrix and box are still read with literal indices, chosen
-  // by an if-chain, so no uniform array is indexed with a dynamic index
-  // (misread for indices past the first by some GLES drivers).
+  // A single `return` (no early return inside the loop) also avoids a
+  // nested-loop pattern that crashes a Direct3D shader compiler.
   if (fade < 1.0) {
     for (int i = 0; i < count; i++) {
-      if (weight >= 1.0) break;
-      highp mat4 cascade_matrix;
-      highp float box;
-      if (i == 0) {
-        cascade_matrix = frag_info.light_space_matrix[0];
-        box = frag_info.cascade_box_sizes[0];
-      } else if (i == 1) {
-        cascade_matrix = frag_info.light_space_matrix[1];
-        box = frag_info.cascade_box_sizes[1];
-      } else if (i == 2) {
-        cascade_matrix = frag_info.light_space_matrix[2];
-        box = frag_info.cascade_box_sizes[2];
-      } else {
-        cascade_matrix = frag_info.light_space_matrix[3];
-        box = frag_info.cascade_box_sizes[3];
-      }
-      highp vec4 light_clip = cascade_matrix * vec4(biased_world_pos, 1.0);
-      highp vec3 proj = light_clip.xyz / light_clip.w;
-      highp vec2 uv = proj.xy * 0.5 + 0.5;
-      highp float margin =
-          max(frag_info.shadow_softness / box, frag_info.shadow_texel_size);
-      if (!(uv.x < margin || uv.x > 1.0 - margin || uv.y < margin ||
-            uv.y > 1.0 - margin || proj.z < 0.0 || proj.z > 1.0)) {
-        float take = min(CascadeBlendWeight(uv, margin, band), 1.0 - weight);
-        if (take > 0.0) {
-          shadow_sum += take * SampleCascade(i, count, proj, box,
-                                             ReceiverPlaneSlope(cascade_matrix, n));
-          weight += take;
+      // No break: the remaining cascades fall through this test instead, so
+      // the loop has a single exit.
+      if (weight < 1.0) {
+        highp vec4 pos = vec4(biased_world_pos, 1.0);
+        // The receiver plane's slope comes from the same cascade matrix (see
+        // ReceiverPlaneSlope), read beside the transform in each branch.
+#if defined(IMPELLER_TARGET_METAL) || defined(IMPELLER_TARGET_VULKAN)
+        highp vec4 light_clip = frag_info.light_space_matrix[i] * pos;
+        highp float box = frag_info.cascade_box_sizes[i];
+        highp vec2 slope =
+            ReceiverPlaneSlope(frag_info.light_space_matrix[i], n);
+#else
+        // Literal indices, since some GLES drivers misread a dynamically
+        // indexed uniform array. Each branch transforms by its own matrix,
+        // so a GPU that flattens the branches still reads only one.
+        highp vec4 light_clip;
+        highp float box;
+        highp vec2 slope;
+        if (i == 0) {
+          light_clip = frag_info.light_space_matrix[0] * pos;
+          box = frag_info.cascade_box_sizes[0];
+          slope = ReceiverPlaneSlope(frag_info.light_space_matrix[0], n);
+        } else if (i == 1) {
+          light_clip = frag_info.light_space_matrix[1] * pos;
+          box = frag_info.cascade_box_sizes[1];
+          slope = ReceiverPlaneSlope(frag_info.light_space_matrix[1], n);
+        } else if (i == 2) {
+          light_clip = frag_info.light_space_matrix[2] * pos;
+          box = frag_info.cascade_box_sizes[2];
+          slope = ReceiverPlaneSlope(frag_info.light_space_matrix[2], n);
+        } else {
+          light_clip = frag_info.light_space_matrix[3] * pos;
+          box = frag_info.cascade_box_sizes[3];
+          slope = ReceiverPlaneSlope(frag_info.light_space_matrix[3], n);
+        }
+#endif
+        highp vec3 proj = light_clip.xyz / light_clip.w;
+        highp vec2 uv = proj.xy * 0.5 + 0.5;
+        highp float margin =
+            max(frag_info.shadow_softness / box, frag_info.shadow_texel_size);
+        if (!(uv.x < margin || uv.x > 1.0 - margin || uv.y < margin ||
+              uv.y > 1.0 - margin || proj.z < 0.0 || proj.z > 1.0)) {
+          float take = min(CascadeBlendWeight(uv, margin, band), 1.0 - weight);
+          if (take > 0.0) {
+            shadow_sum += take * SampleCascade(i, count, proj, box, slope);
+            weight += take;
+          }
         }
       }
     }
