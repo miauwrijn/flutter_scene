@@ -35,7 +35,11 @@ import 'dart:io';
 import 'package:hooks/hooks.dart';
 
 import '../fmat/build_materials.dart'
-    show MaterialAssetMode, buildBundledPhysicalMaterials;
+    show
+        MaterialAssetMode,
+        buildBundledPhysicalMaterials,
+        litExtensionDirectory,
+        litExtensionSources;
 import '../fmat/framework_shaders.dart';
 import '../fmat/target_shader_bundle.dart';
 import '../importer/build_cache.dart';
@@ -147,12 +151,24 @@ Future<void> _buildBaseShaderBundle({
   }
 
   final options = HookOptions.of(buildInput);
+  // The standard lit entries include the application's lit extension like
+  // every lit material (see shaders/flutter_scene_lit_extension.glsl).
+  final extensionDirectory = litExtensionDirectory(options.litExtension);
+  final extensionSources = litExtensionSources(extensionDirectory);
+  buildOutput.dependencies.addAll(extensionSources.map((file) => file.uri));
   final stampBuffer = StringBuffer(
     await shaderBundleStamp(
       buildInput,
-      'engine bundle=base debug_views=$debugViews',
+      'engine bundle=base debug_views=$debugViews '
+      'extension=${extensionDirectory?.toFilePath()}',
     ),
   );
+  for (final file in extensionSources) {
+    stampBuffer.write(
+      ' ext:${file.uri.pathSegments.last}='
+      '${sourceFingerprint(file, strict: options.strictHashing)}',
+    );
+  }
   for (final file in sources) {
     stampBuffer.write(
       ' ${file.uri.pathSegments.last}='
@@ -234,7 +250,12 @@ Future<void> _buildBaseShaderBundle({
     bundleName: 'base',
     manifest: manifest,
     entryRoot: entryRoot,
-    manifestDirectory: shaders,
+    // The compiler searches the manifest directory before any other, so the
+    // application's extension directory stands in for it when there is one:
+    // its flutter_scene_lit_extension.glsl must be found ahead of the
+    // engine's own in shaders/. Entries resolve against the working
+    // directory, not this.
+    manifestDirectory: extensionDirectory ?? shaders,
     includeDirectories: [shaders],
     glesLanguageVersion: engineGlesLanguageVersion,
     assetMode: TargetShaderBundleAssetMode.generatedTree,

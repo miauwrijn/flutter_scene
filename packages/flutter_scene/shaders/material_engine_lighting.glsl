@@ -61,12 +61,13 @@ uniform sampler2D ssao_texture;
 #endif
 #if !defined(FLUTTER_SCENE_SHADOW_CATCHER) && \
     !defined(FLUTTER_SCENE_CUSTOM_AMBIENT)
-// What stands overhead, per cell (SceneWeather.occlusionMap): where rain and
-// snow reach. rg a 16-bit height, b 1 where something stands. A material with
-// its own ambient (environment_lighting: false) spends the engine's sampler
-// budget on its own textures, so it weathers as if open to the sky.
-#define FLUTTER_SCENE_WEATHER_OCCLUSION
-uniform sampler2D weather_occlusion;
+// The lit extension's texture (`LitExtension.texture`): whatever the
+// application's extension code reads, sampled as the application set it up.
+// A material with its own ambient (environment_lighting: false) spends the
+// engine's sampler budget on its own textures and gets none; extension code
+// tests FLUTTER_SCENE_EXT_TEXTURE before reading it.
+#define FLUTTER_SCENE_EXT_TEXTURE
+uniform sampler2D ext_texture;
 #endif
 // A shadow catcher's no-shadow variant compiles its spot loop out, leaving
 // the punctual textures with no live reference, so it declares neither.

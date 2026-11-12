@@ -54,10 +54,10 @@ struct MaterialInputs {
   // A value the material wants to inspect. Never shaded; shown raw by the
   // `custom` surface debug channel (see material_debug.glsl).
   vec3 debug;
-  // Where rain pools here, 0 (sheds) .. 1 (fills first), for the scene's
-  // weather (weather.glsl). Negative — the default — lets the weather judge
-  // by the surface's flatness alone; a terrain passes the lie of its land.
-  float pooling;
+  // Values this material hands to the application's lit extension (see
+  // flutter_scene_lit_extension.glsl), which alone gives them a meaning.
+  // Zero by default.
+  vec4 ext;
 #ifdef FLUTTER_SCENE_MATERIAL_DEPTH_OFFSET
   // How far along the view ray, in metres away from the camera, this
   // fragment's surface really is -- what a parallax material writes when its
@@ -108,7 +108,7 @@ MaterialInputs InitMaterialInputs() {
   material.specular = 1.0;
   material.occlusion = 1.0;
   material.debug = vec3(0.0);
-  material.pooling = -1.0;
+  material.ext = vec4(0.0);
 #ifdef FLUTTER_SCENE_MATERIAL_DEPTH_OFFSET
   material.depth_offset = 0.0;
 #endif

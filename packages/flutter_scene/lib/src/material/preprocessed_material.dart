@@ -283,7 +283,7 @@ class PreprocessedMaterial extends Material implements HotReloadableFmat {
       modelScaleX: modelScaleX,
       modelScaleY: modelScaleY,
       modelScaleZ: modelScaleZ,
-      receivesWeather: receivesWeather,
+      extensionInput: extensionInput,
     );
     // radiance_blend.zw [162]/[163]: this item's punctual-light slice
     // (count, offset) into the per-frame light-index buffer.
@@ -367,7 +367,11 @@ class PreprocessedMaterial extends Material implements HotReloadableFmat {
       maskBaseColorTexCoord,
     );
     final normalTransform = Float32List(8);
-    _packMaskTransform(normalTransform, maskNormalTransform, maskNormalTexCoord);
+    _packMaskTransform(
+      normalTransform,
+      maskNormalTransform,
+      maskNormalTexCoord,
+    );
     final factor = maskBaseColorFactor;
     Material.bindMaskSurfaceInputs(
       pass,

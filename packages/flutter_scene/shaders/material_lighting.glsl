@@ -39,8 +39,37 @@
 #endif
 
 #include <material_shadow_sampling.glsl>
+// The application's lit extension: code of its own in every lit material,
+// found on the include path (see flutter_scene_lit_extension.glsl
+// for the contract; the engine's own copy defines nothing).
+//
+// What a transmissive material asks of it (ExtTransmission): the surface is
+// edited through the inout argument, and this says what happens to the light
+// coming through.
+struct ExtTransmissionResult {
+  // World-space offset added to each refracted ray (a lens on the pane).
+  vec3 ray_offset;
+  // Multiplies the material's transmission.
+  float transmission_scale;
+  // A colour mixed over what is seen through, by overlay_mix.
+  vec3 overlay_color;
+  float overlay_mix;
+  // Multiplies the transmitted colour.
+  float color_scale;
+};
 #ifndef FLUTTER_SCENE_SHADOW_CATCHER
-#include <weather.glsl>
+#include <flutter_scene_lit_extension.glsl>
+#endif
+#ifndef FLUTTER_SCENE_EXT_TRANSMISSION
+ExtTransmissionResult ExtTransmission(inout MaterialInputs material) {
+  ExtTransmissionResult result;
+  result.ray_offset = vec3(0.0);
+  result.transmission_scale = 1.0;
+  result.overlay_color = vec3(0.0);
+  result.overlay_mix = 0.0;
+  result.color_scale = 1.0;
+  return result;
+}
 #endif
 
 // Optional material lighting hooks. A `.fmat` that defines `Light()`,
@@ -400,9 +429,11 @@ highp vec3 EvaluateAnalyticLight(MaterialInputs material, vec3 light_vector,
 // the material contract; a material's Surface() function fills `material` and
 // main() calls this.
 highp vec4 EvaluateLighting(MaterialInputs material) {
-  // Wet and snowed on first: everything below lights the weathered surface.
-#ifndef FLUTTER_SCENE_LEAN_LIGHTING
-  ApplyWeathering(material, v_position);
+  // The application's surface extension first: everything below lights the
+  // surface it leaves. The lean entries compile it out (a frame with an
+  // active extension draws the full tier).
+#if defined(FLUTTER_SCENE_EXT_SURFACE) && !defined(FLUTTER_SCENE_LEAN_LIGHTING)
+  ExtSurface(material, v_position);
 #endif
   vec3 albedo = material.base_color.rgb;
   float alpha = material.base_color.a;
@@ -433,13 +464,13 @@ highp vec4 EvaluateLighting(MaterialInputs material) {
   if (frag_info.ssao_params.x > 1e30) {
     occlusion = texture(ssao_texture, vec2(0.0)).r;
   }
-#ifdef FLUTTER_SCENE_WEATHER_OCCLUSION
-  // Likewise weather_occlusion: the lean entries compile the weather out
-  // (a frame with weather draws the full tier) but the engine binds it.
-  if (frag_info.ssao_params.x > 1e30) {
-    occlusion *= texture(weather_occlusion, vec2(0.0)).b;
-  }
 #endif
+#ifdef FLUTTER_SCENE_EXT_TEXTURE
+  // Likewise ext_texture, in every tier: the engine binds it whether or not
+  // the application's extension reads it.
+  if (frag_info.ssao_params.x > 1e30) {
+    occlusion *= textureLod(ext_texture, vec2(0.0), 0.0).r;
+  }
 #endif
 #if !defined(FLUTTER_SCENE_SKIP_SSAO) && !defined(FLUTTER_SCENE_LEAN_LIGHTING)
   if (frag_info.ssao_params.x > 0.5) {
@@ -519,10 +550,11 @@ highp vec4 EvaluateLighting(MaterialInputs material) {
     shadow = min(shadow, ssao_sample.g);
   }
 #endif
-#ifndef FLUTTER_SCENE_LEAN_LIGHTING
-  // The cloud deck's shadow, direct light only: an overcast day keeps its
-  // sky light.
-  shadow *= WeatherCloudShadow(v_position);
+#if defined(FLUTTER_SCENE_EXT_SUN_VISIBILITY) && \
+    !defined(FLUTTER_SCENE_LEAN_LIGHTING)
+  // The application's say in how much of the directional light arrives
+  // (direct light only: the ambient is untouched).
+  shadow *= ExtSunVisibility(v_position);
 #endif
   float sun_visibility = facing * shadow;
 

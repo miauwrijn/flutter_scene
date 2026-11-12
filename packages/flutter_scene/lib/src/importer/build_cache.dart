@@ -62,6 +62,7 @@ final class HookOptions {
     this.strictHashing = false,
     this.rebuildEverything = false,
     this.debugViews = false,
+    this.litExtension,
   });
 
   /// Reads the options declared for the package [input] is building.
@@ -77,7 +78,16 @@ final class HookOptions {
     debugViews:
         input.userDefines['debug_views'] == true ||
         input.userDefines['flutter_scene_debug_views'] == true,
+    // Likewise the directory of the application's lit extension, a path
+    // relative to the pubspec that declares it.
+    litExtension: _directory(
+      input.userDefines.path('lit_extension') ??
+          input.userDefines.path('flutter_scene_lit_extension'),
+    ),
   );
+
+  static Uri? _directory(Uri? uri) =>
+      uri == null ? null : Directory.fromUri(uri).absolute.uri;
 
   static bool _flag(BuildInput input, String define, String environment) =>
       input.userDefines[define] == true ||
@@ -91,6 +101,11 @@ final class HookOptions {
 
   /// Compile the surface debug views into the engine's shaders and materials.
   final bool debugViews;
+
+  /// The directory holding the application's
+  /// `flutter_scene_lit_extension.glsl`, or null for the engine's own (which
+  /// defines nothing).
+  final Uri? litExtension;
 }
 
 /// Whether the cache is disabled via [kDisableBuildCacheEnv].

@@ -9,7 +9,7 @@ import 'package:vector_math/vector_math.dart';
 
 import 'package:flutter_scene/src/camera.dart';
 import 'package:flutter_scene/src/fog.dart';
-import 'package:flutter_scene/src/weather.dart';
+import 'package:flutter_scene/src/lit_extension.dart';
 import 'package:flutter_scene/src/material/environment.dart';
 import 'package:flutter_scene/src/render/irradiance_field.dart';
 import 'package:flutter_scene/src/render/punctual_lights.dart'
@@ -1045,12 +1045,12 @@ bool leanLightingAllowed({
   required bool environmentBlending,
   required bool ambientOcclusion,
   required int pointShadowTileCount,
-  bool weather = false,
+  bool litExtension = false,
 }) =>
     shadingTierOverride ??
     (!debugDisableLeanLighting &&
-        // The lean entries compile the weather out (weather.glsl).
-        !weather &&
+        // The lean entries compile the lit extension's hooks out.
+        !litExtension &&
         !irradianceField &&
         rectAreaLightCount == 0 &&
         !environmentBlending &&
@@ -1117,7 +1117,7 @@ class Lighting {
     this.projectionOffsetY = 0.0,
     this.orthographic = false,
     this.depthProjection,
-    this.weather,
+    this.litExtension,
     this.time = 0.0,
     this.planarReflectionsSuppressed = false,
   }) : environmentTransform = environmentTransform ?? Matrix3.identity();
@@ -1144,7 +1144,7 @@ class Lighting {
     environmentBlending: environmentMapB != null && environmentBlend > 0.0,
     ambientOcclusion: ssaoMap != null || ssaoIndirectLight,
     pointShadowTileCount: pointShadowTileCount,
-    weather: weather != null,
+    litExtension: litExtension != null,
   );
 
   /// A secondary environment cross-faded with [environmentMap] by
@@ -1338,9 +1338,9 @@ class Lighting {
   /// a material that writes depth then leaves the interpolated depth alone.
   final Vector4? depthProjection;
 
-  /// The scene's weather (cloud shadows, wet and snowy surfaces), or null
-  /// for none. See [SceneWeather].
-  final SceneWeather? weather;
+  /// The application's lit extension when it is active this frame, or null.
+  /// See [LitExtension].
+  final LitExtension? litExtension;
 
   /// Seconds since the scene started rendering, for engine-driven material
   /// animation (the same clock custom post passes receive).

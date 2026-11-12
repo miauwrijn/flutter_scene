@@ -1625,7 +1625,7 @@ class PhysicallyBasedMaterial extends Material {
       modelScaleX: modelScaleX,
       modelScaleY: modelScaleY,
       modelScaleZ: modelScaleZ,
-      receivesWeather: receivesWeather,
+      extensionInput: extensionInput,
     );
     fragInfo[0] = baseColorFactor.r;
     fragInfo[1] = baseColorFactor.g;

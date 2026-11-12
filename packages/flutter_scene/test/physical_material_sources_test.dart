@@ -205,7 +205,7 @@ void main() {
       // Pinned so a new engine sampler shows up as a failure here rather than
       // as a rejected skinned draw on a minimum-spec driver. The irradiance
       // field left this untouched because it rides the coefficient texture.
-      // 15 since the weather's sky-occlusion map (weather.glsl): the shadow
+      // 15 since the lit extension's texture (ext_texture): the shadow
       // variants now sit exactly at maxFragmentSamplers, which the pairing
       // table below already reasons from — there is no headroom left, so the
       // next engine sampler has to displace one.

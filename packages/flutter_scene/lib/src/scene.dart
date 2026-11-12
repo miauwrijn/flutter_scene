@@ -41,7 +41,7 @@ import 'components/point_light_component.dart';
 import 'components/reflection_probe_component.dart';
 import 'components/spot_light_component.dart';
 import 'fog.dart';
-import 'weather.dart';
+import 'lit_extension.dart';
 import 'god_rays.dart';
 import 'light.dart';
 import 'material/environment.dart';
@@ -1330,7 +1330,7 @@ base class Scene implements SceneGraph {
             cascades: cascades,
             layerMask: lead.layerMask,
             fog: fog,
-            weather: weather,
+            litExtension: litExtension,
             time: time,
             // Rejects whole objects behind the mirror on the CPU; the
             // oblique projection clips whatever straddles the plane.
@@ -1841,9 +1841,9 @@ base class Scene implements SceneGraph {
   /// mapping, so it works on any camera type.
   final Fog fog = Fog();
 
-  /// Weather on every lit surface: cloud shadows, wet and snowy surfaces.
-  /// Off by default; see [SceneWeather].
-  final SceneWeather weather = SceneWeather();
+  /// The inputs of the application's lit extension: shader code of its own
+  /// inside every lit material. Inactive by default; see [LitExtension].
+  final LitExtension litExtension = LitExtension();
 
   /// Directional volumetric god rays. Off by default; set
   /// [GodRaysSettings.enabled] to turn them on. Requires a shadow-casting
@@ -3943,7 +3943,7 @@ base class Scene implements SceneGraph {
         irradianceField: irradianceBinding,
         layerMask: view.layerMask,
         fog: fog,
-        weather: weather,
+        litExtension: litExtension,
         captureOpaqueColor: captureOpaqueColor,
         displayReferredLayer: displayReferredActive,
         displayReferredFormat: outputColor.format,

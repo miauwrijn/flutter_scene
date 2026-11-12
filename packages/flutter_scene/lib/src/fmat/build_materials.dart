@@ -116,6 +116,7 @@ const _frameworkShaderFiles = <String>[
   'depth_mask.glsl',
   'diffuse_sh.glsl',
   'filtered_scene_color.glsl',
+  'flutter_scene_lit_extension.glsl',
   'flutter_scene_morph.glsl',
   'flutter_scene_skinned_body.glsl',
   'flutter_scene_unskinned_body.glsl',
@@ -143,7 +144,6 @@ const _frameworkShaderFiles = <String>[
   'ssao_geometry.glsl',
   'texture.glsl',
   'tone_mapping.glsl',
-  'weather.glsl',
   'wireframe.glsl',
 ];
 
@@ -188,6 +188,14 @@ const _frameworkShaderFiles = <String>[
 /// defaults to the app's `flutter_scene_debug_views` hook user-define (a hook
 /// cannot read flutter_scene's own `debug_views`), so set both. Without it the
 /// materials draw through the fallback debug shader while a view is active.
+///
+/// [litExtension] is the directory holding the application's
+/// `flutter_scene_lit_extension.glsl` (see the engine's own copy in
+/// `shaders/` for the contract). It defaults to this package's
+/// `flutter_scene_lit_extension` hook user-define, and without either to the
+/// engine's copy, which defines nothing. Name the same directory to
+/// flutter_scene's own hook (its `lit_extension` user-define), or the
+/// built-in materials are compiled without the extension.
 Future<void> buildMaterials({
   required BuildInput buildInput,
   required BuildOutputBuilder buildOutput,
@@ -196,6 +204,7 @@ Future<void> buildMaterials({
   String discoveryRoot = 'assets/',
   MaterialAssetMode assetMode = MaterialAssetMode.generatedTree,
   bool? debugViews,
+  Uri? litExtension,
 }) => _buildMaterials(
   buildInput: buildInput,
   buildOutput: buildOutput,
@@ -204,6 +213,7 @@ Future<void> buildMaterials({
   discoveryRoot: discoveryRoot,
   assetMode: assetMode,
   debugViews: debugViews ?? HookOptions.of(buildInput).debugViews,
+  litExtension: litExtension,
 );
 
 /// Builds flutter_scene's bundled physical material shaders.
@@ -221,6 +231,7 @@ Future<void> buildBundledPhysicalMaterials({
   bool pruneGeneratedTree = true,
   String? fileVariant,
   bool debugViews = false,
+  Uri? litExtension,
 }) => _buildMaterials(
   buildInput: buildInput,
   buildOutput: buildOutput,
@@ -243,6 +254,7 @@ Future<void> buildBundledPhysicalMaterials({
   pruneGeneratedTree: pruneGeneratedTree,
   fileVariant: fileVariant,
   debugViews: debugViews,
+  litExtension: litExtension,
 );
 
 Future<void> _buildMaterials({
@@ -259,6 +271,7 @@ Future<void> _buildMaterials({
   bool pruneGeneratedTree = true,
   String? fileVariant,
   bool debugViews = false,
+  Uri? litExtension,
 }) async {
   // ignore: deprecated_member_use_from_same_package
   if (assetMode == MaterialAssetMode.legacyOnly) {
@@ -318,6 +331,16 @@ Future<void> _buildMaterials({
   final target = shaderBundleTargetKey(buildInput);
 
   final frameworkShaders = await engineShaderIncludeDirectory(buildInput);
+  // The application's lit extension directory, if it has one. It goes on
+  // the include path ahead of the engine's, whose own copy of the file
+  // defines nothing.
+  final extensionDirectory = litExtensionDirectory(
+    litExtension ?? options.litExtension,
+  );
+  final extensionSources = litExtensionSources(extensionDirectory);
+  // Declared before any early return: editing the extension rebuilds every
+  // lit material.
+  buildOutput.dependencies.addAll(extensionSources.map((file) => file.uri));
 
   // The generated GLSL is an intermediate, regenerated each run.
   final generatedDir = Directory.fromUri(
@@ -403,6 +426,11 @@ Future<void> _buildMaterials({
       strict: options.strictHashing,
     );
     stampBuffer.write(' $name=$hash');
+  }
+  stampBuffer.write(' lit_extension=${extensionDirectory?.toFilePath()}');
+  for (final file in extensionSources) {
+    final hash = sourceFingerprint(file, strict: options.strictHashing);
+    stampBuffer.write(' ${file.uri.pathSegments.last}=$hash');
   }
   // An engine change to how materials compile rebuilds them even when no
   // material or shader file changed.
@@ -529,7 +557,7 @@ Future<void> _buildMaterials({
       bundleName: bundleName,
       manifest: manifest,
       entryRoot: generatedDir.uri,
-      includeDirectories: [frameworkShaders],
+      includeDirectories: [?extensionDirectory, frameworkShaders],
       // Match the engine bundle's GLES dialect (GLSL ES 3.00); the framework
       // radiance sampling these materials can `#include` uses textureLod,
       // which is not available in 1.00 without an extension.
@@ -632,6 +660,37 @@ Future<void> _buildMaterials({
     frameworkShaders: frameworkShaders,
   );
 }
+
+/// The file every lit material includes for the application's extension.
+const String litExtensionFileName = 'flutter_scene_lit_extension.glsl';
+
+/// The application's lit extension directory, checked and normalized, or
+/// null when [requested] is.
+Uri? litExtensionDirectory(Uri? requested) {
+  if (requested == null) return null;
+  final directory = Directory.fromUri(requested).absolute;
+  if (!File.fromUri(directory.uri.resolve(litExtensionFileName)).existsSync()) {
+    throw Exception(
+      'The lit extension directory ${directory.path} holds no '
+      '$litExtensionFileName. See flutter_scene\'s '
+      'shaders/$litExtensionFileName for what goes in it.',
+    );
+  }
+  // A trailing slash, so the include path and the stamp agree however the
+  // directory was named.
+  return Directory(directory.path).uri;
+}
+
+/// The extension's GLSL in [directory]: the file and whatever sits beside it
+/// for it to include, in a stable order. Empty without a directory.
+List<File> litExtensionSources(Uri? directory) => directory == null
+    ? const []
+    : (Directory.fromUri(directory)
+          .listSync()
+          .whereType<File>()
+          .where((file) => file.path.endsWith('.glsl'))
+          .toList()
+        ..sort((a, b) => a.path.compareTo(b.path)));
 
 /// Emits the fragment entries contributed by [compiled].
 Map<String, String> emitFragmentShaderVariants(

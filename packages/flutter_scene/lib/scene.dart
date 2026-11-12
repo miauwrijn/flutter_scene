@@ -130,7 +130,7 @@ export 'src/coplanar_overlaps.dart' show CoplanarOverlap;
 export 'src/depth_conflicts.dart' show DepthConflict, DepthConflictReport;
 export 'src/depth_of_field.dart' show DepthOfField, DepthOfFieldQuality;
 export 'src/fog.dart' show Fog, FogMode;
-export 'src/weather.dart' show SceneWeather;
+export 'src/lit_extension.dart' show LitExtension;
 export 'src/global_illumination.dart'
     show
         GlobalIlluminationSettings,

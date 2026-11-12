@@ -10,7 +10,7 @@ import 'package:vector_math/vector_math.dart';
 
 import 'package:flutter_scene/src/camera.dart';
 import 'package:flutter_scene/src/fog.dart';
-import 'package:flutter_scene/src/weather.dart';
+import 'package:flutter_scene/src/lit_extension.dart';
 import 'package:flutter_scene/src/light.dart';
 import 'package:flutter_scene/src/material/environment.dart';
 import 'package:flutter_scene/src/render/projection_params.dart';
@@ -99,7 +99,7 @@ class ScenePass extends RenderGraphPass {
     IrradianceFieldBinding? irradianceField,
     int layerMask = kRenderLayerAll,
     Fog? fog,
-    SceneWeather? weather,
+    LitExtension? litExtension,
     bool captureOpaqueColor = false,
     bool displayReferredLayer = false,
     gpu.PixelFormat? displayReferredFormat,
@@ -147,7 +147,7 @@ class ScenePass extends RenderGraphPass {
        _ssaoIndirectLight = ssaoIndirectLight,
        _irradianceField = irradianceField,
        _fog = fog,
-       _weather = weather,
+       _litExtension = litExtension,
        _cullingPlanes = cullingPlanes,
        _includeOffscreen = includeOffscreen;
 
@@ -181,7 +181,7 @@ class ScenePass extends RenderGraphPass {
   final bool _ssaoIndirectLight;
   final IrradianceFieldBinding? _irradianceField;
   final Fog? _fog;
-  final SceneWeather? _weather;
+  final LitExtension? _litExtension;
 
   // Material scene inputs (see Material.sceneInputs): whether to capture
   // accumulated scene color, whether to hand materials the prepass linear
@@ -407,7 +407,9 @@ class ScenePass extends RenderGraphPass {
       ssaoIndirectLight: ssaoMap != null && _ssaoIndirectLight,
       viewportSize: _dimensions,
       fog: _fog,
-      weather: _weather != null && _weather.active ? _weather : null,
+      litExtension: _litExtension != null && _litExtension.active
+          ? _litExtension
+          : null,
       sceneDepthLinear: _bindSceneDepth
           ? context.blackboard.get<gpu.Texture>(kLinearDepthBlackboardKey)
           : null,

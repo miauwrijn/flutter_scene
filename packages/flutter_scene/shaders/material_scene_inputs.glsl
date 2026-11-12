@@ -200,32 +200,15 @@ uniform FragInfo {
   // orthographic one, where z is 0 and the mapping is linear. All four zero
   // (no projection published) means a material must leave depth alone.
   highp vec4 depth_projection;
-  // Weather (see SceneWeather and weather.glsl). A procedural cloud deck that
-  // shadows the directional light, and surfaces wetted and snowed on where
-  // they are open to the sky.
-  // weather_cloud_u/v: the cloud-deck coordinates of a world point ON the
-  // deck, u = dot(p, xyz) + w (scale, wind drift and any axis flip folded
-  // in by the CPU). weather_cloud_up: xyz the world up axis (unit), w the
-  // deck's height along it. weather_cloud_params: x shadow strength (0 off),
-  // y cover, z seed, w unused.
-  highp vec4 weather_cloud_u;
-  highp vec4 weather_cloud_v;
-  highp vec4 weather_cloud_up;
-  highp vec4 weather_cloud_params;
-  // x wetness, y snow cover, z rainfall, w 1 when this material takes
-  // weather at all (water and glass do not).
-  highp vec4 weather_surface;
-  // The sky-occlusion height map (weather_occlusion sampler): map coords
-  // s = dot(p, occ_s.xyz) + occ_s.w, t likewise; occ_range x the lowest
-  // stored height, y the height span, z 1 when a map is bound, w the
-  // clearance a surface may sit under the stored top and still be open.
-  highp vec4 weather_occ_s;
-  highp vec4 weather_occ_t;
-  highp vec4 weather_occ_range;
-  // Wind-driven rain. xyz: how far, horizontally, a falling drop has come
-  // per unit of height it fell (toward upwind, i.e. the offset to walk back
-  // up the drop's path) — tan of the rain's slant. w unused.
-  highp vec4 weather_rain;
+  // The application's lit extension (see `LitExtension` and
+  // `shaders/flutter_scene_lit_extension.glsl`): nine vec4s the
+  // application packs per frame (`LitExtension.params`) and its own code in
+  // the lit shader reads. The engine gives them no meaning; all zero when no
+  // extension is active.
+  highp vec4 ext_params[9];
+  // The drawing material's `Material.extensionInput`: per-material values
+  // for the extension (an opt-out, a strength). Zero by default.
+  highp vec4 ext_material;
 }
 frag_info;
 

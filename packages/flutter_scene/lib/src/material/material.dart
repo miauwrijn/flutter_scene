@@ -4,7 +4,7 @@ import 'package:flutter/services.dart' show rootBundle;
 import 'dart:math' as math;
 import 'dart:typed_data';
 
-import 'package:vector_math/vector_math.dart' show Matrix4, Vector3;
+import 'package:vector_math/vector_math.dart' show Matrix4, Vector3, Vector4;
 
 import 'package:flutter_scene/src/render/depth_raster.dart';
 import 'package:flutter_scene/src/fmat/fmat_ast.dart' show DepthSurfaceKind;
@@ -355,10 +355,11 @@ abstract class Material {
   @internal
   int lightChannelMask = 0xFF;
 
-  /// Whether the scene's weather wets and snows this material
-  /// (`Scene.weather`). Water and glass turn it off. Cloud shadows fall on
-  /// it either way.
-  bool receivesWeather = true;
+  /// This material's values for the application's lit extension
+  /// (`Scene.litExtension`), read there as `frag_info.ext_material`: an
+  /// opt-out, a strength, whatever the extension defines. Zero by default;
+  /// the engine gives it no meaning.
+  final Vector4 extensionInput = Vector4.zero();
 
   /// The draw's model scale (world-space lengths of the model transform's
   /// basis vectors), set by the encoder right before [bind] and packed into
