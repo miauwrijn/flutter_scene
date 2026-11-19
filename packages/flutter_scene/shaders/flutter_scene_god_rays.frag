@@ -34,7 +34,8 @@ uniform PostCameraInfo {
 cam;
 
 // Per-cascade world->light-clip matrices, view-space split distances, the light
-// travel direction (xyz) with the cascade count in w, and the light color.
+// travel direction (xyz) with the cascade count in w, and the light color with
+// the atlas tile count in w.
 uniform PostShadowInfo {
   mat4 light_space_matrix[4];
   vec4 cascade_splits;
@@ -92,13 +93,14 @@ vec3 ViewPositionAt(vec2 uv) {
   }
 
 // Sunlight visibility at world point P (1 lit, 0 shadowed). Points outside all
-// cascades are treated as lit.
-float ShadowVisibility(vec3 p, int count) {
+// cascades are treated as lit. [tiles] is the atlas's tile count: spot and
+// point shadow tiles share the strip after the cascades.
+float ShadowVisibility(vec3 p, int count, int tiles) {
   float result = 1.0;
-  TRY_CASCADE(0, p, count, result);
-  if (count > 1) TRY_CASCADE(1, p, count, result);
-  if (count > 2) TRY_CASCADE(2, p, count, result);
-  if (count > 3) TRY_CASCADE(3, p, count, result);
+  TRY_CASCADE(0, p, tiles, result);
+  if (count > 1) TRY_CASCADE(1, p, tiles, result);
+  if (count > 2) TRY_CASCADE(2, p, tiles, result);
+  if (count > 3) TRY_CASCADE(3, p, tiles, result);
   return 1.0;
 }
 
@@ -148,11 +150,14 @@ void main() {
   // the in-scatter into the first step near the camera; density scales the
   // overall thickness.
   int count = int(shadow.light_direction.w + 0.5);
+  // Older packings leave w at zero: the cascades alone then.
+  int tiles = shadow.light_color.w > 0.5 ? int(shadow.light_color.w + 0.5)
+                                         : count;
   float lit_sum = 0.0;
   for (int i = 0; i < kMaxSteps; i++) {
     if (i >= steps) break;
     vec3 p = ray_origin + ray_dir * (offset + float(i) * step_len);
-    lit_sum += ShadowVisibility(p, count);
+    lit_sum += ShadowVisibility(p, count, tiles);
   }
   float avg_lit = lit_sum / float(steps);
 
