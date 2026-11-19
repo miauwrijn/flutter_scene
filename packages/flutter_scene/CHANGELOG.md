@@ -1,5 +1,6 @@
 ## 0.24.4
 
+* `MeshGeometry.sharingVertices` draws another fixed mesh's vertices with indices of its own, uploading only the indices, so one mesh can be drawn many times with a different subset of its triangles (a level-of-detail cut, a culled subset) without copying its vertices. `MeshGeometry.setIndexData` replaces a mesh's indices without uploading its vertices again, on fixed and updatable storage alike.
 * A `PolylineGeometry` draws without the app calling `updateForCamera` each frame, which is deprecated and does nothing. Its strip is expanded in a vertex shader for whichever camera renders it, so every view of a scene sees it face on, and it follows its node's transform.
 * BREAKING: `PolylineGeometry` extends `Geometry`, not `MeshGeometry`, and a raycast no longer hits it.
 * `SceneView.errorBuilder` shows a failed engine resource load (such as a shader bundle a web build could not fetch) with a `retry` callback, instead of leaving the view on its loading widget.
