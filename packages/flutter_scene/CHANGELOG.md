@@ -4,6 +4,7 @@
 * `Texture2DArray` uploads layered data textures, sampled in `.fmat` materials through `sampler2DArray` parameters. Arrays work on the web backends, and on Metal and Vulkan with Flutter 3.50 or newer (`Texture2DArray.isSupported`).
 * `Texture2D.fromData` builds a texture from raw texels in a `DataTextureFormat` (`r8`, `rg8`, `rgba8`, `r32Float`, `rgba16Float`, `rgba32Float`).
 * `r8` and `rg8` textures whose rows are not a multiple of four bytes upload correctly on WebGL2.
+* A `.fmat` sampler parameter takes `stage: vertex` to be declared in the vertex stage, so `Vertex()` can read a texture (a height map, a wind field). The engine binds it on the vertex shader in every pass that draws the material. A sampler lives in one stage only, which keeps it from spending a texture unit in both on OpenGL ES, where the stages share one limit.
 * A `PolylineGeometry` draws without the app calling `updateForCamera` each frame, which is deprecated and does nothing. Its strip is expanded in a vertex shader for whichever camera renders it, so every view of a scene sees it face on, and it follows its node's transform.
 * BREAKING: `PolylineGeometry` extends `Geometry`, not `MeshGeometry`, and a raycast no longer hits it.
 * `SceneView.errorBuilder` shows a failed engine resource load (such as a shader bundle a web build could not fetch) with a `retry` callback, instead of leaving the view on its loading widget.
