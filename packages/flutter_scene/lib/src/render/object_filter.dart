@@ -8,7 +8,9 @@ import 'package:vector_math/vector_math.dart';
 
 import 'package:flutter_scene/src/geometry/geometry.dart'
     show bindUnskinnedFrameInfo;
+import 'package:flutter_scene/src/mesh_draw.dart';
 import 'package:flutter_scene/src/render/instance_packing.dart';
+import 'package:flutter_scene/src/render/mesh_draw_selection.dart';
 import 'package:flutter_scene/src/render/render_scene.dart';
 import 'package:flutter_scene/src/scene_encoder.dart' show resolvePipeline;
 import 'package:flutter_scene/src/shaders.dart';
@@ -130,6 +132,9 @@ void renderObjectMask({
   // What a covered pixel holds. The surface contents sample the material
   // through the full varyings, so they imply [fullVertex].
   MaskContent content = MaskContent.flat,
+  // Whether the mask is drawn for a screen view's camera, for the items'
+  // mesh draw selectors (see MeshDrawContext.primaryView).
+  bool primaryView = false,
 }) {
   final renderTarget = gpu.RenderTarget.singleColor(
     gpu.ColorAttachment(texture: target, clearValue: clearColor),
@@ -156,6 +161,7 @@ void renderObjectMask({
     pixelSlope,
     fullVertex || content != MaskContent.flat,
     content,
+    primaryView,
   );
   if (reverseOrder) {
     final visible = <RenderItem>[];
@@ -189,6 +195,7 @@ class _ObjectMaskEncoder {
     this._pixelSlope,
     this._fullVertex,
     this._content,
+    this._primaryView,
   ) {
     _renderPass.setDepthWriteEnable(true);
     _renderPass.setColorBlendEnable(false);
@@ -224,6 +231,7 @@ class _ObjectMaskEncoder {
     );
     return f.length2 > 0 ? f.normalized() : Vector3(0, 0, -1);
   }();
+  final bool _primaryView;
 
   static final gpu.Shader _maskShader = baseShaderLibrary['MaskFragment']!;
   static final gpu.Shader _maskedMaskShader =
@@ -242,6 +250,9 @@ class _ObjectMaskEncoder {
     if (!_filter._matches(item, _layerMask)) return;
     final include = _include;
     if (include != null && !include(item)) return;
+    // The instances outside the view, as the color pass drops them: a batch
+    // whose bounds reach into the view would otherwise draw every instance.
+    if (!item.cullVisibleInstances(frustum, const [])) return;
     _renderPass.clearBindings();
     final geometry = item.geometry;
     // Skinned items draw through the full bind path below; apply this item's
@@ -406,90 +417,142 @@ class _ObjectMaskEncoder {
             geometry.bindsModelTransformInstance
         ? geometry.vertexStreamCount
         : null;
-    final instances = item.instanceTransforms;
-    if (instances != null) {
-      if (dataSlot != null) {
+    // The part of the mesh the color pass draws for this camera (a level of
+    // detail by instance count or index range), so the mask matches it.
+    final selection = beginMeshDraw(
+      item,
+      geometry,
+      MeshDrawPass.color,
+      _cameraPosition,
+      _primaryView,
+    );
+    try {
+      final instances = item.instanceTransforms;
+      if (instances != null) {
+        // The instances to draw: those in view, cut to the selector's prefix.
+        final visible = limitInstanceIndices(
+          item.visibleInstanceIndices,
+          instances.length,
+          selection.instanceCount,
+        );
+        if (visible != null && visible.isEmpty) return;
+        if (dataSlot != null) {
+          bindDraw(item.worldTransform);
+          // Every instance in view and no per-instance attributes: the record
+          // the color pass retains on the GPU is this one, so bind it rather
+          // than packing it again.
+          final packedWorldData = item.instanceWorldData;
+          final packedWinding = item.instanceWorldWindingFlipped;
+          if (item.visibleInstanceIndices == null &&
+              item.instanceAttributeFloats == attributeFloats &&
+              packedWorldData != null &&
+              packedWinding != null) {
+            final flipped = bindRetainedInstanceData(
+              _renderPass,
+              packedWorldData,
+              packedWinding,
+              slot: dataSlot,
+            );
+            if (flipped != null) {
+              _renderPass.setWindingOrder(
+                flipped
+                    ? gpu.WindingOrder.counterClockwise
+                    : gpu.WindingOrder.clockwise,
+              );
+              geometry.draw(
+                _renderPass,
+                instanceCount: visible?.length ?? instances.length,
+              );
+              return;
+            }
+          }
+          final packed = packInstanceData(
+            item.worldTransform,
+            instances,
+            item.instanceColors ??
+                List.filled(instances.length, _white, growable: false),
+            nodeWindingFlipped: item.windingFlipped,
+            instanceWindingFlipped: item.instanceWindingFlipped,
+            attributeData: item.instanceAttributeData,
+            attributeFloats: attributeFloats,
+            indices: visible,
+            scratch: transientInstancePackingScratch,
+          );
+          transientInstancePackingScratch.releaseSingleBatch();
+          if (packed.ccwCount > 0) {
+            bindInstanceData(_renderPass, packed.ccw, slot: dataSlot);
+            _renderPass.setWindingOrder(gpu.WindingOrder.clockwise);
+            geometry.draw(_renderPass, instanceCount: packed.ccwCount);
+          }
+          if (packed.cwCount > 0) {
+            bindInstanceData(_renderPass, packed.cw, slot: dataSlot);
+            _renderPass.setWindingOrder(gpu.WindingOrder.counterClockwise);
+            geometry.draw(_renderPass, instanceCount: packed.cwCount);
+          }
+          return;
+        }
+        if (geometry.instancedVertexLayout == null) {
+          final count = visible?.length ?? instances.length;
+          for (var slot = 0; slot < count; slot++) {
+            final instanceTransform = instances[visible?[slot] ?? slot];
+            bindDraw(item.worldTransform * instanceTransform);
+            final flip =
+                item.windingFlipped != (instanceTransform.determinant() < 0);
+            _renderPass.setWindingOrder(
+              flip
+                  ? gpu.WindingOrder.counterClockwise
+                  : gpu.WindingOrder.clockwise,
+            );
+            geometry.draw(_renderPass);
+          }
+          return;
+        }
         bindDraw(item.worldTransform);
-        final packed = packInstanceData(
+        final packed = packInstanceTransforms(
           item.worldTransform,
           instances,
-          item.instanceColors ??
-              List.filled(instances.length, _white, growable: false),
           nodeWindingFlipped: item.windingFlipped,
-          instanceWindingFlipped: item.instanceWindingFlipped,
-          attributeData: item.instanceAttributeData,
-          attributeFloats: attributeFloats,
+          indices: visible,
           scratch: transientInstancePackingScratch,
         );
-        transientInstancePackingScratch.releaseSingleBatch();
         if (packed.ccwCount > 0) {
-          bindInstanceData(_renderPass, packed.ccw, slot: dataSlot);
+          bindInstanceTransforms(_renderPass, packed.ccw);
           _renderPass.setWindingOrder(gpu.WindingOrder.clockwise);
           geometry.draw(_renderPass, instanceCount: packed.ccwCount);
         }
         if (packed.cwCount > 0) {
-          bindInstanceData(_renderPass, packed.cw, slot: dataSlot);
+          bindInstanceTransforms(_renderPass, packed.cw);
           _renderPass.setWindingOrder(gpu.WindingOrder.counterClockwise);
           geometry.draw(_renderPass, instanceCount: packed.cwCount);
         }
         return;
       }
-      if (geometry.instancedVertexLayout == null) {
-        for (final instanceTransform in instances) {
-          bindDraw(item.worldTransform * instanceTransform);
-          final flip =
-              item.windingFlipped != (instanceTransform.determinant() < 0);
-          _renderPass.setWindingOrder(
-            flip
-                ? gpu.WindingOrder.counterClockwise
-                : gpu.WindingOrder.clockwise,
-          );
-          geometry.draw(_renderPass);
-        }
-        return;
-      }
-      bindDraw(item.worldTransform);
-      final packed = packInstanceTransforms(
-        item.worldTransform,
-        instances,
-        nodeWindingFlipped: item.windingFlipped,
-        scratch: transientInstancePackingScratch,
-      );
-      if (packed.ccwCount > 0) {
-        bindInstanceTransforms(_renderPass, packed.ccw);
-        _renderPass.setWindingOrder(gpu.WindingOrder.clockwise);
-        geometry.draw(_renderPass, instanceCount: packed.ccwCount);
-      }
-      if (packed.cwCount > 0) {
-        bindInstanceTransforms(_renderPass, packed.cw);
-        _renderPass.setWindingOrder(gpu.WindingOrder.counterClockwise);
-        geometry.draw(_renderPass, instanceCount: packed.cwCount);
-      }
-      return;
-    }
 
-    bindDraw(item.worldTransform);
-    // Only bind a model-transform instance buffer when the geometry expects one
-    // at the slot after its vertex streams. A geometry that supplies its own
-    // per-instance buffer (a billboard batch) sets this false; binding here
-    // would clobber slot 1 and the shader would read its instance attributes as
-    // a transform matrix.
-    if (dataSlot != null) {
-      bindSingleInstanceData(
-        _renderPass,
-        item.worldTransform,
-        slot: dataSlot,
-        attributeFloats: attributeFloats,
+      bindDraw(item.worldTransform);
+      // Only bind a model-transform instance buffer when the geometry expects one
+      // at the slot after its vertex streams. A geometry that supplies its own
+      // per-instance buffer (a billboard batch) sets this false; binding here
+      // would clobber slot 1 and the shader would read its instance attributes as
+      // a transform matrix.
+      if (dataSlot != null) {
+        bindSingleInstanceData(
+          _renderPass,
+          item.worldTransform,
+          slot: dataSlot,
+          attributeFloats: attributeFloats,
+        );
+      } else if (geometry.instancedVertexLayout != null &&
+          geometry.bindsModelTransformInstance) {
+        bindSingleInstanceTransform(_renderPass, item.worldTransform);
+      }
+      _renderPass.setWindingOrder(
+        item.windingFlipped
+            ? gpu.WindingOrder.counterClockwise
+            : gpu.WindingOrder.clockwise,
       );
-    } else if (geometry.instancedVertexLayout != null &&
-        geometry.bindsModelTransformInstance) {
-      bindSingleInstanceTransform(_renderPass, item.worldTransform);
+      geometry.draw(_renderPass);
+    } finally {
+      endMeshDraw(geometry);
     }
-    _renderPass.setWindingOrder(
-      item.windingFlipped
-          ? gpu.WindingOrder.counterClockwise
-          : gpu.WindingOrder.clockwise,
-    );
-    geometry.draw(_renderPass);
   }
 }
