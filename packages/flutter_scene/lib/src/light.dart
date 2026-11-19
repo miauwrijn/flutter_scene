@@ -1,4 +1,5 @@
 import 'dart:math' as math;
+import 'dart:typed_data';
 import 'dart:ui' as ui;
 
 import 'package:flutter/foundation.dart' show debugPrint, internal, kDebugMode;
@@ -610,13 +611,31 @@ class PointLight {
     this.shadowCasterFaces = ShadowCasterFaces.front,
     this.channelMask = 0xFF,
     this.shadowCasterChannelMask = 0xFF,
-  }) : color = color ?? Vector3(1.0, 1.0, 1.0);
+    this.photometry,
+    Vector3? photometryAxis,
+  }) : color = color ?? Vector3(1.0, 1.0, 1.0),
+       photometryAxis = photometryAxis ?? Vector3(0.0, -1.0, 0.0);
 
   /// Linear RGB color of the light.
   Vector3 color;
 
   /// Scalar multiplier applied to [color]; the radiance at unit distance.
   double intensity;
+
+  /// An angular intensity profile, such as an IES file's averaged over
+  /// azimuth: relative intensity (peak 1) at evenly spaced angles from
+  /// [photometryAxis] (the first sample) to its opposite (the last).
+  /// [intensity] scales it. Null is a uniform point light.
+  ///
+  /// Any length of at least one sample works; it is resampled to 64 when
+  /// packed. Lights that share one list share one packed copy, so reuse the
+  /// list for many lamps of one fixture.
+  Float32List? photometry;
+
+  /// The direction [photometry]'s angles are measured from, in the owning
+  /// node's local space (a pendant's points down, the default). Need not be
+  /// unit length.
+  Vector3 photometryAxis;
 
   /// World-space distance at which the light's influence smoothly reaches
   /// zero. `0` means infinite range (pure inverse-square falloff, clamped
@@ -842,8 +861,15 @@ class SpotLight {
     this.shadowCasterFaces = ShadowCasterFaces.front,
     this.channelMask = 0xFF,
     this.shadowCasterChannelMask = 0xFF,
+    this.photometry,
   }) : color = color ?? Vector3(1.0, 1.0, 1.0),
        direction = direction ?? Vector3(0.0, -1.0, 0.0);
+
+  /// An angular intensity profile measured from [direction], as
+  /// [PointLight.photometry]. When set it is the beam: it replaces the
+  /// inner/outer cone falloff. The outer cone still sets the shadow map's
+  /// frustum, so keep it wide enough to cover the lit part of the profile.
+  Float32List? photometry;
 
   /// Linear RGB color of the light.
   Vector3 color;
