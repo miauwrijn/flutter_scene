@@ -26,15 +26,15 @@ import 'package:flutter_scene/src/render/uniform_slots.dart';
 /// [PhysicallyBasedMaterial] and `PreprocessedMaterial` use it so the lighting
 /// packing lives in one place.
 class EngineLightingUniforms {
-  /// The float count of the full `FragInfo` block (832 bytes / 208 floats:
+  /// The float count of the full `FragInfo` block (848 bytes / 212 floats:
   /// the mat4 `environment_transform` ends at float 155, the `ssao_params`
   /// vec4 at floats 156..159, then the `radiance_blend` vec4 at floats
   /// 160..163, `ssao_lighting` at 164..167, `model_scale` at 168..171,
   /// `dielectric_f0` at 172..175, the five irradiance-field vec4s at
   /// 176..195, `froxel_grid` at 196..199, `view_projection` at 200..203, and
-  /// `camera_position` at 204..207). See the layout map in the
-  /// implementation.
-  static const fragInfoFloatCount = 208;
+  /// `camera_position` at 204..207, and `depth_projection` at 208..211).
+  /// See the layout map in the implementation.
+  static const fragInfoFloatCount = 212;
 
   /// Index of the `dielectric_f0` vec4 in `FragInfo`. [packInto] writes the
   /// standard 0.04 dielectric reflectance; a material with a non-default
@@ -277,6 +277,15 @@ class EngineLightingUniforms {
     fragInfo[205] = cameraPosition?.y ?? 0.0;
     fragInfo[206] = cameraPosition?.z ?? 0.0;
     fragInfo[207] = 0.0;
+    // depth_projection [208..211]: the raster projection's depth row, for a
+    // material that writes its own gl_FragDepth. Zero when the pass
+    // publishes none, which the shader reads as "keep the interpolated
+    // depth".
+    final depthRow = lighting.depthProjection;
+    fragInfo[208] = depthRow?.x ?? 0.0;
+    fragInfo[209] = depthRow?.y ?? 0.0;
+    fragInfo[210] = depthRow?.z ?? 0.0;
+    fragInfo[211] = depthRow?.w ?? 0.0;
     // spot_shadow_params [12..15] (more of the unused SH region): the shared
     // spot-shadow parameters. x is the total non-cascade tile count (spot
     // tiles then point-shadow tiles); 0 disables both spot and point shadow
