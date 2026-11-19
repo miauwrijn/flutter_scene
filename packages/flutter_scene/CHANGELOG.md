@@ -1,5 +1,7 @@
 ## 0.24.4
 
+* A `.fmat` material with `mask_surface: true` also fills the normal object mask (`MaskContent.normal`) with the `material.normal` its own `Surface()` computes, normal maps and all, through a `<Name>MaskNormal` entry beside `<Name>MaskAlbedo`. Without it the normal mask shows the geometric normal. The sidecar's `mask_surface` is now a map of both entries.
+* `RenderPassContext.drawObjects` takes `content:` to fill the mask with each object's textured albedo (`MaskContent.albedo`) or normal-mapped world-space normal (`MaskContent.normal`) instead of a flat color, so a custom pass can shade with the surfaces' own detail. Cut-out materials are cut out of both. A `.fmat` material declares `mask_surface: true` to fill the albedo mask by its own `Surface()`.
 * A `PolylineGeometry` draws without the app calling `updateForCamera` each frame, which is deprecated and does nothing. Its strip is expanded in a vertex shader for whichever camera renders it, so every view of a scene sees it face on, and it follows its node's transform.
 * BREAKING: `PolylineGeometry` extends `Geometry`, not `MeshGeometry`, and a raycast no longer hits it.
 * `SceneView.errorBuilder` shows a failed engine resource load (such as a shader bundle a web build could not fetch) with a `retry` callback, instead of leaving the view on its loading widget.

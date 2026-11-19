@@ -283,6 +283,18 @@ for outlines and highlights). The built-in god rays, screen-space
 reflections, depth of field, and screen distortion passes are all ordinary
 `CustomRenderPass`es, so anything they do, a custom one can.
 
+`drawObjects` can also fill the mask with each surface's own detail through
+`content:`. `MaskContent.albedo` writes the per-object color times the
+material's linear base color (factor, texture, and vertex color), and
+`MaskContent.normal` writes its normal-mapped world-space normal, encoded
+`n * 0.5 + 0.5`. A pass that shades or composites with the surfaces (a
+lighting or decal effect, say) reads them at full resolution without
+re-rendering the scene. Cut-out (`AlphaMode.mask`) materials are cut out of
+both. `PhysicallyBasedMaterial` supplies its inputs; a `.fmat` material
+declares `mask_surface: true` to fill both masks by its own `Surface()` (at
+the cost of two extra shader entries), and without it draws white in the
+albedo mask and its geometric normal in the normal mask.
+
 Declaring a `RenderInput` (`depth`, `normals`, `shadowMap`) makes the
 engine produce that buffer for the frame and exposes it on the context, so
 a custom pass can read scene geometry, not just color:

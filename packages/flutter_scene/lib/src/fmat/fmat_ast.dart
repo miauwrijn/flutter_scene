@@ -22,6 +22,28 @@ enum DepthSurfaceKind {
   final String sidecarKey;
 }
 
+/// An object-mask fragment a `mask_surface: true` material supplies itself,
+/// running its own `Surface()` (see `MaskContent`).
+enum MaskSurfaceKind {
+  /// The albedo mask: the per-item color times `material.base_color.rgb`.
+  albedo('MaskAlbedo', 'albedo', 'FLUTTER_SCENE_MASK_SURFACE_ALBEDO'),
+
+  /// The normal mask: `material.normal`, encoded `n * 0.5 + 0.5`.
+  normal('MaskNormal', 'normal', 'FLUTTER_SCENE_MASK_SURFACE_NORMAL');
+
+  const MaskSurfaceKind(this.suffix, this.sidecarKey, this.define);
+
+  /// Appended to the material name for the bundle entry.
+  final String suffix;
+
+  /// The key in the sidecar's `mask_surface` map.
+  final String sidecarKey;
+
+  /// Defined, beside `FLUTTER_SCENE_MASK_SURFACE`, in this kind's variant, so
+  /// `Surface()` can skip what the mask does not read.
+  final String define;
+}
+
 /// Which rendering contract a `.fmat` targets.
 enum FmatDomain {
   /// A surface material: the author writes `void Surface(inout MaterialInputs)`
@@ -284,6 +306,7 @@ class FmatMaterial {
     required this.culling,
     this.depthWrite = false,
     this.effectsDepth = false,
+    this.maskSurface = false,
     this.depthTest = FmatDepthTest.lessEqual,
     this.depthLayer = 0,
     required this.parameters,
@@ -341,6 +364,16 @@ class FmatMaterial {
   /// soft cutouts such as fins, which must blur and fog with what they are
   /// attached to without hiding what is behind them.
   final bool effectsDepth;
+
+  /// Whether the material's own `Surface()` fills the albedo and normal
+  /// object masks (`mask_surface:`, default false), what a custom pass reads
+  /// through `RenderPassContext.drawObjects(content: MaskContent.albedo)` and
+  /// `MaskContent.normal`. Without it the albedo mask draws the material
+  /// white and the normal mask its geometric normal, since the engine cannot
+  /// tell what a custom shader's color and normal are. Each variant is
+  /// compiled with `FLUTTER_SCENE_MASK_SURFACE` and its [MaskSurfaceKind]
+  /// define, so `Surface()` can skip work the mask does not need.
+  final bool maskSurface;
 
   /// The depth test used in the translucent pass (`depth_test:`).
   final FmatDepthTest depthTest;

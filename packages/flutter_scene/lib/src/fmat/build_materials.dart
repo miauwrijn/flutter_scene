@@ -22,6 +22,8 @@ import 'fmat_emitter.dart'
         kLightmapDefine,
         kRadianceCubeDefine,
         materialHasDepthSurface,
+        materialHasMaskSurface,
+        maskSurfaceEntryName,
         lightmapEntryName,
         materialSamplesEnvironment,
         radianceCubeEntryName;
@@ -690,6 +692,14 @@ Map<String, String> emitFragmentShaderVariants(
         depthSurfaceEntryName(material, kind): emitFragmentGlsl(
           material,
           depthSurface: kind,
+        ),
+    // A `mask_surface` material fills the albedo and normal object masks
+    // itself.
+    if (materialHasMaskSurface(material))
+      for (final kind in MaskSurfaceKind.values)
+        maskSurfaceEntryName(material, kind): emitFragmentGlsl(
+          material,
+          maskSurface: kind,
         ),
   };
   if (!materialSamplesEnvironment(material)) {
