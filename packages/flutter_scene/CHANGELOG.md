@@ -1,5 +1,6 @@
 ## 0.24.4
 
+* `RenderPassContext.cameraInfo` (`PostCameraInfo`) carries the near plane the frame rasterizes with. A view fits its near plane to the visible content, but the block held the camera's own, so a custom pass that reconstructed points on the near plane put them where no geometry was clipped.
 * A `PolylineGeometry` draws without the app calling `updateForCamera` each frame, which is deprecated and does nothing. Its strip is expanded in a vertex shader for whichever camera renders it, so every view of a scene sees it face on, and it follows its node's transform.
 * BREAKING: `PolylineGeometry` extends `Geometry`, not `MeshGeometry`, and a raycast no longer hits it.
 * `SceneView.errorBuilder` shows a failed engine resource load (such as a shader bundle a web build could not fetch) with a `retry` callback, instead of leaving the view on its loading widget.

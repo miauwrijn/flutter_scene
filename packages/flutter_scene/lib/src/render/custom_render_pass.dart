@@ -22,6 +22,8 @@ import 'package:flutter_scene/src/shaders.dart';
 import 'package:flutter_scene/src/render/frame_transients.dart';
 import 'package:flutter_scene/src/scene_encoder.dart' show resolvePipeline;
 import 'package:flutter_scene/src/render/uniform_slots.dart';
+import 'package:flutter_scene/src/render/viewport_camera.dart'
+    show depthRasterOf;
 
 /// Packs the `PostShadowInfo` std140 block a depth-aware custom pass reads
 /// (exposed as [RenderPassContext.shadowInfo]) from the frame's [cascades],
@@ -279,7 +281,9 @@ class RenderPassContext {
   ///
   /// * `vec4 projection`: xy the view-space extent per unit of NDC (the half-fov
   ///   tangents for perspective, the half width and height for orthographic),
-  ///   z near, w far.
+  ///   z near, w far. The near is the plane the frame rasterizes with, which
+  ///   for a perspective view is fitted to the visible content, so a point
+  ///   reconstructed on it lies where geometry is clipped.
   /// * `vec4 camera_right`, `vec4 camera_up`, `vec4 camera_forward`: the camera
   ///   basis in xyz, matching the depth prepass's view space (the eye at the
   ///   origin looking down +forward). `camera_right.w` and `camera_up.w` are the
@@ -298,7 +302,11 @@ class RenderPassContext {
       final projection = ProjectionParams.of(camera.projection, dimensions);
       f[0] = projection.scaleX;
       f[1] = projection.scaleY;
-      f[2] = projection.near;
+      // The near the frame clips geometry at: a view's fitted near replaces
+      // a perspective projection's own (see DepthRaster.near).
+      f[2] = projection.orthographicFlag == 0
+          ? depthRasterOf(camera).near ?? projection.near
+          : projection.near;
       f[3] = projection.far;
       f[7] = projection.offsetX;
       f[11] = projection.offsetY;
