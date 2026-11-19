@@ -1840,6 +1840,58 @@ class PhysicallyBasedMaterial extends Material {
   }
 
   @override
+  void bindMaskSurface(
+    gpu.RenderPass pass,
+    gpu.Shader shader,
+    TransientWriter transientsBuffer, {
+    required bool baseColor,
+    required bool normal,
+  }) {
+    // The inputs Surface() shades with: base color factor, texture and
+    // weighted vertex color; the normal map with its scale.
+    final baseTransform = Material.maskBaseTransformScratch..fillRange(0, 8, 0);
+    packTextureTransformRecord(
+      baseTransform,
+      0,
+      baseColorTextureTransform,
+      baseColorTextureTexCoord,
+    );
+    final normalTransform = Material.maskNormalTransformScratch
+      ..fillRange(0, 8, 0);
+    packTextureTransformRecord(
+      normalTransform,
+      0,
+      normalTextureTransform,
+      normalTextureTexCoord,
+    );
+    Material.bindMaskSurfaceInputs(
+      pass,
+      shader,
+      transientsBuffer,
+      bindBaseColor: baseColor,
+      bindNormal: normal,
+      color: Material.maskColorScratch
+        ..[0] = baseColorFactor.r
+        ..[1] = baseColorFactor.g
+        ..[2] = baseColorFactor.b,
+      vertexColorWeight: vertexColorWeight,
+      baseColorTexture: resolveTextureSource(baseColorTexture),
+      baseColorSampler: textureSourceSampler(baseColorTexture),
+      normalTexture: resolveTextureSource(normalTexture),
+      normalSampler: textureSourceSampler(normalTexture),
+      normalScale: normalScale,
+      baseColorTransform: baseTransform,
+      normalTransform: normalTransform,
+      // MASK coverage as the color pass tests it: texture alpha times
+      // weighted vertex alpha times the factor alpha against the cutoff.
+      alphaCutoff: alphaMode == AlphaMode.mask
+          ? alphaCutoff / math.max(baseColorFactor.a, 1e-3)
+          : 0.0,
+      vertexAlphaWeight: vertexColorWeight,
+    );
+  }
+
+  @override
   bool isOpaque() {
     // BLEND always goes through the translucent pass. OPAQUE and MASK
     // are drawn in the opaque pass (MASK relies on the shader's
