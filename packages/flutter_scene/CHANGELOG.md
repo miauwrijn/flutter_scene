@@ -1,5 +1,6 @@
 ## 0.24.4
 
+* A `.fmat` material with `depth_offset: true` sets `material.depth_offset` in `Surface()` to push its surface back along the view ray, and the color pass writes the matching depth, so parallax relief occludes and is occluded where it really is instead of at the flat polygon. The depth prepass and shadow maps still see the polygon.
 * A `PolylineGeometry` draws without the app calling `updateForCamera` each frame, which is deprecated and does nothing. Its strip is expanded in a vertex shader for whichever camera renders it, so every view of a scene sees it face on, and it follows its node's transform.
 * BREAKING: `PolylineGeometry` extends `Geometry`, not `MeshGeometry`, and a raycast no longer hits it.
 * `SceneView.errorBuilder` shows a failed engine resource load (such as a shader bundle a web build could not fetch) with a `retry` callback, instead of leaving the view on its loading widget.

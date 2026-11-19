@@ -284,6 +284,7 @@ class FmatMaterial {
     required this.culling,
     this.depthWrite = false,
     this.effectsDepth = false,
+    this.depthOffset = false,
     this.depthTest = FmatDepthTest.lessEqual,
     this.depthLayer = 0,
     required this.parameters,
@@ -341,6 +342,21 @@ class FmatMaterial {
   /// soft cutouts such as fins, which must blur and fog with what they are
   /// attached to without hiding what is behind them.
   final bool effectsDepth;
+
+  /// Whether `Surface()` sets its own fragment depth (`depth_offset:`,
+  /// default false).
+  ///
+  /// `MaterialInputs` gains a `depth_offset` field: how far, in world units
+  /// along the view ray and away from the camera, the visible surface lies
+  /// behind the polygon. The generated `main()` writes the matching
+  /// `gl_FragDepth`, so a parallax or ray-marched surface occludes and is
+  /// occluded where its relief really is, not where the flat polygon is.
+  /// Zero keeps the interpolated depth.
+  ///
+  /// Only the color pass writes the offset; the depth prepass and shadow
+  /// maps still see the polygon. Opt-in because a shader that writes depth
+  /// gives up early depth rejection for every surface drawn with it.
+  final bool depthOffset;
 
   /// The depth test used in the translucent pass (`depth_test:`).
   final FmatDepthTest depthTest;

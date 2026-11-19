@@ -49,6 +49,7 @@ class PreprocessedMaterial extends Material implements HotReloadableFmat {
        _culling = _parseCulling(metadata['culling']),
        _depthWrite = metadata['depth_write'] == true,
        _effectsDepth = metadata['effects_depth'] == true,
+       _writesDepth = metadata['depth_offset'] == true,
        _depthCompare = _parseDepthCompare(metadata['depth_test']),
        _sceneInputs = _parseSceneInputs(metadata['engine_inputs']),
        _environmentLighting = metadata['environment_lighting'] != false,
@@ -105,6 +106,10 @@ class PreprocessedMaterial extends Material implements HotReloadableFmat {
       value is num ? value.toDouble() : null;
 
   Set<RenderInput> _sceneInputs;
+
+  // Whether the fragment writes its own depth (`depth_offset: true`). Its
+  // shader then declares FragInfo even when unlit, for the projection row.
+  bool _writesDepth;
 
   // False when the material supplies its own indirect light
   // (`environment_lighting: false`), so the engine IBL samplers are absent.
@@ -421,6 +426,7 @@ class PreprocessedMaterial extends Material implements HotReloadableFmat {
     _culling = _parseCulling(metadata['culling']);
     _depthWrite = metadata['depth_write'] == true;
     _effectsDepth = metadata['effects_depth'] == true;
+    _writesDepth = metadata['depth_offset'] == true;
     _depthCompare = _parseDepthCompare(metadata['depth_test']);
     _sceneInputs = _parseSceneInputs(metadata['engine_inputs']);
     _environmentLighting = metadata['environment_lighting'] != false;
@@ -474,9 +480,10 @@ class PreprocessedMaterial extends Material implements HotReloadableFmat {
       // block too (the screen-UV mapping, the input gates, and the camera
       // basis its accessors unproject with), but none of the lighting
       // samplers, so it costs no texture unit. The generated shader declares
-      // the block only in that case, so this condition must match the
-      // emitter's.
-      if (lit || _sceneInputs.isNotEmpty) {
+      // the block only in that case (or when the material writes its own
+      // depth, whose projection row rides in it), so this condition must
+      // match the emitter's.
+      if (lit || _sceneInputs.isNotEmpty || _writesDepth) {
         _packEngineFragInfo(lighting, env);
         pass.bindUniform(
           shader.cachedUniformSlot('FragInfo'),
