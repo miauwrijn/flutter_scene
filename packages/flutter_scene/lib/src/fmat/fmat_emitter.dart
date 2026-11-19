@@ -305,7 +305,7 @@ String emitFragmentGlsl(
   _writeInstanceAccessors(sb, material);
 
   final uniforms = material.uniformParameters.toList();
-  final samplers = material.samplerParameters.toList();
+  final samplers = material.fragmentSamplerParameters.toList();
   if (uniforms.isNotEmpty) {
     // The vertex stage declares the same block at its highp default, and a
     // block shared by both stages must match member precision to link on
@@ -566,6 +566,14 @@ String _paramsKeepAliveScalar(FmatParameter p) {
   };
 }
 
+// A scalar read of vertex-stage sampler [p] for the vertex keep-alive. An
+// explicit LOD: the vertex stage has no derivatives for `texture()` to pick
+// one from.
+String _samplerKeepAliveScalar(FmatParameter p) =>
+    p.type == FmatType.samplerCube
+    ? 'textureLod(${p.name}, vec3(0.0, 0.0, 1.0), 0.0).x'
+    : 'textureLod(${p.name}, vec2(0.0), 0.0).x';
+
 /// The define that compiles each `engine_inputs` entry's sampler and accessors
 /// into `material_scene_inputs.glsl`. `filtered_scene_color` has none; it rides
 /// `scene_color` and brings its own include.
@@ -745,13 +753,27 @@ String _emitVertexVariant(
     sb.writeln('}');
     sb.writeln('$kMaterialParamsInstance;');
     sb.writeln();
-    // The body include folds this into the zero-bound keep-alive so the block
-    // survives even when Vertex() reads no parameter; the runtime binds it to
-    // both stages unconditionally, and binding an optimized-out block crashes
-    // the Metal backend.
+  }
+
+  // The `stage: vertex` samplers, declared here only (the fragment stage does
+  // not see them); the runtime binds them on the vertex shader.
+  final vertexSamplers = material.vertexSamplerParameters.toList();
+  for (final p in vertexSamplers) {
+    sb.writeln('uniform ${p.type.glslType} ${p.name};');
+  }
+  if (vertexSamplers.isNotEmpty) sb.writeln();
+
+  // The body include folds this into the zero-bound keep-alive so the block
+  // and the vertex samplers survive even when Vertex() reads none of them;
+  // the runtime binds them all unconditionally, and binding an optimized-out
+  // resource crashes the Metal backend.
+  final paramsKeepAlive = [
+    if (uniforms.isNotEmpty) _paramsKeepAliveScalar(uniforms.first),
+    for (final p in vertexSamplers) _samplerKeepAliveScalar(p),
+  ];
+  if (paramsKeepAlive.isNotEmpty) {
     sb.writeln(
-      '#define MATERIAL_PARAMS_KEEP_ALIVE '
-      '(${_paramsKeepAliveScalar(uniforms.first)})',
+      '#define MATERIAL_PARAMS_KEEP_ALIVE (${paramsKeepAlive.join(' + ')})',
     );
     sb.writeln();
   }
@@ -835,7 +857,7 @@ String _emitSkyGlsl(
   sb.writeln();
 
   final uniforms = material.uniformParameters.toList();
-  final samplers = material.samplerParameters.toList();
+  final samplers = material.fragmentSamplerParameters.toList();
   if (uniforms.isNotEmpty) {
     // The vertex stage declares the same block at its highp default, and a
     // block shared by both stages must match member precision to link on
@@ -979,6 +1001,7 @@ Map<String, Object?> buildSidecar(FmatMaterial material) {
           'name': p.name,
           'type': p.type.glslType,
           if (p.hint != null) 'hint': _hintJson(p.hint!),
+          if (p.isVertexSampler) 'stage': 'vertex',
         },
     ],
   };

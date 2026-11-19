@@ -898,6 +898,16 @@ FmatMaterial _build(
     );
   }
 
+  // A vertex-stage sampler is read in `Vertex()`, so it needs a vertex block.
+  final vertexSampler = parameters.where((p) => p.isVertexSampler).firstOrNull;
+  if (vertexSampler != null && vertex == null) {
+    throw FmatException(
+      'Parameter `${vertexSampler.name}` has `stage: vertex`, so the material '
+      'must declare a `vertex { }` block that reads it.',
+      fileName: fileName,
+    );
+  }
+
   if (instanceAttributes.isNotEmpty && domain != FmatDomain.surface) {
     throw FmatException(
       '`instance_attributes` is only supported in surface materials.',
@@ -1257,7 +1267,7 @@ List<FmatParameter> _buildParameters(Object? raw, String? fileName) {
       );
     }
     for (final key in entry.keys) {
-      if (!{'type', 'name', 'hint', 'default'}.contains(key)) {
+      if (!{'type', 'name', 'hint', 'default', 'stage'}.contains(key)) {
         throw FmatException(
           'Unknown parameter key `$key`.',
           fileName: fileName,
@@ -1305,6 +1315,7 @@ List<FmatParameter> _buildParameters(Object? raw, String? fileName) {
 
     final hint = _buildHint(entry['hint'], type, pname, fileName);
     final defaultValue = _buildDefault(entry['default'], type, pname, fileName);
+    final stage = _buildStage(entry['stage'], type, pname, fileName);
 
     params.add(
       FmatParameter(
@@ -1312,10 +1323,38 @@ List<FmatParameter> _buildParameters(Object? raw, String? fileName) {
         name: pname,
         hint: hint,
         defaultValue: defaultValue,
+        stage: stage,
       ),
     );
   }
   return params;
+}
+
+// A parameter's `stage:` (fragment by default). Only a sampler takes one: a
+// uniform parameter is readable in both stages already.
+FmatStage _buildStage(
+  Object? raw,
+  FmatType type,
+  String pname,
+  String? fileName,
+) {
+  if (raw == null) return FmatStage.fragment;
+  if (!type.isSampler) {
+    throw FmatException(
+      'Parameter `$pname`: only sampler parameters take a `stage`; uniform '
+      'parameters are readable in both stages.',
+      fileName: fileName,
+    );
+  }
+  final stage = switch (raw) {
+    _Ident(name: 'fragment') => FmatStage.fragment,
+    _Ident(name: 'vertex') => FmatStage.vertex,
+    _ => throw FmatException(
+      'Parameter `$pname`: `stage` must be `fragment` or `vertex`.',
+      fileName: fileName,
+    ),
+  };
+  return stage;
 }
 
 void _validateParamName(String name, String? fileName) {

@@ -384,6 +384,9 @@ class PreprocessedMaterial extends Material implements HotReloadableFmat {
     // even when Vertex() reads no parameter; binding an optimized-out block
     // crashes the Metal backend.
     parameters.bindUniformBlock(pass, vertexShader, transientsBuffer);
+    // The `stage: vertex` samplers, which only the vertex variant declares
+    // (folded into the same keep-alive).
+    parameters.bindVertexSamplers(pass, vertexShader);
     // Bind the keep-alive block (name must match kVertexKeepAliveBlock in the
     // emitter) to zero: the generated shader multiplies the mesh inputs by it
     // so the optimizer cannot strip a declared attribute when a Vertex() hook
