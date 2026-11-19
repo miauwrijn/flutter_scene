@@ -116,6 +116,7 @@ class ShadowPass extends RenderGraphPass {
     ByteData? shadowUniform,
     ShadowCachePlan? cachePlan,
     SharedShadowAtlas? shared,
+    DirectionalLight? cookieLight,
   }) : assert(shared == null || cascades.isEmpty),
        _renderScene = renderScene,
        _cascades = cascades,
@@ -128,7 +129,15 @@ class ShadowPass extends RenderGraphPass {
        _pointShadows = pointShadows,
        _shadowUniform = shadowUniform,
        _cachePlan = cachePlan,
-       _shared = shared;
+       _shared = shared,
+       _cookieLight =
+           hasShadowCookieTile(cookieLight, hasCascades: cascades.isNotEmpty)
+           ? cookieLight
+           : null;
+
+  // The directional light whose cookie rides the atlas as its last tile, or
+  // null for none (see DirectionalLight.cookie).
+  final DirectionalLight? _cookieLight;
 
   final RenderScene _renderScene;
   final List<ShadowCascade> _cascades;
@@ -168,6 +177,8 @@ class ShadowPass extends RenderGraphPass {
       baseShaderLibrary['FullscreenVertex']!;
   static final gpu.Shader _copyFragmentShader =
       baseShaderLibrary['ShadowCopyFragment']!;
+  static final gpu.Shader _cookieFragmentShader =
+      baseShaderLibrary['ShadowCookieFragment']!;
 
   // Two triangles of NDC positions covering the viewport (6 vec2s).
   static final gpu.DeviceBuffer _quadBuffer = gpu.gpuContext
@@ -208,8 +219,12 @@ class ShadowPass extends RenderGraphPass {
 
     final spotCount = _spotShadows?.matrices.length ?? 0;
     final pointCount = _pointShadows?.casters.length ?? 0;
+    final cookieTiles = _cookieLight == null ? 0 : 1;
     final totalTiles =
-        _cascades.length + spotCount + pointCount * kPointShadowTilesPerLight;
+        _cascades.length +
+        spotCount +
+        pointCount * kPointShadowTilesPerLight +
+        cookieTiles;
     final atlasWidth = _tileResolution * totalTiles;
     // fp32 (not fp16): the far cascade's orthographic depth range spans
     // hundreds of world units, and fp16's ~11-bit mantissa quantizes
@@ -369,6 +384,16 @@ class ShadowPass extends RenderGraphPass {
       }
     }
 
+    final cookieLight = _cookieLight;
+    if (cookieLight != null) {
+      _encodeCookieTile(
+        renderPass,
+        context.transientsBuffer,
+        totalTiles - 1,
+        cookieLight,
+      );
+    }
+
     rendererSubmissions.submit(commandBuffer);
     context.blackboard.set(kShadowMapBlackboardKey, color);
     final spotFrame = _spotShadows;
@@ -450,6 +475,55 @@ class ShadowPass extends RenderGraphPass {
       if (deferredPipelineBuilds > deferred) entry.hasContent = false;
     }
   }
+
+  /// Copies [light]'s cookie into atlas [tile] with its strength applied, the
+  /// visibility factor the lit shaders read (see shadow_cookie.glsl).
+  void _encodeCookieTile(
+    gpu.RenderPass pass,
+    TransientWriter transients,
+    int tile,
+    DirectionalLight light,
+  ) {
+    pass.setViewport(
+      gpu.Viewport(
+        x: tile * _tileResolution,
+        y: 0,
+        width: _tileResolution,
+        height: _tileResolution,
+      ),
+    );
+    pass.clearBindings();
+    pass.bindPipeline(
+      resolvePipeline(_copyVertexShader, _cookieFragmentShader),
+    );
+    pass.setColorBlendEnable(false);
+    pass.setCullMode(gpu.CullMode.none);
+    pass.setDepthWriteEnable(false);
+    pass.setDepthCompareOperation(gpu.CompareFunction.always);
+    bindVertexBufferCompat(pass, _quadView, 6);
+    pass.bindTexture(
+      _cookieFragmentShader.cachedUniformSlot('cookie_texture'),
+      light.cookie!,
+      sampler: _cookieSampler,
+    );
+    _cookieInfo[0] = light.cookieStrength.clamp(0.0, 1.0);
+    pass.bindUniform(
+      _cookieFragmentShader.cachedUniformSlot('CookieInfo'),
+      transients.emplace(ByteData.sublistView(_cookieInfo)),
+    );
+    drawCompat(pass, 6);
+  }
+
+  static final Float32List _cookieInfo = Float32List(4);
+
+  // The copy resamples the cookie to the tile resolution; the lit shader
+  // then filters the tile by hand.
+  static final gpu.SamplerOptions _cookieSampler = gpu.SamplerOptions(
+    minFilter: gpu.MinMagFilter.linear,
+    magFilter: gpu.MinMagFilter.linear,
+    widthAddressMode: gpu.SamplerAddressMode.repeat,
+    heightAddressMode: gpu.SamplerAddressMode.repeat,
+  );
 
   /// Replays cascade [tile]'s cached static content into its atlas slot,
   /// writing the stored depth to both the color channel and the fragment

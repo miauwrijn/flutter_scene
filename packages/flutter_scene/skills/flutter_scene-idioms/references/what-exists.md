@@ -322,7 +322,11 @@ Lights (all in `light.dart`, all fields mutable):
   = 4, shadowMaxDistance = 150.0, shadowCascadeSplitLambda = 0.6, shadowMapResolution = 1024,
   shadowDepthBias = 0.02, shadowNormalBias = 0.02, shadowAmbientStrength = 0.0, shadowFilter =
   rotatedPoisson, shadowCasterFaces = front, contactShadows = false, contactShadowDistance = 0.3,
-  angularRadius = 0.005})`.
+  angularRadius = 0.005, cookie, cookieSize /*(100,100)*/, cookieOffset, cookieRepeat = true,
+  cookieStrength = 1.0})`. `cookie` is a light cookie: a texture (red = visibility) projected along
+  the light that scales its direct light (cloud shadows, canopy dapple). It needs `castsShadow` and
+  rides the shadow atlas as one extra tile, so it costs no texture unit; `cookieUv(point, direction)`
+  gives the texture coordinate a world point samples, for rendering a matching cookie.
 - `PointLight({color, intensity = 1.0, range = 0.0, falloffExponent = 2.0, castsShadow = false,
   shadowMapResolution = 512, shadowNear = 0.1, shadowDepthBias = 0.0, shadowNormalBias = 0.1,
   shadowSoftness = 1.0, shadowCasterFaces = front})`. Shadows render six cube faces into the shared
