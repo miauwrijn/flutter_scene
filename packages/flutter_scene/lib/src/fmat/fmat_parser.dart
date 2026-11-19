@@ -564,6 +564,7 @@ FmatMaterial _build(
     'culling',
     'depth_write',
     'effects_depth',
+    'depth_offset',
     'depth_test',
     'depth_layer',
     'parameters',
@@ -629,6 +630,21 @@ FmatMaterial _build(
     throw FmatException(
       '`effects_depth` is for translucent materials; opaque ones already '
       'write depth.',
+      fileName: fileName,
+    );
+  }
+
+  final depthOffsetValue = tree['depth_offset'];
+  if (depthOffsetValue != null && depthOffsetValue is! bool) {
+    throw FmatException(
+      '`depth_offset` must be a boolean.',
+      fileName: fileName,
+    );
+  }
+  final depthOffset = depthOffsetValue as bool? ?? false;
+  if (depthOffset && domain == FmatDomain.sky) {
+    throw FmatException(
+      '`depth_offset` applies to surface materials; a sky writes no depth.',
       fileName: fileName,
     );
   }
@@ -934,6 +950,7 @@ FmatMaterial _build(
     culling: culling,
     depthWrite: depthWrite,
     effectsDepth: effectsDepth,
+    depthOffset: depthOffset,
     depthTest: depthTest,
     depthLayer: depthLayer,
     parameters: parameters,
