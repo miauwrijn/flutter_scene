@@ -1,5 +1,6 @@
 ## 0.24.4
 
+* `buildMaterials` takes `includeDirectories`, directories of the app's own GLSL put on the include path after flutter_scene's `shaders/`, so `.fmat` materials can share code through `#include`. Editing a `.glsl` file in them recompiles the materials.
 * A `PolylineGeometry` draws without the app calling `updateForCamera` each frame, which is deprecated and does nothing. Its strip is expanded in a vertex shader for whichever camera renders it, so every view of a scene sees it face on, and it follows its node's transform.
 * BREAKING: `PolylineGeometry` extends `Geometry`, not `MeshGeometry`, and a raycast no longer hits it.
 * `SceneView.errorBuilder` shows a failed engine resource load (such as a shader bundle a web build could not fetch) with a `retry` callback, instead of leaving the view on its loading widget.
