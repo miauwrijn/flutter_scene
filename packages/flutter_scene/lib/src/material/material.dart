@@ -7,7 +7,8 @@ import 'dart:typed_data';
 import 'package:vector_math/vector_math.dart' show Matrix4, Vector3;
 
 import 'package:flutter_scene/src/render/depth_raster.dart';
-import 'package:flutter_scene/src/fmat/fmat_ast.dart' show DepthSurfaceKind;
+import 'package:flutter_scene/src/fmat/fmat_ast.dart'
+    show DepthSurfaceKind, MaskSurfaceKind;
 import 'package:flutter_scene/src/generated_assets/generated_assets.dart'
     show debugViewsEntrySuffix;
 import 'package:flutter_scene/src/gpu/gpu.dart' as gpu;
@@ -933,6 +934,141 @@ abstract class Material {
     gpu.Shader shader,
     TransientWriter transientsBuffer,
   ) {}
+
+  /// The material's own fragment for the [kind] object mask
+  /// (`MaskContent.albedo` or `MaskContent.normal`), or null to use the
+  /// engine's. A `.fmat` with `mask_surface: true` supplies both, each
+  /// running its `Surface()`, bound through [bindDepthSurface] plus the
+  /// mask's `MaskInfo` color.
+  @internal
+  gpu.Shader? maskSurfaceShader(MaskSurfaceKind kind) => null;
+
+  /// Binds what the surface-content object mask shaders
+  /// (`MaskAlbedoFragment`, `MaskNormalFragment`, see `MaskContent`) read:
+  /// the base color texture with its factor and UV transform, and the normal
+  /// map with its scale, in the `MaskSurfaceInfo` block. The base material
+  /// has neither, so it binds a white base color and the geometric normal;
+  /// materials with textures override.
+  ///
+  /// [baseColor] and [normal] say which samplers [shader] declares. Each
+  /// mask shader declares only the ones it reads, and binding a sampler a
+  /// shader does not have fails.
+  @internal
+  void bindMaskSurface(
+    gpu.RenderPass pass,
+    gpu.Shader shader,
+    TransientWriter transientsBuffer, {
+    required bool baseColor,
+    required bool normal,
+  }) {
+    bindMaskSurfaceInputs(
+      pass,
+      shader,
+      transientsBuffer,
+      bindBaseColor: baseColor,
+      bindNormal: normal,
+      color: const [1.0, 1.0, 1.0],
+      vertexColorWeight: 0.0,
+      baseColorTexture: null,
+      baseColorSampler: null,
+      normalTexture: null,
+      normalSampler: null,
+      normalScale: 1.0,
+    );
+  }
+
+  // One block per isolate, refilled per draw (emplace copies it into the
+  // frame's transients).
+  static final Float32List _maskSurfaceInfo = Float32List(24);
+
+  /// Scratch for a [bindMaskSurface] override's color and UV transform
+  /// records, valid until it calls [bindMaskSurfaceInputs] (which copies
+  /// them), so a mask pass allocates nothing per drawn object.
+  @internal
+  static final Float32List maskColorScratch = Float32List(3),
+      maskBaseTransformScratch = Float32List(8),
+      maskNormalTransformScratch = Float32List(8);
+
+  /// Packs the `MaskSurfaceInfo` block and binds the samplers [shader]
+  /// declares ([bindBaseColor], [bindNormal]), with the neutral placeholders
+  /// standing in for missing textures. The transforms are the packed
+  /// offset/scale + cos/sin/channel records (eight floats, see
+  /// `packTextureTransformRecord`), identity when null. A positive
+  /// [alphaCutoff] cuts the mask to the material's coverage, with
+  /// [vertexAlphaWeight] of the vertex alpha multiplied in.
+  @internal
+  static void bindMaskSurfaceInputs(
+    gpu.RenderPass pass,
+    gpu.Shader shader,
+    TransientWriter transientsBuffer, {
+    required bool bindBaseColor,
+    required bool bindNormal,
+    required List<double> color,
+    required double vertexColorWeight,
+    required gpu.Texture? baseColorTexture,
+    required gpu.SamplerOptions? baseColorSampler,
+    required gpu.Texture? normalTexture,
+    required gpu.SamplerOptions? normalSampler,
+    required double normalScale,
+    Float32List? baseColorTransform,
+    Float32List? normalTransform,
+    double alphaCutoff = 0.0,
+    double vertexAlphaWeight = 0.0,
+  }) {
+    final info = _maskSurfaceInfo..fillRange(0, 24, 0.0);
+    info
+      ..[0] = color[0]
+      ..[1] = color[1]
+      ..[2] = color[2]
+      ..[3] = vertexColorWeight
+      // Identity transforms: offset 0, scale 1, cos 1, sin 0, channel 0.
+      ..[6] = 1
+      ..[7] = 1
+      ..[8] = 1
+      ..[14] = 1
+      ..[15] = 1
+      ..[16] = 1
+      ..[20] = normalTexture != null ? 1.0 : 0.0
+      ..[21] = normalScale
+      ..[22] = alphaCutoff
+      ..[23] = vertexAlphaWeight;
+    if (baseColorTransform != null) {
+      info.setRange(4, 12, baseColorTransform);
+    }
+    if (normalTransform != null) {
+      info.setRange(12, 20, normalTransform);
+    }
+    pass.bindUniform(
+      shader.cachedUniformSlot('MaskSurfaceInfo'),
+      transientsBuffer.emplace(scratchBytesOf(info)),
+    );
+    if (bindBaseColor) {
+      pass.bindTexture(
+        shader.cachedUniformSlot('base_color_texture'),
+        whitePlaceholder(baseColorTexture),
+        sampler: samplerOrPlaceholder(
+          baseColorTexture,
+          baseColorSampler ?? _maskRepeatSampler,
+        ),
+      );
+    }
+    if (bindNormal) {
+      pass.bindTexture(
+        shader.cachedUniformSlot('normal_texture'),
+        normalPlaceholder(normalTexture),
+        sampler: samplerOrPlaceholder(
+          normalTexture,
+          normalSampler ?? _maskRepeatSampler,
+        ),
+      );
+    }
+  }
+
+  // Material textures tile; sample them with repeat.
+  static final gpu.SamplerOptions _maskRepeatSampler = gpu.SamplerOptions(
+    widthAddressMode: gpu.SamplerAddressMode.repeat,
+    heightAddressMode: gpu.SamplerAddressMode.repeat,
+  );
 }
 
 // The entry each base library shader was resolved from, and its twin built

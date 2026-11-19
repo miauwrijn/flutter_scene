@@ -140,6 +140,16 @@ class PreprocessedMaterial extends Material implements HotReloadableFmat {
     Map<String, Object?> metadata,
     gpu.Shader? Function(String entryName) shaderFor,
   ) {
+    // The object masks' own fragments ride the same lookup (see
+    // [maskSurfaceShader]).
+    final masks = metadata['mask_surface'];
+    _maskSurfaceShaders = masks is! Map
+        ? null
+        : {
+            for (final kind in MaskSurfaceKind.values)
+              if (masks[kind.sidecarKey] case final String entry)
+                if (shaderFor(entry) case final gpu.Shader shader) kind: shader,
+          };
     final meta = metadata['depth_surface'];
     if (meta is! Map) {
       setDepthSurfaceShaders(null);
@@ -164,6 +174,13 @@ class PreprocessedMaterial extends Material implements HotReloadableFmat {
   @internal
   gpu.Shader? depthSurfaceShader(DepthSurfaceKind kind) =>
       _depthSurfaceShaders?[kind];
+
+  Map<MaskSurfaceKind, gpu.Shader>? _maskSurfaceShaders;
+
+  @override
+  @internal
+  gpu.Shader? maskSurfaceShader(MaskSurfaceKind kind) =>
+      _maskSurfaceShaders?[kind];
 
   @override
   @internal
