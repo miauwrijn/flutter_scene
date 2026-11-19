@@ -195,6 +195,11 @@ class MeshGeometry extends UnskinnedGeometry {
   /// subset changes). It keeps no CPU data, so it cannot be raycast or
   /// extracted, and it cannot be [rebuild]t; change what it draws with
   /// [setIndexData]. Every index must be less than `source.vertexCount`.
+  ///
+  /// [source] owns the vertex buffers, so keep it alive for as long as this
+  /// geometry draws. The streams are shared as [source] holds them now: a
+  /// later [rebuild] of [source] uploads new buffers that this geometry does
+  /// not follow.
   MeshGeometry.sharingVertices(MeshGeometry source, {List<int>? indices})
     : storage = GeometryStorage.fixed,
       retainCpuData = false {
