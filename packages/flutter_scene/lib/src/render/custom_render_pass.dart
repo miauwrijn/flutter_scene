@@ -182,8 +182,9 @@ class RenderPassContext {
     this._renderScene,
     this._viewLayerMask,
     this._passKey,
-    this._time,
-  );
+    this._time, {
+    this.primaryView = false,
+  });
 
   final RenderGraphContext _context;
 
@@ -195,6 +196,10 @@ class RenderPassContext {
 
   /// The render-target size in physical pixels.
   final ui.Size dimensions;
+
+  /// Whether this pass renders for a screen view's camera (false for texture
+  /// views and reflection captures), as mesh draw selectors see it.
+  final bool primaryView;
 
   final gpu.Texture _destination;
   final RenderScene _renderScene;
@@ -397,6 +402,7 @@ class RenderPassContext {
               final node = item.sourceNode;
               return node == null ? fill : colorOf(node);
             },
+      primaryView: primaryView,
     );
     return mask;
   }
@@ -486,7 +492,9 @@ class UserRenderGraphPass extends RenderGraphPass {
     required int viewLayerMask,
     required int passIndex,
     required double time,
+    bool primaryView = false,
   }) : _pass = pass,
+       _primaryView = primaryView,
        _camera = camera,
        _dimensions = dimensions,
        _destination = destination,
@@ -503,6 +511,7 @@ class UserRenderGraphPass extends RenderGraphPass {
   final int _viewLayerMask;
   final int _passIndex;
   final double _time;
+  final bool _primaryView;
 
   @override
   String get name => _pass.name;
@@ -519,6 +528,7 @@ class UserRenderGraphPass extends RenderGraphPass {
       _viewLayerMask,
       '${_pass.stage.name}_$_passIndex',
       _time,
+      primaryView: _primaryView,
     );
     _pass.execute(passContext);
     if (passContext._wrote) {
