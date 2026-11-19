@@ -8,6 +8,8 @@
 // material_engine_lighting.glsl.
 
 #ifndef FLUTTER_SCENE_SKIP_SHADOWS
+#include <shadow_cookie.glsl>
+
 // One rotated Poisson-disk PCF tap into a cascade's atlas tile.
 // Samples the caster depth for the soft-shadow blocker search, with the
 // same tile mapping as ShadowTap and no comparison.
@@ -333,6 +335,17 @@ float SampleShadow(highp vec3 world_pos, vec3 n) {
   // Weight no cascade covered reads as lit.
   float shadow = shadow_sum + (1.0 - weight);
   return mix(shadow, 1.0, fade);
+}
+
+// The directional light's cookie at [world_pos] (1 = unaffected): the last
+// tile of the shadow atlas, when the light has one (see shadow_cookie.glsl).
+float SampleDirectionalCookie(highp vec3 world_pos) {
+  highp float total =
+      frag_info.shadow_cascade_count + frag_info.spot_shadow_params.x;
+  return SampleShadowCookie(
+      shadow_map, world_pos, frag_info.directional_light_direction.xyz,
+      frag_info.directional_cookie, frag_info.directional_cookie_transform,
+      total - 1.0, total, 1.0 / frag_info.shadow_texel_size);
 }
 #endif
 

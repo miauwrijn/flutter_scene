@@ -1,6 +1,8 @@
 ## 0.24.4
 
 * God rays sample the directional light's shadow cascades where they are in the shared shadow atlas. They divided the atlas by the cascade count alone, so once a spot or point light cast shadows the shafts read the wrong part of the atlas.
+* `DirectionalLight.cookie` projects a texture along the light that scales its direct light, like a light cookie: drifting cloud shadows, dappled light under a canopy. `cookieSize`, `cookieOffset` (for scrolling), `cookieRepeat` and `cookieStrength` place it, and `cookieUv` gives the texture coordinate a world point samples, for rendering a matching cookie. It needs a shadow-casting light and rides the shadow atlas as one extra tile, so it costs no texture unit, and a light without a cookie draws as before. God rays follow it.
+* God rays sample the right shadow tiles when spot or point lights also cast shadows. They divided the atlas by the cascade count alone, which misplaced every cascade lookup once the atlas held more tiles.
 * A `PolylineGeometry` draws without the app calling `updateForCamera` each frame, which is deprecated and does nothing. Its strip is expanded in a vertex shader for whichever camera renders it, so every view of a scene sees it face on, and it follows its node's transform.
 * BREAKING: `PolylineGeometry` extends `Geometry`, not `MeshGeometry`, and a raycast no longer hits it.
 * `SceneView.errorBuilder` shows a failed engine resource load (such as a shader bundle a web build could not fetch) with a `retry` callback, instead of leaving the view on its loading widget.
