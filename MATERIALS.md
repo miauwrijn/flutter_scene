@@ -979,6 +979,21 @@ The generated shaders `#include` flutter_scene's framework GLSL; the hook puts
 that directory on `impellerc`'s include path for you, so nothing is copied into
 your project.
 
+To share GLSL of your own between materials, pass the directories that hold it
+as `includeDirectories`; a material's `fragment` or `vertex` block can then
+`#include <your_file.glsl>`. They are searched after flutter_scene's own
+`shaders/`, so give your files names the engine does not use. Every `.glsl`
+file directly in them is a dependency of the build, so editing one recompiles
+the materials.
+
+```dart
+await buildMaterials(
+  buildInput: input,
+  buildOutput: output,
+  includeDirectories: [input.packageRoot.resolve('shaders/include/')],
+);
+```
+
 You can call `buildMaterials` alongside `buildScenes` and
 `buildShaderBundleJson` in the same hook.
 
