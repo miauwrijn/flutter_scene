@@ -34,15 +34,19 @@ uniform PostCameraInfo {
 cam;
 
 // Per-cascade world->light-clip matrices, view-space split distances, the light
-// travel direction (xyz) with the cascade count in w, and the light color with
-// the atlas tile count in w.
+// travel direction (xyz) with the cascade count in w, the light color with the
+// atlas tile count in w, and the light's cookie (see shadow_cookie.glsl).
 uniform PostShadowInfo {
   mat4 light_space_matrix[4];
   vec4 cascade_splits;
   vec4 light_direction;
   vec4 light_color;
+  vec4 cookie;
+  vec4 cookie_transform;
 }
 shadow;
+
+#include <shadow_cookie.glsl>
 
 // params0: (intensity, density, anisotropy g, step count).
 // params1: (max distance, jitter, -, -). color: rgb tint * the light color.
@@ -93,8 +97,8 @@ vec3 ViewPositionAt(vec2 uv) {
   }
 
 // Sunlight visibility at world point P (1 lit, 0 shadowed). Points outside all
-// cascades are treated as lit. [tiles] is the atlas's tile count: spot and
-// point shadow tiles share the strip after the cascades.
+// cascades are treated as lit. [tiles] is the atlas's tile count, which spot,
+// point and cookie tiles add to.
 float ShadowVisibility(vec3 p, int count, int tiles) {
   float result = 1.0;
   TRY_CASCADE(0, p, tiles, result);
@@ -150,14 +154,21 @@ void main() {
   // the in-scatter into the first step near the camera; density scales the
   // overall thickness.
   int count = int(shadow.light_direction.w + 0.5);
-  // Older packings leave w at zero: the cascades alone then.
   int tiles = shadow.light_color.w > 0.5 ? int(shadow.light_color.w + 0.5)
                                          : count;
+  float tile_res = float(textureSize(input_shadow, 0).y);
   float lit_sum = 0.0;
   for (int i = 0; i < kMaxSteps; i++) {
     if (i >= steps) break;
     vec3 p = ray_origin + ray_dir * (offset + float(i) * step_len);
-    lit_sum += ShadowVisibility(p, count, tiles);
+    float lit = ShadowVisibility(p, count, tiles);
+    // The light's cookie shapes the shafts as it shapes the lit surfaces.
+    if (lit > 0.0) {
+      lit *= SampleShadowCookie(input_shadow, p, shadow.light_direction.xyz,
+                                shadow.cookie, shadow.cookie_transform,
+                                float(tiles - 1), float(tiles), tile_res);
+    }
+    lit_sum += lit;
   }
   float avg_lit = lit_sum / float(steps);
 

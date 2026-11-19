@@ -92,6 +92,16 @@ enum DirectionalShadowFilter {
   bilinearPcf,
 }
 
+/// Whether the shadow atlas carries a cookie tile for [light]: it has a
+/// [DirectionalLight.cookie] and casts cascaded shadows this frame
+/// ([hasCascades]). The shadow pass appends the tile and the lit shaders
+/// read it on exactly this condition.
+@internal
+bool hasShadowCookieTile(
+  DirectionalLight? light, {
+  required bool hasCascades,
+}) => hasCascades && light?.cookie != null;
+
 /// An infinitely-distant light source (e.g. the sun) that illuminates
 /// the whole scene from a single direction.
 ///
@@ -145,8 +155,15 @@ class DirectionalLight {
     this.angularRadius = 0.005,
     this.channelMask = 0xFF,
     this.shadowCasterChannelMask = 0xFF,
+    this.cookie,
+    Vector2? cookieSize,
+    Vector2? cookieOffset,
+    this.cookieRepeat = true,
+    this.cookieStrength = 1.0,
   }) : direction = direction ?? defaultDirection,
-       color = color ?? Vector3(1.0, 1.0, 1.0);
+       color = color ?? Vector3(1.0, 1.0, 1.0),
+       cookieSize = cookieSize ?? Vector2(100.0, 100.0),
+       cookieOffset = cookieOffset ?? Vector2.zero();
 
   /// The direction the light travels, in world space (from the light
   /// toward the scene). Need not be unit length.
@@ -317,6 +334,70 @@ class DirectionalLight {
   /// illuminates.
   /// {@category Lighting and environment}
   int shadowCasterChannelMask;
+
+  /// A texture projected along the light that scales its direct light, like
+  /// a light cookie or gobo: drifting cloud shadows, dappled light under a
+  /// canopy, a window's pattern. The red channel is the visibility (1 lets
+  /// all the light through, 0 none). It multiplies the cast shadow, so the
+  /// ambient follows it only as far as [shadowAmbientStrength] darkens the
+  /// ambient under a cast shadow.
+  ///
+  /// The cookie is projected orthographically along the light's travel
+  /// direction; see [cookieUv] for where a world point samples it. It is
+  /// copied into one extra tile of the shadow atlas each frame (at
+  /// [shadowMapResolution]), so it applies only while the light casts
+  /// cascaded shadows ([castsShadow]) and costs no extra texture unit in the
+  /// lit shaders. A light without a cookie draws exactly as before.
+  ///
+  /// Applies to the scene's primary (shadow-casting) directional light.
+  /// {@category Lighting and environment}
+  gpu.Texture? cookie;
+
+  /// The world-space extent the [cookie] texture spans across the light's
+  /// view (its `u` and `v` axes; see [cookieUv]). Defaults to 100 x 100.
+  Vector2 cookieSize;
+
+  /// Shifts the [cookie] in the light's view plane, in world units (see
+  /// [cookieUv]). Advance it over time to scroll the pattern, such as clouds
+  /// drifting with the wind.
+  Vector2 cookieOffset;
+
+  /// Whether the [cookie] tiles beyond its [cookieSize] (the default). When
+  /// false, points outside it are unaffected by the cookie.
+  bool cookieRepeat;
+
+  /// How strongly the [cookie] applies, from 0 (no effect) to 1 (the
+  /// default, its full value).
+  double cookieStrength;
+
+  /// The [cookie] texture coordinate a world-space [point] samples, for a
+  /// light travelling along [travelDirection] (the light's world direction;
+  /// need not be unit length). Use it to render a cookie that matches world
+  /// content, such as cloud density seen from the ground.
+  ///
+  /// The projection is orthographic along the travel direction `L`:
+  ///
+  /// ```text
+  /// right = normalize(cross((0, 0, 1), L))   // (1, 0, 0) for a light straight down
+  /// up    = cross(L, right)                  // (0, 0, 1) for a light straight down
+  /// uv    = ((dot(point, right), dot(point, up)) + cookieOffset) / cookieSize
+  /// ```
+  ///
+  /// A light travelling along the world Z axis uses `(1, 0, 0)` in place of
+  /// `(0, 0, 1)` as the reference. `uv` (0, 0) is the cookie's first texel,
+  /// as sampled with `texture()`; with [cookieRepeat] the coordinate wraps.
+  Vector2 cookieUv(Vector3 point, Vector3 travelDirection) {
+    final l = travelDirection.normalized();
+    final reference = l.z.abs() > 0.999
+        ? Vector3(1.0, 0.0, 0.0)
+        : Vector3(0.0, 0.0, 1.0);
+    final right = reference.cross(l)..normalize();
+    final up = l.cross(right);
+    return Vector2(
+      (point.dot(right) + cookieOffset.x) / cookieSize.x,
+      (point.dot(up) + cookieOffset.y) / cookieSize.y,
+    );
+  }
 
   /// Builds the [shadowCascadeCount] shadow cascades that cover
   /// [camera]'s view out to [shadowMaxDistance], for a render target of

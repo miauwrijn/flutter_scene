@@ -3704,6 +3704,7 @@ base class Scene implements SceneGraph {
           spotShadows: spotShadowFrame,
           pointShadows: pointShadowFrame,
           cachePlan: shadowCachePlan,
+          cookieLight: cascades.isNotEmpty ? light : null,
           shared:
               cascades.isEmpty &&
                   (view.target != null || identical(view, _sharedShadowAnchor))
@@ -3718,12 +3719,13 @@ base class Scene implements SceneGraph {
                   effectiveCascades,
                   lightDirection ?? light!.direction,
                   light!.color * light.intensity,
-                  // The whole strip, which spot and point shadows share.
                   totalTiles:
                       effectiveCascades.length +
                       (spotShadowFrame?.matrices.length ?? 0) +
                       (pointShadowFrame?.casters.length ?? 0) *
-                          kPointShadowTilesPerLight,
+                          kPointShadowTilesPerLight +
+                      (hasShadowCookieTile(light, hasCascades: true) ? 1 : 0),
+                  cookieLight: light,
                 )
               : null,
         ),
