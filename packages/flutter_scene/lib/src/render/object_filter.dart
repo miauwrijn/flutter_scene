@@ -1,3 +1,4 @@
+import 'package:flutter_scene/src/fmat/fmat_ast.dart' show MaskSurfaceKind;
 import 'dart:typed_data';
 
 import 'package:flutter_scene/src/render/viewport_camera.dart';
@@ -53,6 +54,33 @@ class NodeFilter {
   }
 }
 
+/// What an object-filtered draw writes for each covered pixel (see
+/// `RenderPassContext.drawObjects`).
+///
+/// {@category Rendering}
+enum MaskContent {
+  /// The per-item color as given: a flat silhouette.
+  flat,
+
+  /// The per-item color multiplied by the material's linear base color as
+  /// it shades with it (factor, texture and weighted vertex color), so a
+  /// pass can work with each surface's own albedo at full resolution. Alpha
+  /// is the per-item color's alpha.
+  ///
+  /// `PhysicallyBasedMaterial` supplies its inputs. A `.fmat` material
+  /// declares `mask_surface: true` to fill it by its own `Surface()`; other
+  /// materials draw white.
+  albedo,
+
+  /// The material's world-space shading normal (the geometric normal
+  /// perturbed by its normal map, as the color pass lights with), encoded
+  /// `n * 0.5 + 0.5` in rgb. Alpha is the per-item color's alpha; the
+  /// per-item rgb is ignored. Materials without a normal map write the
+  /// geometric normal; a `.fmat` material declares `mask_surface: true` to
+  /// write the `material.normal` its own `Surface()` computes.
+  normal,
+}
+
 /// Draws a filtered set of the scene's geometry flat into [target], each
 /// item filled with a solid color (coverage in alpha), with its own cleared
 /// depth so the filtered objects self-occlude but are not occluded by the
@@ -99,6 +127,9 @@ void renderObjectMask({
   // position-only one, to reproduce the color pass's depth exactly, and cuts
   // alpha-masked materials to their coverage as the depth passes do.
   bool fullVertex = false,
+  // What a covered pixel holds. The surface contents sample the material
+  // through the full varyings, so they imply [fullVertex].
+  MaskContent content = MaskContent.flat,
 }) {
   final renderTarget = gpu.RenderTarget.singleColor(
     gpu.ColorAttachment(texture: target, clearValue: clearColor),
@@ -123,7 +154,8 @@ void renderObjectMask({
     include,
     nudge,
     pixelSlope,
-    fullVertex,
+    fullVertex || content != MaskContent.flat,
+    content,
   );
   if (reverseOrder) {
     final visible = <RenderItem>[];
@@ -156,6 +188,7 @@ class _ObjectMaskEncoder {
     this._nudge,
     this._pixelSlope,
     this._fullVertex,
+    this._content,
   ) {
     _renderPass.setDepthWriteEnable(true);
     _renderPass.setColorBlendEnable(false);
@@ -177,10 +210,28 @@ class _ObjectMaskEncoder {
   final double Function(RenderItem item)? _nudge;
   final double _pixelSlope;
   final bool _fullVertex;
+  final MaskContent _content;
+
+  // The view's world-space forward axis, for a material's own surface
+  // fragment (see Material.bindDepthSurface): the view-projection's fourth
+  // row minus its third, as near as a mask needs it.
+  late final Vector3 _cameraForward = () {
+    final m = _cameraTransform;
+    final f = Vector3(
+      m.entry(3, 0) - m.entry(2, 0),
+      m.entry(3, 1) - m.entry(2, 1),
+      m.entry(3, 2) - m.entry(2, 2),
+    );
+    return f.length2 > 0 ? f.normalized() : Vector3(0, 0, -1);
+  }();
 
   static final gpu.Shader _maskShader = baseShaderLibrary['MaskFragment']!;
   static final gpu.Shader _maskedMaskShader =
       baseShaderLibrary['MaskMaskedFragment']!;
+  static final gpu.Shader _albedoShader =
+      baseShaderLibrary['MaskAlbedoFragment']!;
+  static final gpu.Shader _normalShader =
+      baseShaderLibrary['MaskNormalFragment']!;
   static final Vector4 _white = Vector4(1, 1, 1, 1);
 
   final Frustum frustum;
@@ -213,15 +264,43 @@ class _ObjectMaskEncoder {
         ? item.material.vertexAttributesFor(materialVertex)
         : VertexAttributeSchema.none;
     geometry.useVertexAttributes(attributes);
-    // The masked fragment reads the full-vertex varyings.
-    final masked = _fullVertex && item.material.depthAlphaMasked;
-    final fragmentShader = masked ? _maskedMaskShader : _maskShader;
+    // The full vertex stage runs the material's color vertex variant, which
+    // declares its per-instance attribute inputs, so the instance record is
+    // as wide here as in the color pass.
+    final instanceSchema = depthVertex == null
+        ? item.material.instanceAttributes
+        : null;
+    final attributeFloats = instanceSchema?.floatCount ?? 0;
+    // The surface contents cut a cut-out material themselves (their
+    // MaskSurfaceInfo carries its coverage test); the flat fill reuses the
+    // depth passes' masked fragment. Both read the full-vertex varyings.
+    final surfaceContent = _content != MaskContent.flat;
+    final masked =
+        !surfaceContent && _fullVertex && item.material.depthAlphaMasked;
+    // A material that fills a surface mask by its own Surface() (a `.fmat`
+    // with `mask_surface: true`) draws it with that fragment instead.
+    final ownSurface = switch (_content) {
+      MaskContent.albedo => item.material.maskSurfaceShader(
+        MaskSurfaceKind.albedo,
+      ),
+      MaskContent.normal => item.material.maskSurfaceShader(
+        MaskSurfaceKind.normal,
+      ),
+      MaskContent.flat => null,
+    };
+    final fragmentShader =
+        ownSurface ??
+        switch (_content) {
+          MaskContent.albedo => _albedoShader,
+          MaskContent.normal => _normalShader,
+          MaskContent.flat => masked ? _maskedMaskShader : _maskShader,
+        };
     final pipeline = resolvePipeline(
       activeVertex,
       fragmentShader,
       vertexLayout:
           depthVertex?.layout ??
-          geometry.instancedVertexLayoutFor(null, attributes),
+          geometry.instancedVertexLayoutFor(instanceSchema, attributes),
     );
     if (!identical(_boundPipeline, pipeline)) {
       _renderPass.bindPipeline(pipeline);
@@ -253,6 +332,27 @@ class _ObjectMaskEncoder {
         _renderPass,
         fragmentShader,
         _transientsBuffer,
+      );
+    }
+    if (ownSurface != null) {
+      // The material's parameters and the engine blocks its Surface() may
+      // read, as for its depth-surface variants.
+      item.material.bindDepthSurface(
+        _renderPass,
+        fragmentShader,
+        _transientsBuffer,
+        cameraPosition: _cameraPosition,
+        cameraForward: _cameraForward,
+      );
+    } else if (surfaceContent) {
+      // Both surface shaders read the base color (its alpha is the cut-out
+      // test); only the normal one declares the normal map.
+      item.material.bindMaskSurface(
+        _renderPass,
+        fragmentShader,
+        _transientsBuffer,
+        baseColor: true,
+        normal: _content == MaskContent.normal,
       );
     }
 
@@ -316,6 +416,9 @@ class _ObjectMaskEncoder {
           item.instanceColors ??
               List.filled(instances.length, _white, growable: false),
           nodeWindingFlipped: item.windingFlipped,
+          instanceWindingFlipped: item.instanceWindingFlipped,
+          attributeData: item.instanceAttributeData,
+          attributeFloats: attributeFloats,
           scratch: transientInstancePackingScratch,
         );
         transientInstancePackingScratch.releaseSingleBatch();
@@ -372,7 +475,12 @@ class _ObjectMaskEncoder {
     // would clobber slot 1 and the shader would read its instance attributes as
     // a transform matrix.
     if (dataSlot != null) {
-      bindSingleInstanceData(_renderPass, item.worldTransform, slot: dataSlot);
+      bindSingleInstanceData(
+        _renderPass,
+        item.worldTransform,
+        slot: dataSlot,
+        attributeFloats: attributeFloats,
+      );
     } else if (geometry.instancedVertexLayout != null &&
         geometry.bindsModelTransformInstance) {
       bindSingleInstanceTransform(_renderPass, item.worldTransform);

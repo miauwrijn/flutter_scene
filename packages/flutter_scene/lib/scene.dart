@@ -310,7 +310,7 @@ export 'src/shader_reflection/shader_reflection.dart'
         ShaderUniformValue,
         decodeUniformBlock,
         matchUniformBlocks;
-export 'src/render/object_filter.dart' show NodeFilter;
+export 'src/render/object_filter.dart' show MaskContent, NodeFilter;
 export 'src/render/render_layers.dart'
     show kRenderLayerAll, kRenderLayerDefault;
 export 'src/render/selection_outline_pass.dart' show HighlightStyle;
