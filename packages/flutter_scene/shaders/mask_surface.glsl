@@ -24,7 +24,7 @@ mask_surface;
 uniform sampler2D base_color_texture;
 // Declared only by the shader that reads it (the normal content defines
 // MASK_SURFACE_NORMAL): an unread sampler is compiled out, and binding a slot
-// the shader no longer has fails.
+// the compiled shader does not have fails.
 #ifdef MASK_SURFACE_NORMAL
 uniform sampler2D normal_texture;
 #endif
