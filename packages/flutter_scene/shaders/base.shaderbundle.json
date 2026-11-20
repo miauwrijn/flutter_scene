@@ -119,6 +119,10 @@
     "type": "fragment",
     "file": "shaders/flutter_scene_shadow_copy.frag"
   },
+  "ShadowCookieFragment": {
+    "type": "fragment",
+    "file": "shaders/flutter_scene_shadow_cookie.frag"
+  },
   "ShadowCatcherBlurFragment": {
     "type": "fragment",
     "file": "shaders/flutter_scene_shadow_catcher_blur.frag"

@@ -26,15 +26,16 @@ import 'package:flutter_scene/src/render/uniform_slots.dart';
 /// [PhysicallyBasedMaterial] and `PreprocessedMaterial` use it so the lighting
 /// packing lives in one place.
 class EngineLightingUniforms {
-  /// The float count of the full `FragInfo` block (848 bytes / 212 floats:
+  /// The float count of the full `FragInfo` block (880 bytes / 220 floats:
   /// the mat4 `environment_transform` ends at float 155, the `ssao_params`
   /// vec4 at floats 156..159, then the `radiance_blend` vec4 at floats
   /// 160..163, `ssao_lighting` at 164..167, `model_scale` at 168..171,
   /// `dielectric_f0` at 172..175, the five irradiance-field vec4s at
   /// 176..195, `froxel_grid` at 196..199, `view_projection` at 200..203, and
-  /// `camera_position` at 204..207, and `depth_projection` at 208..211).
-  /// See the layout map in the implementation.
-  static const fragInfoFloatCount = 212;
+  /// `camera_position` at 204..207, `depth_projection` at 208..211, and the
+  /// directional cookie's two vec4s at 212..219). See the layout map in the
+  /// implementation.
+  static const fragInfoFloatCount = 220;
 
   /// Index of the `dielectric_f0` vec4 in `FragInfo`. [packInto] writes the
   /// standard 0.04 dielectric reflectance; a material with a non-default
@@ -286,12 +287,33 @@ class EngineLightingUniforms {
     fragInfo[209] = depthRow?.y ?? 0.0;
     fragInfo[210] = depthRow?.z ?? 0.0;
     fragInfo[211] = depthRow?.w ?? 0.0;
+    // directional_cookie [212..215] and directional_cookie_transform
+    // [216..219]: the cookie riding the shadow atlas as its last tile. The
+    // tile exists for the whole view (it follows the unmasked light), but a
+    // node outside the light's channels gets no sun and so no cookie.
+    final cookieTile = hasShadowCookieTile(
+      lighting.directionalLight,
+      hasCascades: cascades.isNotEmpty,
+    );
+    final cookieLight = cookieTile ? light : null;
+    fragInfo[212] = cookieLight != null ? 1.0 : 0.0;
+    fragInfo[213] = (cookieLight?.cookieRepeat ?? false) ? 1.0 : 0.0;
+    fragInfo[214] = 0.0;
+    fragInfo[215] = 0.0;
+    fragInfo[216] = cookieLight == null ? 0.0 : 1.0 / cookieLight.cookieSize.x;
+    fragInfo[217] = cookieLight == null ? 0.0 : 1.0 / cookieLight.cookieSize.y;
+    fragInfo[218] = cookieLight?.cookieOffset.x ?? 0.0;
+    fragInfo[219] = cookieLight?.cookieOffset.y ?? 0.0;
     // spot_shadow_params [12..15] (more of the unused SH region): the shared
     // spot-shadow parameters. x is the total non-cascade tile count (spot
-    // tiles then point-shadow tiles); 0 disables both spot and point shadow
-    // sampling, and the shader uses it to size the shared shadow atlas.
-    fragInfo[12] = (lighting.spotShadowCount + lighting.pointShadowTileCount)
-        .toDouble();
+    // tiles, then point-shadow tiles, then the cookie tile); the spot and
+    // point loops sample only lights holding a slot, and the shader uses it
+    // to size the shared shadow atlas.
+    fragInfo[12] =
+        (lighting.spotShadowCount +
+                lighting.pointShadowTileCount +
+                (cookieTile ? 1 : 0))
+            .toDouble();
     fragInfo[13] = lighting.spotShadowDepthBias;
     fragInfo[14] = lighting.spotShadowNormalBias;
     fragInfo[15] = lighting.spotShadowSoftness;

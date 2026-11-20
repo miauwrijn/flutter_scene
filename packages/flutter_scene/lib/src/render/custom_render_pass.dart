@@ -29,15 +29,20 @@ import 'package:flutter_scene/src/render/uniform_slots.dart';
 /// intensity. Layout: `mat4 light_space_matrix[4]` (world -> cascade clip),
 /// `vec4 cascade_splits` (view-space split distance per cascade), `vec4
 /// light_direction` (xyz direction, w = cascade count), `vec4 light_color`
-/// (rgb, w = the atlas's tile count [totalTiles], spot and point shadow tiles
-/// included; the cascade count when omitted).
+/// (rgb, w = the atlas's tile count [totalTiles], spot, point and cookie
+/// tiles included; the cascade count when omitted), then the light's
+/// cookie as `vec4 cookie` (x enabled, y repeat) and `vec4
+/// cookie_transform` (xy 1 / size, zw offset), its tile the atlas's last
+/// (see `shadow_cookie.glsl`). A shader may declare only the leading
+/// fields it reads.
 ByteData packPostShadowInfo(
   List<ShadowCascade> cascades,
   Vector3 direction,
   Vector3 color, {
   int? totalTiles,
+  DirectionalLight? cookieLight,
 }) {
-  final f = Float32List(76); // 4 mat4 + 3 vec4
+  final f = Float32List(84); // 4 mat4 + 5 vec4
   final count = cascades.length < 4 ? cascades.length : 4;
   for (var i = 0; i < count; i++) {
     f.setRange(i * 16, i * 16 + 16, cascades[i].lightSpaceMatrix.storage);
@@ -51,6 +56,14 @@ ByteData packPostShadowInfo(
   f[73] = color.y;
   f[74] = color.z;
   f[75] = (totalTiles ?? count).toDouble();
+  if (hasShadowCookieTile(cookieLight, hasCascades: count > 0)) {
+    f[76] = 1.0;
+    f[77] = cookieLight!.cookieRepeat ? 1.0 : 0.0;
+    f[80] = 1.0 / cookieLight.cookieSize.x;
+    f[81] = 1.0 / cookieLight.cookieSize.y;
+    f[82] = cookieLight.cookieOffset.x;
+    f[83] = cookieLight.cookieOffset.y;
+  }
   return ByteData.sublistView(f);
 }
 

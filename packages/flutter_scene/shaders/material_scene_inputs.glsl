@@ -199,6 +199,12 @@ uniform FragInfo {
   // All zero when the pass publishes none; such a material then keeps the
   // interpolated depth.
   highp vec4 depth_projection;
+  // The directional light's cookie (see shadow_cookie.glsl). x: enabled,
+  // the cookie riding the shadow atlas as its last tile. y: repeat. zw
+  // unused. Zero when the light has no cookie or casts no shadow.
+  highp vec4 directional_cookie;
+  // xy: 1 / the cookie's size in world units; zw: its offset.
+  highp vec4 directional_cookie_transform;
 }
 frag_info;
 
