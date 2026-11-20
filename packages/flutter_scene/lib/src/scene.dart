@@ -3723,6 +3723,12 @@ base class Scene implements SceneGraph {
                   effectiveCascades,
                   lightDirection ?? light!.direction,
                   light!.color * light.intensity,
+                  // The whole strip, which spot and point shadows share.
+                  totalTiles:
+                      effectiveCascades.length +
+                      (spotShadowFrame?.matrices.length ?? 0) +
+                      (pointShadowFrame?.casters.length ?? 0) *
+                          kPointShadowTilesPerLight,
                 )
               : null,
         ),
