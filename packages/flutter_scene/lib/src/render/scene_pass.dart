@@ -393,6 +393,7 @@ class ScenePass extends RenderGraphPass {
           ? context.blackboard.get<gpu.Texture>(kLinearDepthBlackboardKey)
           : null,
       cameraPosition: camera.position,
+      depthProjection: _depthProjectionRow(camera),
       cameraForward: cameraForward,
       cameraRight: cameraRight,
       cameraUp: cameraUp,
@@ -617,6 +618,14 @@ class ScenePass extends RenderGraphPass {
   // sharing the scene's depth attachment so opaque geometry occludes them.
   // The layer is composited onto the resolved image by
   // DisplayReferredCompositePass, past the tone curve.
+  // The depth row (m22, m23, m32, m33) of the projection this pass
+  // rasterizes with, published for materials that write their own
+  // gl_FragDepth (see Lighting.depthProjection).
+  Vector4 _depthProjectionRow(Camera camera) {
+    final m = rasterProjectionOf(camera, _dimensions);
+    return Vector4(m.entry(2, 2), m.entry(2, 3), m.entry(3, 2), m.entry(3, 3));
+  }
+
   void _encodeDisplayReferredLayer(
     RenderGraphContext context,
     SceneEncoder encoder,

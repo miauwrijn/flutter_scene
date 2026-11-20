@@ -54,6 +54,13 @@ struct MaterialInputs {
   // A value the material wants to inspect. Never shaded; shown raw by the
   // `custom` surface debug channel (see material_debug.glsl).
   vec3 debug;
+#ifdef FLUTTER_SCENE_MATERIAL_DEPTH_OFFSET
+  // How far behind the polygon the visible surface lies, in world units
+  // along the view ray (away from the camera): what a parallax march finds.
+  // The generated main() writes the matching gl_FragDepth. 0 keeps the
+  // interpolated depth. Present only with `depth_offset: true`.
+  float depth_offset;
+#endif
 #ifdef FLUTTER_SCENE_PHYSICAL_MATERIAL
   // Advanced physical fields. These exist only in physical shader variants,
   // so standard/unlit materials keep their original interface and cost.
@@ -111,6 +118,9 @@ MaterialInputs InitMaterialInputs() {
   material.iridescence = 0.0;
   material.iridescence_ior = 1.3;
   material.iridescence_thickness = 0.0;
+#endif
+#ifdef FLUTTER_SCENE_MATERIAL_DEPTH_OFFSET
+  material.depth_offset = 0.0;
 #endif
   return material;
 }
