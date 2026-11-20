@@ -244,7 +244,7 @@ shader really can sample anywhere (a full-screen warp).
 
 ## Parameters
 
-Each parameter is `{ type, name, hint?, default? }`.
+Each parameter is `{ type, name, hint?, default?, stage? }`.
 
 **Types.** Scalar and vector types (`float`, `int`, `vec2`, `vec3`, `vec4`,
 `mat4`) are packed into a uniform block named `MaterialParams`; you read them in
@@ -265,6 +265,11 @@ use `mat4`.
 (`default: [1, 1, 1, 1]` for a `vec4`). Samplers take a placeholder via their
 hint, not a `default`. Defaults are applied when the material is constructed, so
 an unset parameter still renders sensibly.
+
+**Stage.** A sampler is declared in the fragment stage by default. Give it
+`stage: vertex` to declare it in the vertex stage instead, for a texture
+`Vertex()` reads (see [Sampling textures in `Vertex()`](#sampling-textures-in-vertex)).
+Only samplers take a `stage`; uniform parameters are readable in both stages.
 
 ## The `fragment` block
 
@@ -368,6 +373,35 @@ void Vertex(inout VertexInputs vertex) {
   vertex.world_position.y -= material_params.curvature * dot(rel.xz, rel.xz);
 }
 ```
+
+### Sampling textures in `Vertex()`
+
+A sampler with `stage: vertex` is declared in the vertex stage only, so
+`Vertex()` can read it (a height or displacement map, a wind field) and
+`Surface()` cannot. Bind it like any other sampler parameter; the engine binds
+it on the vertex shader in every pass that draws the material (color, depth,
+shadows). The vertex stage has no derivatives, so sample with `textureLod`.
+The material needs a `vertex { }` block.
+
+```
+parameters: [
+  { type: float,     name: height_scale, default: 0.5 },
+  { type: sampler2d, name: height_map, hint: default_black, stage: vertex },
+],
+```
+
+```glsl
+void Vertex(inout VertexInputs vertex) {
+  float h = textureLod(height_map, vertex.uv, 0.0).r;
+  vertex.world_position += vertex.world_normal * h * material_params.height_scale;
+}
+```
+
+A sampler lives in one stage only. To read the same texture in both stages,
+declare two parameters and bind the texture to each. Declaring it in both
+stages would cost a texture unit in each, and on OpenGL ES the vertex and
+fragment stages share one 16-unit budget with the engine's own lighting and
+shadow samplers.
 
 **Derive, don't replace.** Prefer perturbing the provided value
 (`vertex.world_normal = normalize(vertex.world_normal + delta)`) over assigning

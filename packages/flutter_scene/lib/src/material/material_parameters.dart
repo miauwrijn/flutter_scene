@@ -25,7 +25,11 @@ class _ParamSlot {
 }
 
 class _SamplerSlot {
-  _SamplerSlot(this.defaultPlaceholder, [this.type = FmatType.sampler2d]) {
+  _SamplerSlot(
+    this.defaultPlaceholder, {
+    this.type = FmatType.sampler2d,
+    this.vertexStage = false,
+  }) {
     if (type == FmatType.sampler2DArray && !gpu.supportsTextureArrays) {
       throw UnsupportedError(
         'This material declares a sampler2DArray, but this backend has no '
@@ -38,6 +42,9 @@ class _SamplerSlot {
 
   /// The declared sampler type, which the bound texture's type must match.
   final FmatType type;
+
+  // Declared by the vertex stage only (`stage: vertex`), so bound there.
+  final bool vertexStage;
   gpu.Texture? texture;
   gpu.SamplerOptions? sampler;
 }
@@ -133,6 +140,7 @@ class MaterialParameters {
     parameters,
     Map<String, FmatHintKind?> samplers = const {},
     Map<String, FmatType> samplerTypes = const {},
+    Set<String> vertexSamplers = const {},
     Map<String, Object> defaults = const {},
   }) {
     final layout = {
@@ -145,7 +153,11 @@ class MaterialParameters {
     };
     final samplerSlots = {
       for (final e in samplers.entries)
-        e.key: _SamplerSlot(e.value, samplerTypes[e.key] ?? FmatType.sampler2d),
+        e.key: _SamplerSlot(
+          e.value,
+          type: samplerTypes[e.key] ?? FmatType.sampler2d,
+          vertexStage: vertexSamplers.contains(e.key),
+        ),
     };
     final params = MaterialParameters._(
       blockName,
@@ -195,6 +207,11 @@ class MaterialParameters {
 
   /// Whether a sampler parameter named [name] is declared.
   bool hasSampler(String name) => _samplers.containsKey(name);
+
+  /// Whether sampler parameter [name] is declared by the vertex stage
+  /// (`stage: vertex`) rather than the fragment stage. False for an unknown
+  /// name.
+  bool isVertexSampler(String name) => _samplers[name]?.vertexStage ?? false;
 
   /// Whether [name] is declared with type [type]. Lets a caller writing to
   /// many materials at once ([MaterialGroup]) skip a member that spells the
@@ -273,6 +290,7 @@ class MaterialParameters {
     Map<String, Object> defaults = const {},
     Map<String, FmatHintKind?> samplers = const {},
     Map<String, FmatType> samplerTypes = const {},
+    Set<String> vertexSamplers = const {},
   }) {
     final layout = {
       for (final e in parameters.entries)
@@ -284,7 +302,11 @@ class MaterialParameters {
     };
     _applyRefresh(blockName, blockSizeBytes, layout, defaults, {
       for (final e in samplers.entries)
-        e.key: _SamplerSlot(e.value, samplerTypes[e.key] ?? FmatType.sampler2d),
+        e.key: _SamplerSlot(
+          e.value,
+          type: samplerTypes[e.key] ?? FmatType.sampler2d,
+          vertexStage: vertexSamplers.contains(e.key),
+        ),
     });
   }
 
@@ -299,7 +321,10 @@ class MaterialParameters {
       final hint = (s['hint'] as Map?)?.cast<String, Object?>();
       slots[s['name'] as String] = _SamplerSlot(
         _hintKind(hint?['kind'] as String?),
-        FmatType.fromToken((s['type'] as String?) ?? '') ?? FmatType.sampler2d,
+        type:
+            FmatType.fromToken((s['type'] as String?) ?? '') ??
+            FmatType.sampler2d,
+        vertexStage: s['stage'] == 'vertex',
       );
     }
     return slots;
@@ -600,12 +625,13 @@ class MaterialParameters {
   /// `FragmentKeepAlive` block, so the runtime binds it exactly when the
   /// generated shader carries it.
   @internal
-  bool get hasAnyParameters => hasUniformBlock || _samplers.isNotEmpty;
+  bool get hasAnyParameters =>
+      hasUniformBlock || _samplers.values.any((s) => !s.vertexStage);
 
   /// Binds only the `MaterialParams` uniform block on [shader] into [pass],
   /// not the sampler parameters. Used to make the block available to the
   /// vertex stage, whose generated shader declares the block but not the
-  /// material's samplers.
+  /// material's fragment samplers (see [bindVertexSamplers] for its own).
   void bindUniformBlock(
     gpu.RenderPass pass,
     gpu.Shader shader,
@@ -619,15 +645,31 @@ class MaterialParameters {
     }
   }
 
-  /// Binds the uniform block and the sampler parameters on [shader] into [pass].
+  /// Binds the uniform block and the fragment-stage sampler parameters on the
+  /// fragment [shader] into [pass]. The `stage: vertex` samplers are not
+  /// declared there; see [bindVertexSamplers].
   void bind(
     gpu.RenderPass pass,
     gpu.Shader shader,
     TransientWriter transientsBuffer,
   ) {
     bindUniformBlock(pass, shader, transientsBuffer);
+    _bindSamplers(pass, shader, vertexStage: false);
+  }
+
+  /// Binds the `stage: vertex` sampler parameters on the generated vertex
+  /// [shader] into [pass]: the textures a material's `Vertex()` reads.
+  void bindVertexSamplers(gpu.RenderPass pass, gpu.Shader shader) =>
+      _bindSamplers(pass, shader, vertexStage: true);
+
+  void _bindSamplers(
+    gpu.RenderPass pass,
+    gpu.Shader shader, {
+    required bool vertexStage,
+  }) {
     for (final entry in _samplers.entries) {
       final slot = entry.value;
+      if (slot.vertexStage != vertexStage) continue;
       pass.bindTexture(
         shader.cachedUniformSlot(entry.key),
         slot.texture ?? _placeholder(slot.type, slot.defaultPlaceholder),

@@ -185,17 +185,40 @@ class FmatParameter {
     required this.name,
     this.hint,
     this.defaultValue,
+    this.stage = FmatStage.fragment,
   });
 
   final FmatType type;
   final String name;
   final FmatHint? hint;
 
+  /// The shader stage a sampler parameter is declared in (`stage:`, default
+  /// [FmatStage.fragment]). Uniform parameters are readable in both stages
+  /// regardless and always report [FmatStage.fragment].
+  final FmatStage stage;
+
   /// The default value: a `num` for scalars, a `List<num>` for vectors and
   /// matrices, or `null`. Samplers carry their default via [hint].
   final Object? defaultValue;
 
   bool get isSampler => type.isSampler;
+
+  /// Whether this is a sampler only the vertex stage declares and reads.
+  bool get isVertexSampler => isSampler && stage == FmatStage.vertex;
+}
+
+/// The shader stage that declares a sampler parameter.
+///
+/// A sampler is declared in exactly one stage. Declaring it in both would
+/// spend a texture unit in each, and some backends (OpenGL ES) count the
+/// vertex and fragment units against one shared limit.
+enum FmatStage {
+  /// Read by `Surface()` (and the fragment-stage hooks). The default.
+  fragment,
+
+  /// Read by `Vertex()`: a displacement or height map, a wind field, a depth
+  /// pyramid a material culls against. Requires a `vertex { }` block.
+  vertex,
 }
 
 /// A custom interpolant the vertex stage writes and the fragment stage reads,
@@ -416,9 +439,18 @@ class FmatMaterial {
   Iterable<FmatParameter> get uniformParameters =>
       parameters.where((p) => !p.isSampler);
 
-  /// Parameters declared as top-level sampler uniforms.
+  /// Parameters declared as top-level sampler uniforms, in either stage.
   Iterable<FmatParameter> get samplerParameters =>
       parameters.where((p) => p.isSampler);
+
+  /// The sampler parameters the fragment stage declares and binds.
+  Iterable<FmatParameter> get fragmentSamplerParameters =>
+      parameters.where((p) => p.isSampler && !p.isVertexSampler);
+
+  /// The sampler parameters only the vertex stage declares and binds
+  /// (`stage: vertex`).
+  Iterable<FmatParameter> get vertexSamplerParameters =>
+      parameters.where((p) => p.isVertexSampler);
 }
 
 /// Thrown when a `.fmat` source is malformed or fails validation. Carries a
