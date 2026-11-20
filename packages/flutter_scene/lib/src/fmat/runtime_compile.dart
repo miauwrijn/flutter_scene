@@ -24,6 +24,8 @@ import 'package:flutter_scene/src/fmat/fmat_emitter.dart'
         kDebugViewsDefine,
         kRadianceCubeDefine,
         materialHasDepthSurface,
+        materialHasMaskSurface,
+        maskSurfaceEntryName,
         materialSamplesEnvironment,
         radianceCubeEntryName;
 import 'package:flutter_scene/src/importer/build_cache.dart';
@@ -193,6 +195,16 @@ final class FmatRuntimeCompiler {
               genDir,
               '${depthSurfaceEntryName(compiled.material, kind)}.frag',
               emitFragmentGlsl(compiled.material, depthSurface: kind),
+            ),
+          },
+      if (materialHasMaskSurface(compiled.material))
+        for (final kind in MaskSurfaceKind.values)
+          maskSurfaceEntryName(compiled.material, kind): {
+            'type': 'fragment',
+            'file': _writeShader(
+              genDir,
+              '${maskSurfaceEntryName(compiled.material, kind)}.frag',
+              emitFragmentGlsl(compiled.material, maskSurface: kind),
             ),
           },
       for (final MapEntry(key: vertexEntry, value: vertexGlsl)
