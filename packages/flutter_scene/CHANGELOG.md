@@ -16,7 +16,6 @@
 * `Texture2DArray` uploads layered data textures, sampled in `.fmat` materials through `sampler2DArray` parameters. Arrays work on the web backends, and on Metal and Vulkan with Flutter 3.50 or newer (`Texture2DArray.isSupported`).
 * `Texture2D.fromData` builds a texture from raw texels in a `DataTextureFormat` (`r8`, `rg8`, `rgba8`, `r32Float`, `rgba16Float`, `rgba32Float`).
 * `r8` and `rg8` textures whose rows are not a multiple of four bytes upload correctly on WebGL2.
-* God rays sample the directional light's shadow cascades where they are in the shared shadow atlas. They divided the atlas by the cascade count alone, so once a spot or point light cast shadows the shafts read the wrong part of the atlas.
 * `DirectionalLight.cookie` projects a texture along the light that scales its direct light, like a light cookie: drifting cloud shadows, dappled light under a canopy. `cookieSize`, `cookieOffset` (for scrolling), `cookieRepeat` and `cookieStrength` place it, and `cookieUv` gives the texture coordinate a world point samples, for rendering a matching cookie. It needs a shadow-casting light and rides the shadow atlas as one extra tile, so it costs no texture unit, and a light without a cookie draws as before. God rays follow it.
 * `OffAxisProjection` is a lens with four separate frustum edges (`fromAngles`, `fromMatrix`), the shape a headset gives for each eye.
 * `RenderViewGroup` and `Scene.renderViewGroups` render views together, culling once and fitting and rendering the shadows once, so both eyes of a stereo pair shade identically.
