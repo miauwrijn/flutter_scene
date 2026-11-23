@@ -178,6 +178,48 @@ class MeshGeometry extends UnskinnedGeometry {
     }
   }
 
+  /// A geometry that draws [source]'s vertices with indices of its own.
+  ///
+  /// Only the indices are uploaded; the vertex streams (and any custom
+  /// attribute streams) are the ones [source] already has on the GPU. Use it
+  /// when one mesh is drawn several times with a different subset of its
+  /// triangles each time, such as a level-of-detail cut per instance, a
+  /// culled subset per view, or a sorted slice per pass, so that each draw
+  /// gets its own index buffer without a copy of the vertices.
+  ///
+  /// [source] must use [GeometryStorage.fixed]: an updatable mesh rotates
+  /// its vertex buffers on every update, which would leave this geometry
+  /// reading a stale one. The shared geometry takes [source]'s primitive
+  /// type and bounds (the vertices are the same, so a subset never needs
+  /// more room and keeping the full bounds keeps culling stable as the
+  /// subset changes). It keeps no CPU data, so it cannot be raycast or
+  /// extracted, and it cannot be [rebuild]t; change what it draws with
+  /// [setIndexData]. Every index must be less than `source.vertexCount`.
+  ///
+  /// [source] owns the vertex buffers, so keep it alive for as long as this
+  /// geometry draws. The streams are shared as [source] holds them now: a
+  /// later [rebuild] of [source] uploads new buffers that this geometry does
+  /// not follow.
+  MeshGeometry.sharingVertices(MeshGeometry source, {List<int>? indices})
+    : storage = GeometryStorage.fixed,
+      retainCpuData = false {
+    if (source.storage != GeometryStorage.fixed) {
+      throw ArgumentError.value(
+        source.storage,
+        'source.storage',
+        'sharingVertices needs a source with fixed storage',
+      );
+    }
+    primitiveType = source.primitiveType;
+    shareVertexStreamsOf(source);
+    _liveVertexCount = source.vertexCount;
+    setLocalBounds(source.localBounds, source.localBoundingSphere);
+    _indexed = true;
+    _uploadIndices(indices ?? const <int>[]);
+    // No CPU copy is kept (see [retainCpuData]).
+    _packedIndexBytes = null;
+  }
+
   /// Uploads a mesh from a [MeshData] snapshot built off the render
   /// isolate.
   ///
@@ -266,6 +308,10 @@ class MeshGeometry extends UnskinnedGeometry {
   late final _RingBufferStream _colorRing;
   late final _RingBufferStream _tangentRing;
   List<gpu.BufferView> _streamViews = const [];
+
+  // The index buffers [setIndexData] writes, allocated on its first call so a
+  // mesh that never re-indexes keeps its single index buffer.
+  _IndexRing? _indexRing;
 
   // The interleaved vertex bytes, built lazily from the structure-of-arrays
   // CPU streams only when the scene serializer asks for them, and invalidated
@@ -552,6 +598,7 @@ class MeshGeometry extends UnskinnedGeometry {
     ByteData? indexBytes;
     TypedData? indexUpload;
     var indexType = gpu.IndexType.int16;
+    _indexed = indices != null;
     if (indices != null) {
       final packed = InterleavedLayoutAdapter.packIndices(indices);
       indexBytes = ByteData.sublistView(packed.bytes);
@@ -595,6 +642,50 @@ class MeshGeometry extends UnskinnedGeometry {
         tangents: _cpuTangents,
         indices: indexBytes,
       );
+    }
+  }
+
+  /// Replaces the index buffer and leaves every vertex stream as it is.
+  ///
+  /// For geometry whose vertices stay put while the triangles it draws
+  /// change, such as a level-of-detail cut, a culled subset, or a
+  /// back-to-front sort. Unlike [rebuild], which uploads every attribute
+  /// again, this uploads only [indices], and it works on
+  /// [GeometryStorage.fixed] geometry too. The geometry must have been
+  /// created with indices, and every index must be less than [vertexCount].
+  /// The bounds are not recomputed: they still cover every vertex.
+  ///
+  /// The indices go into a small ring of buffers, so the GPU can keep
+  /// reading the previous ones while the new ones are written. When this
+  /// mesh retains CPU data, raycasts follow the new indices, reading
+  /// [indices] itself rather than a copy: a caller that reuses one array
+  /// must call this again after each rewrite.
+  void setIndexData(Uint32List indices) {
+    if (!_indexed) {
+      throw StateError(
+        'setIndexData requires geometry created with indices; this geometry '
+        'draws unindexed',
+      );
+    }
+    assert(() {
+      for (final index in indices) {
+        if (index >= _liveVertexCount) {
+          throw ArgumentError(
+            'index $index is out of range for $_liveVertexCount vertices',
+          );
+        }
+      }
+      return true;
+    }());
+    final bytes = indices.buffer.asUint8List(
+      indices.offsetInBytes,
+      indices.lengthInBytes,
+    );
+    setIndices((_indexRing ??= _IndexRing()).write(bytes), gpu.IndexType.int32);
+    if (retainCpuData) {
+      _packedIndexBytes = bytes;
+      _packedIndices32Bit = true;
+      _refreshRaycastData();
     }
   }
 
@@ -990,6 +1081,52 @@ class _RingBufferStream {
       buffer,
       offsetInBytes: 0,
       lengthInBytes: vertexCount * bytesPerVertex,
+    );
+  }
+}
+
+// A ring of host-visible index buffers for [MeshGeometry.setIndexData], so
+// the CPU never writes a buffer the GPU may still be reading (the reason
+// [_RingBufferStream] exists for the attributes). A new index list replaces
+// the old one entirely, so every write is a full write and no stale span is
+// tracked.
+class _IndexRing {
+  // Matches [_RingBufferStream]'s depth (`TransientWriter`'s frame count).
+  static const int ringDepth = 4;
+
+  final List<gpu.DeviceBuffer> _buffers = [];
+  int _capacityBytes = 0;
+  int _cursor = 0;
+
+  gpu.BufferView write(Uint8List bytes) {
+    if (_buffers.isEmpty || bytes.length > _capacityBytes) {
+      // TODO(gpu-release): release the outgrown ring as the index buffer
+      // above would.
+      _capacityBytes = nextBufferCapacity(bytes.length);
+      _buffers
+        ..clear()
+        ..addAll(
+          List.generate(
+            ringDepth,
+            (_) => gpu.gpuContext.createDeviceBuffer(
+              gpu.StorageMode.hostVisible,
+              _capacityBytes,
+            ),
+          ),
+        );
+      _cursor = 0;
+    } else {
+      _cursor = (_cursor + 1) % ringDepth;
+    }
+    final buffer = _buffers[_cursor];
+    if (bytes.isNotEmpty) {
+      buffer.overwrite(ByteData.sublistView(bytes));
+      buffer.flush(offsetInBytes: 0, lengthInBytes: bytes.length);
+    }
+    return gpu.BufferView(
+      buffer,
+      offsetInBytes: 0,
+      lengthInBytes: bytes.length,
     );
   }
 }

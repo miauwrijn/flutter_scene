@@ -264,6 +264,19 @@ abstract class Geometry {
     _vertexCount = vertexCount;
   }
 
+  /// Binds [source]'s vertex streams and custom attribute streams as this
+  /// geometry's own, so it draws the same vertices without uploading them
+  /// again (see `MeshGeometry.sharingVertices`). Custom attributes are
+  /// shared as [source] holds them now; ones it gains later are not.
+  @internal
+  void shareVertexStreamsOf(Geometry source) {
+    setVertexStreams(source._vertexStreams, source._vertexCount);
+    _customAttributes
+      ..clear()
+      ..addAll(source._customAttributes);
+    _resolved.clear();
+  }
+
   // Extra per-vertex attribute streams a material's custom `attributes` read,
   // keyed by the shader `in` name. Bound after the base vertex streams, as the
   // draw's vertex shader declares them (see [useVertexAttributes]). Populated

@@ -16,6 +16,7 @@
 * `Texture2DArray` uploads layered data textures, sampled in `.fmat` materials through `sampler2DArray` parameters. Arrays work on the web backends, and on Metal and Vulkan with Flutter 3.50 or newer (`Texture2DArray.isSupported`).
 * `Texture2D.fromData` builds a texture from raw texels in a `DataTextureFormat` (`r8`, `rg8`, `rgba8`, `r32Float`, `rgba16Float`, `rgba32Float`).
 * `r8` and `rg8` textures whose rows are not a multiple of four bytes upload correctly on WebGL2.
+* `MeshGeometry.sharingVertices` draws another fixed mesh's vertices with indices of its own, uploading only the indices, so one mesh can be drawn many times with a different subset of its triangles (a level-of-detail cut, a culled subset) without copying its vertices. `MeshGeometry.setIndexData` replaces a mesh's indices without uploading its vertices again, on fixed and updatable storage alike.
 * `OffAxisProjection` is a lens with four separate frustum edges (`fromAngles`, `fromMatrix`), the shape a headset gives for each eye.
 * `RenderViewGroup` and `Scene.renderViewGroups` render views together, culling once and fitting and rendering the shadows once, so both eyes of a stereo pair shade identically.
 * `RenderView.cullingFrustum` overrides the frustum a view culls against.
