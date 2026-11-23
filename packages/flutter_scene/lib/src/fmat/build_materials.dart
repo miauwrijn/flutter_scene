@@ -3,6 +3,7 @@ import 'dart:io';
 
 import 'package:data_assets/data_assets.dart';
 import 'package:hooks/hooks.dart';
+import 'package:meta/meta.dart' show visibleForTesting;
 
 import 'package:flutter_scene/src/importer/build_cache.dart';
 import 'package:flutter_scene/src/importer/build_hooks.dart'
@@ -194,6 +195,13 @@ const _frameworkShaderFiles = <String>[
 /// The app's `flutter_scene_lighting_features` hook user-define compiles lit
 /// features out of the materials, like flutter_scene's own
 /// `lighting_features` does for the engine's shaders, so set both.
+///
+/// [includeDirectories] puts directories of the app's own GLSL on the
+/// include path after flutter_scene's `shaders/`, so materials can share
+/// code through `#include <file.glsl>`. Every `.glsl` file in them (not in
+/// subdirectories) is a dependency of the build: editing one recompiles the
+/// materials. Name files so they do not collide with the engine's, which are
+/// found first.
 Future<void> buildMaterials({
   required BuildInput buildInput,
   required BuildOutputBuilder buildOutput,
@@ -202,6 +210,7 @@ Future<void> buildMaterials({
   String discoveryRoot = 'assets/',
   MaterialAssetMode assetMode = MaterialAssetMode.generatedTree,
   bool? debugViews,
+  List<Uri> includeDirectories = const [],
 }) => _buildMaterials(
   buildInput: buildInput,
   buildOutput: buildOutput,
@@ -209,6 +218,7 @@ Future<void> buildMaterials({
   bundleName: bundleName,
   discoveryRoot: discoveryRoot,
   assetMode: assetMode,
+  includeDirectories: includeDirectories,
   debugViews: debugViews ?? HookOptions.of(buildInput).debugViews,
   compiledOutLightingFeatures: HookOptions.of(
     buildInput,
@@ -271,6 +281,7 @@ Future<void> _buildMaterials({
   String? fileVariant,
   bool debugViews = false,
   Set<LightingFeature> compiledOutLightingFeatures = const {},
+  List<Uri> includeDirectories = const [],
 }) async {
   // ignore: deprecated_member_use_from_same_package
   if (assetMode == MaterialAssetMode.legacyOnly) {
@@ -419,6 +430,19 @@ Future<void> _buildMaterials({
     );
     stampBuffer.write(' $name=$hash');
   }
+  // The app's own GLSL directories: on the include path below, so their
+  // files are inputs like the framework's.
+  final appIncludes = [
+    for (final directory in includeDirectories) _includeDirectory(directory),
+  ];
+  for (final directory in appIncludes) {
+    stampBuffer.write(' include=${directory.toFilePath()}');
+    for (final file in includeDirectorySources(directory)) {
+      buildOutput.dependencies.add(file.uri);
+      final hash = sourceFingerprint(file, strict: options.strictHashing);
+      stampBuffer.write(' ${file.uri.pathSegments.last}=$hash');
+    }
+  }
   // An engine change to how materials compile rebuilds them even when no
   // material or shader file changed.
   stampBuffer.write(' compiler=${materialCompilerFingerprint()}');
@@ -545,7 +569,7 @@ Future<void> _buildMaterials({
       bundleName: bundleName,
       manifest: manifest,
       entryRoot: generatedDir.uri,
-      includeDirectories: [frameworkShaders],
+      includeDirectories: [frameworkShaders, ...appIncludes],
       // Match the engine bundle's GLES dialect (GLSL ES 3.00); the framework
       // radiance sampling these materials can `#include` uses textureLod,
       // which is not available in 1.00 without an extension.
@@ -864,3 +888,29 @@ void _registerOutputs({
   );
   buildOutput.dependencies.addAll(materialCompilerSources());
 }
+
+// [directory] as an absolute directory URI with a trailing slash, so the
+// include path and the stamp agree however it was named. Throws when it does
+// not exist, which would otherwise surface as an unresolved #include.
+Uri _includeDirectory(Uri directory) {
+  final dir = Directory.fromUri(directory).absolute;
+  if (!dir.existsSync()) {
+    throw ArgumentError.value(
+      directory,
+      'includeDirectories',
+      'is not a directory',
+    );
+  }
+  return Directory(dir.path).uri;
+}
+
+/// The `.glsl` files directly in [directory], in a stable order: the sources
+/// an include directory contributes to a material build.
+@visibleForTesting
+List<File> includeDirectorySources(Uri directory) =>
+    Directory.fromUri(directory)
+        .listSync()
+        .whereType<File>()
+        .where((file) => file.path.endsWith('.glsl'))
+        .toList()
+      ..sort((a, b) => a.path.compareTo(b.path));
