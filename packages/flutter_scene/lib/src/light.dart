@@ -1114,6 +1114,7 @@ class Lighting {
     this.filteredSceneColor,
     this.transmissionFilterBandCount = 0,
     this.cameraPosition,
+    this.depthProjection,
     this.cameraForward,
     this.cameraRight,
     this.cameraUp,
@@ -1325,6 +1326,15 @@ class Lighting {
   /// [sceneDepthLinear]. Null when no material requests scene inputs.
   final Vector3? cameraPosition;
   final Vector3? cameraForward;
+
+  /// The depth row of the projection the pass rasterizes with, as
+  /// `(m22, m23, m32, m33)`: window depth is `(x * z + y) / (z' * z + w)`
+  /// at planar view depth `z`. A material with `depth_offset: true` maps
+  /// the depth it writes through it. Taken from the matrix in use, so it is
+  /// right for reversed, infinite and orthographic projections. Null when
+  /// the pass publishes none; such a material then keeps the interpolated
+  /// depth.
+  final Vector4? depthProjection;
 
   /// Normalized world-space right/up axes used to project refracted volume
   /// exits back into the scene-color image.

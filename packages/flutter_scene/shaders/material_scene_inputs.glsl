@@ -191,6 +191,13 @@ uniform FragInfo {
   highp vec4 view_projection;
   // xyz: the camera's world-space position. w unused.
   highp vec4 camera_position;
+  // The raster projection's depth row, for a material that writes its own
+  // gl_FragDepth: window depth = (x * view_z + y) / (z * view_z + w) at
+  // planar view depth view_z. Read off the projection matrix the pass draws
+  // with, so it holds for reversed, infinite and orthographic lenses alike.
+  // All zero when the pass publishes none; such a material then keeps the
+  // interpolated depth.
+  highp vec4 depth_projection;
 }
 frag_info;
 
@@ -232,6 +239,42 @@ highp vec2 ProjectWorldOffsetToScreenUv(highp vec3 world_offset) {
 // forward axis), comparable against the opaque scene depth.
 highp float GetFragmentViewDepth() {
   return dot(-v_viewvector, frag_info.camera_forward.xyz);
+}
+
+// The window depth (what gl_FragCoord.z carries and gl_FragDepth takes) of a
+// point at planar view depth [view_z], through the published projection row.
+highp float WindowDepthAtViewDepth(highp float view_z) {
+  highp vec4 row = frag_info.depth_projection;
+  highp float w = row.z * view_z + row.w;
+  if (abs(w) < 1e-9) return gl_FragCoord.z;
+  return (row.x * view_z + row.y) / w;
+}
+
+// The depth to write for a fragment whose visible surface lies [distance]
+// world units further along the view ray. Returns the interpolated depth
+// exactly when there is nothing to displace or no projection is published,
+// so an undisplaced fragment cannot z-fight the other passes by an ulp.
+highp float WindowDepthAlongView(highp float distance) {
+  if (distance <= 0.0 ||
+      dot(frag_info.depth_projection, frag_info.depth_projection) <= 0.0) {
+    return gl_FragCoord.z;
+  }
+  // Along the line to the eye under perspective; along the camera axis
+  // under an orthographic lens, whose rays are parallel.
+  highp vec3 to_fragment = -v_viewvector;
+  highp float length_to_fragment = length(to_fragment);
+  highp vec3 ray = frag_info.view_projection.z > 0.5 ||
+                           length_to_fragment <= 1e-6
+                       ? frag_info.camera_forward.xyz
+                       : to_fragment / length_to_fragment;
+  highp float view_z =
+      dot(to_fragment + ray * distance, frag_info.camera_forward.xyz);
+  // Carry over any push the vertex stage gave this draw's depth (a depth
+  // layer), which the interpolated depth holds and the projection row does
+  // not.
+  highp float push =
+      gl_FragCoord.z - WindowDepthAtViewDepth(GetFragmentViewDepth());
+  return clamp(WindowDepthAtViewDepth(max(view_z, 1e-4)) + push, 0.0, 1.0);
 }
 
 #ifdef FLUTTER_SCENE_SCENE_COLOR
