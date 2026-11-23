@@ -129,6 +129,99 @@ void main() {
       expect(floats[2 * _floatsPerLight + 15], closeTo(0.2, 1e-6));
     });
 
+    test(
+      'a photometric profile rides after the lights, named by texel 8.x',
+      () {
+        final profile = Float32List.fromList([1, 0.5, 0]);
+        final a = Node(localTransform: Matrix4.translationValues(0, 2, 0))
+          ..addComponent(
+            PointLightComponent(
+              PointLight(
+                photometry: profile,
+                photometryAxis: Vector3(0, -2, 0),
+                radius: 0.25,
+              ),
+            ),
+          );
+        final b = Node()
+          ..addComponent(PointLightComponent(PointLight(photometry: profile)));
+        final c = Node()..addComponent(PointLightComponent(PointLight()));
+        final (params, count) = PunctualLightBuffer.packLights(
+          directionals: const [],
+          points: [
+            a.getComponent<PointLightComponent>()!,
+            b.getComponent<PointLightComponent>()!,
+            c.getComponent<PointLightComponent>()!,
+          ],
+          spots: const [],
+        );
+        const row = _floatsPerLight;
+        expect(count, 3);
+        // Three light rows, then one shared profile of two rows.
+        expect(params.length, (3 + 2) * row);
+        expect(params[40], 3.0, reason: 'the first light names row 3');
+        expect(params[row + 40], 3.0, reason: 'a shared list is packed once');
+        expect(params[2 * row + 40], -1.0, reason: 'no profile');
+        // The source radius keeps texel 3.w.
+        expect(params[15], closeTo(0.25, 1e-6));
+        // The point's axis, normalized, in texel 10.yzw.
+        expect(params[41], closeTo(0, 1e-6));
+        expect(params[42], closeTo(-1, 1e-6));
+        expect(params[43], closeTo(0, 1e-6));
+        // Resampled to 64 samples, 32 to a row: first 1, middle about 0.5,
+        // last 0.
+        final p0 = 3 * row;
+        expect(params[p0], closeTo(1, 1e-6));
+        expect(params[p0 + 31], closeTo(0.508, 0.01));
+        expect(params[p0 + row], closeTo(0.492, 0.01));
+        expect(params[p0 + row + 31], closeTo(0, 1e-6));
+      },
+    );
+
+    test('the profile axis follows the node rotation', () {
+      final node = Node(localTransform: Matrix4.rotationZ(math.pi / 2))
+        ..addComponent(
+          PointLightComponent(
+            PointLight(
+              photometry: Float32List.fromList([1, 0]),
+              photometryAxis: Vector3(0, -1, 0),
+            ),
+          ),
+        );
+      final (params, _) = PunctualLightBuffer.packLights(
+        directionals: const [],
+        points: [node.getComponent<PointLightComponent>()!],
+        spots: const [],
+      );
+      // -Y turned a quarter about Z is +X.
+      expect(params[41], closeTo(1, 1e-6));
+      expect(params[42], closeTo(0, 1e-6));
+    });
+
+    test('a spot names its profile; directional and area rows have none', () {
+      final profile = Float32List.fromList([1, 1, 0]);
+      final (params, count) = PunctualLightBuffer.packLights(
+        directionals: [
+          _directional(DirectionalLight()),
+          _directional(DirectionalLight()),
+        ],
+        points: const [],
+        spots: [_spotAt(Vector3.zero(), SpotLight(photometry: profile))],
+        areas: [
+          (Node()..addComponent(RectAreaLightComponent(RectAreaLight())))
+              .getComponent<RectAreaLightComponent>()!,
+        ],
+      );
+      const row = _floatsPerLight;
+      // The second directional (the first is the primary), the spot, the
+      // area light, then the profile.
+      expect(count, 3);
+      expect(params.length, (3 + 2) * row);
+      expect(params[40], -1.0, reason: 'directional');
+      expect(params[row + 40], 3.0, reason: 'spot');
+      expect(params[2 * row + 40], -1.0, reason: 'area');
+    });
+
     test('an infinite-range point light encodes inverse range 0', () {
       final (floats, _) = PunctualLightBuffer.packLights(
         directionals: const [],

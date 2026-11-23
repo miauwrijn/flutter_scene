@@ -36,7 +36,7 @@ const int kMaxFroxelLights = 255;
 //   col 1: color.rgb * intensity, inverse range (0 = infinite)
 //   col 2: direction.xyz, spot angular scale
 //   col 3: spot angular offset, shadow slot (-1 = none), falloff exponent,
-//          unused
+//          source radius (an area light's height)
 //   col 4-7: world -> spot-clip matrix for a shadow-casting spot. A
 //          shadow-casting point light instead packs its face-depth mapping and
 //          sampling parameters here (col 4: depth scale/offset, normal bias,
@@ -46,12 +46,43 @@ const int kMaxFroxelLights = 255;
 //          extent zw), or a point light's two tiles' top-left corners.
 //   col 9: a spot's depth bias, normal bias, softness, and inverse tile
 //          resolution, or a point light's tile extent in xy.
+//   col 10: photometric profile row (-1 = none), then a point light's
+//          profile axis.xyz (a spot measures its profile from its direction).
+//   col 11: unused.
+// Photometric profiles follow the light rows (see [kPhotometrySamples]).
 // The shader reads these by computed UV, sidestepping the GLSL ES 1.00 ban on
 // dynamically indexing a uniform array in a fragment shader. The shadow data
 // rides here rather than in its own texture so no extra sampler is needed
 // (the lit shader is at the backend's sampler limit).
 const int _texelsPerLight = 12;
 const int _floatsPerLight = _texelsPerLight * 4;
+
+/// The samples a packed photometric profile has, evenly spaced from its
+/// axis (0) to the opposite direction (pi).
+const int kPhotometrySamples = 64;
+
+// A profile's rows after the light rows: 32 samples in the first eight
+// texels of each.
+const int _rowsPerProfile = 2;
+const int _profileFloatsPerRow = 32;
+
+// [profile] resampled to [kPhotometrySamples] evenly spaced angles, linearly.
+Float32List _resampleProfile(Float32List profile) {
+  if (profile.length == kPhotometrySamples) return profile;
+  final out = Float32List(kPhotometrySamples);
+  if (profile.isEmpty) {
+    out.fillRange(0, kPhotometrySamples, 1.0);
+    return out;
+  }
+  for (var i = 0; i < kPhotometrySamples; i++) {
+    final x = i / (kPhotometrySamples - 1) * (profile.length - 1);
+    final i0 = x.floor().clamp(0, profile.length - 1);
+    final i1 = math.min(i0 + 1, profile.length - 1);
+    final f = x - i0;
+    out[i] = profile[i0] + (profile[i1] - profile[i0]) * f;
+  }
+  return out;
+}
 
 // The per-object light-index buffer is packed into a 2D texture at most this
 // many texels wide (each texel one light index in .r), so a large scene's
@@ -97,7 +128,8 @@ class PunctualLighting {
   /// scene disabled it).
   final PunctualLightBuffer? internalBuffer;
 
-  /// All scene lights, one per row (RGBA32F, `paramsCount` rows), or null when
+  /// All scene lights, one per row, then any photometric profiles' rows
+  /// (RGBA32F, `paramsCount` rows), or null when
   /// there are none.
   final gpu.Texture? paramsTexture;
 
@@ -244,11 +276,15 @@ class FroxelLighting {
 
 /// The packed light parameters plus the culling inputs derived from them.
 class _PackedLights {
-  _PackedLights(this.params, this.count, this.cullables);
+  _PackedLights(this.params, this.count, this.cullables, {required this.rows});
 
   final Float32List params;
   final int count;
   final List<CullableLight> cullables;
+
+  /// Rows in [params]: the [count] light rows, then the photometric
+  /// profiles' rows.
+  final int rows;
 }
 
 /// Builds the per-frame punctual lighting: the parameters texture holding every
@@ -367,7 +403,7 @@ class PunctualLightBuffer {
 
     final paramsTexture = _paramsRing.upload(
       _texelsPerLight,
-      count,
+      packed.rows,
       packed.params,
     );
 
@@ -377,7 +413,7 @@ class PunctualLightBuffer {
       return PunctualLighting(
         paramsTexture: paramsTexture,
         indexTexture: null,
-        paramsCount: count,
+        paramsCount: packed.rows,
         indexWidth: 0,
         indexHeight: 0,
         spotShadowCount: spotTileCount,
@@ -406,7 +442,7 @@ class PunctualLightBuffer {
     return PunctualLighting(
       paramsTexture: paramsTexture,
       indexTexture: indexTexture,
-      paramsCount: count,
+      paramsCount: packed.rows,
       indexWidth: indexWidth,
       indexHeight: indexHeight,
       spotShadowCount: spotTileCount,
@@ -849,7 +885,43 @@ class PunctualLightBuffer {
         points.length +
         spots.length +
         areas.length;
-    final floats = Float32List(count * _floatsPerLight);
+    // Photometric profiles ride after the light rows, deduplicated by list
+    // identity; a light's texel 10.x names its profile's first row (-1: none).
+    final profiles = <Float32List>[];
+    final profileIndex = Map<Float32List, int>.identity();
+    double profileRowOf(Float32List? profile) {
+      if (profile == null) return -1.0;
+      final k = profileIndex.putIfAbsent(profile, () {
+        profiles.add(_resampleProfile(profile));
+        return profiles.length - 1;
+      });
+      return (count + k * _rowsPerProfile).toDouble();
+    }
+
+    final pointProfileRows = [
+      for (final c in points) profileRowOf(c.light.photometry),
+    ];
+    final spotProfileRows = [
+      for (final c in spots) profileRowOf(c.light.photometry),
+    ];
+    final rows = count + profiles.length * _rowsPerProfile;
+    final floats = Float32List(rows * _floatsPerLight);
+    // Every light row starts with no profile; only directional and area rows
+    // keep it.
+    for (var r = 0; r < count; r++) {
+      floats[r * _floatsPerLight + 40] = -1.0;
+    }
+    for (var k = 0; k < profiles.length; k++) {
+      final first = (count + k * _rowsPerProfile) * _floatsPerLight;
+      for (var r = 0; r < _rowsPerProfile; r++) {
+        floats.setRange(
+          first + r * _floatsPerLight,
+          first + r * _floatsPerLight + _profileFloatsPerRow,
+          profiles[k],
+          r * _profileFloatsPerRow,
+        );
+      }
+    }
     final cullables = <CullableLight>[];
     var row = 0;
 
@@ -889,6 +961,14 @@ class PunctualLightBuffer {
       floats[base + 13] = -1.0;
       floats[base + 14] = math.max(light.falloffExponent, 0.0);
       floats[base + 15] = math.max(light.radius, 0.0);
+      final profileRow = pointProfileRows[row - additionalDirectionalCount];
+      floats[base + 40] = profileRow;
+      if (profileRow >= 0) {
+        final axis = component.worldPhotometryAxis;
+        floats[base + 41] = axis.x;
+        floats[base + 42] = axis.y;
+        floats[base + 43] = axis.z;
+      }
       cullables.add(
         CullableLight(
           row,
@@ -927,6 +1007,8 @@ class PunctualLightBuffer {
       floats[base + 13] = -1.0;
       floats[base + 14] = math.max(light.falloffExponent, 0.0);
       floats[base + 15] = math.max(light.radius, 0.0);
+      floats[base + 40] =
+          spotProfileRows[row - additionalDirectionalCount - points.length];
       cullables.add(
         CullableLight(
           row,
@@ -977,6 +1059,6 @@ class PunctualLightBuffer {
       row++;
     }
 
-    return _PackedLights(floats, count, cullables);
+    return _PackedLights(floats, count, cullables, rows: rows);
   }
 }
