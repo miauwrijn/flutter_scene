@@ -7,14 +7,17 @@ import 'dart:math' as math;
 import 'dart:typed_data';
 
 import 'package:flutter_scene/scene.dart';
+import 'package:flutter_scene/src/render/point_shadow.dart';
 import 'package:flutter_scene/src/render/punctual_lights.dart';
 import 'package:flutter_scene/src/render/render_scene.dart';
+import 'package:flutter_scene/src/render/shadow_atlas_layout.dart';
+import 'package:flutter_scene/src/render/spot_shadow.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:vector_math/vector_math.dart';
 
-// Floats per light row (9 RGBA32F texels). Kept local to the test so a change
+// Floats per light row (12 RGBA32F texels). Kept local to the test so a change
 // to the layout has to be reflected here on purpose.
-const int _floatsPerLight = 36;
+const int _floatsPerLight = 48;
 
 PointLightComponent _pointAt(Vector3 position, PointLight light) {
   final node = Node(localTransform: Matrix4.translation(position));
@@ -156,15 +159,15 @@ void main() {
         expect(count, 3);
         // Three light rows, then one shared profile of two rows.
         expect(params.length, (3 + 2) * row);
-        expect(params[32], 3.0, reason: 'the first light names row 3');
-        expect(params[row + 32], 3.0, reason: 'a shared list is packed once');
-        expect(params[2 * row + 32], -1.0, reason: 'no profile');
+        expect(params[40], 3.0, reason: 'the first light names row 3');
+        expect(params[row + 40], 3.0, reason: 'a shared list is packed once');
+        expect(params[2 * row + 40], -1.0, reason: 'no profile');
         // The source radius keeps texel 3.w.
         expect(params[15], closeTo(0.25, 1e-6));
-        // The point's axis, normalized, in texel 8.yzw.
-        expect(params[33], closeTo(0, 1e-6));
-        expect(params[34], closeTo(-1, 1e-6));
-        expect(params[35], closeTo(0, 1e-6));
+        // The point's axis, normalized, in texel 10.yzw.
+        expect(params[41], closeTo(0, 1e-6));
+        expect(params[42], closeTo(-1, 1e-6));
+        expect(params[43], closeTo(0, 1e-6));
         // Resampled to 64 samples, 32 to a row: first 1, middle about 0.5,
         // last 0.
         final p0 = 3 * row;
@@ -191,8 +194,8 @@ void main() {
         spots: const [],
       );
       // -Y turned a quarter about Z is +X.
-      expect(params[33], closeTo(1, 1e-6));
-      expect(params[34], closeTo(0, 1e-6));
+      expect(params[41], closeTo(1, 1e-6));
+      expect(params[42], closeTo(0, 1e-6));
     });
 
     test('a spot names its profile; directional and area rows have none', () {
@@ -214,9 +217,9 @@ void main() {
       // area light, then the profile.
       expect(count, 3);
       expect(params.length, (3 + 2) * row);
-      expect(params[32], -1.0, reason: 'directional');
-      expect(params[row + 32], 3.0, reason: 'spot');
-      expect(params[2 * row + 32], -1.0, reason: 'area');
+      expect(params[40], -1.0, reason: 'directional');
+      expect(params[row + 40], 3.0, reason: 'spot');
+      expect(params[2 * row + 40], -1.0, reason: 'area');
     });
 
     test('an infinite-range point light encodes inverse range 0', () {
@@ -348,5 +351,97 @@ void main() {
       expect(component.worldDirection.y, closeTo(0, 1e-6));
       expect(component.worldDirection.z, closeTo(0, 1e-6));
     });
+  });
+
+  test('each shadow-casting light stamps its own tile and parameters', () {
+    final point = _pointAt(
+      Vector3(0, 2, 0),
+      PointLight(
+        castsShadow: true,
+        range: 5,
+        shadowMapResolution: 128,
+        shadowDepthBias: 0.01,
+      ),
+    );
+    final soft = _spotAt(
+      Vector3(-2, 3, 0),
+      SpotLight(
+        castsShadow: true,
+        range: 8,
+        shadowMapResolution: 512,
+        shadowDepthBias: 0.004,
+        shadowNormalBias: 0.05,
+        shadowSoftness: 3,
+      ),
+    );
+    final sharp = _spotAt(
+      Vector3(2, 3, 0),
+      SpotLight(
+        castsShadow: true,
+        range: 8,
+        shadowMapResolution: 1024,
+        shadowDepthBias: 0.002,
+        shadowNormalBias: 0.01,
+        shadowSoftness: 0.5,
+      ),
+    );
+    final spots = [soft, sharp];
+    final spotFrame = collectSpotShadows(spots)!;
+    final pointFrame = collectPointShadows([point])!;
+    final atlas = ShadowAtlasLayout.plan(
+      cascadeCount: 4,
+      cascadeResolution: 2048,
+      spotResolutions: [
+        for (final c in spotFrame.casters) c.light.shadowMapResolution,
+      ],
+      pointFaceResolutions: [128],
+    )!;
+    final (floats, _) = PunctualLightBuffer.packLights(
+      directionals: const [],
+      points: [point],
+      spots: spots,
+    );
+    PunctualLightBuffer.stampShadowRows(
+      floats,
+      directionals: const [],
+      points: [point],
+      spots: spots,
+      spotShadows: spotFrame,
+      pointShadows: pointFrame,
+      shadowAtlas: atlas,
+    );
+
+    for (var i = 0; i < spots.length; i++) {
+      final light = spots[i].light;
+      final slot = spotFrame.slotOf(spots[i]);
+      final base = (1 + i) * _floatsPerLight;
+      final tile = atlas.spotTiles[slot];
+      expect(tile.size, light.shadowMapResolution);
+      expect(floats[base + 13], slot.toDouble());
+      expect(
+        floats.sublist(base + 32, base + 36),
+        Float32List.fromList(tile.uvRect(atlas.width, atlas.height).storage),
+      );
+      expect(floats[base + 36], closeTo(light.shadowDepthBias, 1e-6));
+      expect(floats[base + 37], closeTo(light.shadowNormalBias, 1e-6));
+      expect(floats[base + 38], closeTo(light.shadowSoftness, 1e-6));
+      expect(floats[base + 39], closeTo(1 / light.shadowMapResolution, 1e-9));
+    }
+
+    final first = atlas.pointTiles[0], second = atlas.pointTiles[1];
+    expect(first.size, 256);
+    expect(floats[21], closeTo(1 / 128, 1e-9));
+    expect(floats[20], closeTo(0.01, 1e-6));
+    expect(
+      floats.sublist(32, 38),
+      Float32List.fromList([
+        first.x / atlas.width,
+        first.y / atlas.height,
+        second.x / atlas.width,
+        second.y / atlas.height,
+        256 / atlas.width,
+        256 / atlas.height,
+      ]),
+    );
   });
 }

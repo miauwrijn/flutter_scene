@@ -34,13 +34,15 @@ uniform PostCameraInfo {
 cam;
 
 // Per-cascade world->light-clip matrices, view-space split distances, the light
-// travel direction (xyz) with the cascade count in w, the light color with the
-// atlas tile count in w, and the light's cookie (see shadow_cookie.glsl).
+// travel direction (xyz) with the cascade count in w, the light color, the
+// cascades' atlas placement (xy one tile's UV extent, z cascades per row), and
+// the light's cookie (see shadow_cookie.glsl and packPostShadowInfo).
 uniform PostShadowInfo {
   mat4 light_space_matrix[4];
   vec4 cascade_splits;
   vec4 light_direction;
   vec4 light_color;
+  vec4 cascade_atlas;
   vec4 cookie;
   vec4 cookie_transform;
 }
@@ -87,9 +89,11 @@ vec3 ViewPositionAt(vec2 uv) {
     vec3 proj = lc.xyz / lc.w;                                             \
     if (abs(proj.x) < 1.0 && abs(proj.y) < 1.0) {                          \
       vec2 tile_uv = proj.xy * 0.5 + 0.5;                                  \
-      vec2 atlas_uv = vec2((float(IDX) + tile_uv.x) / float(COUNT),        \
-                           tile_uv.y);                                     \
-      atlas_uv.y = 1.0 - atlas_uv.y; /* atlas stored top-down */           \
+      float cols = shadow.cascade_atlas.z;                                 \
+      vec2 cell = vec2(mod(float(IDX), cols), floor(float(IDX) / cols));   \
+      /* atlas stored top-down */                                          \
+      vec2 atlas_uv =                                                      \
+          (cell + vec2(tile_uv.x, 1.0 - tile_uv.y)) * shadow.cascade_atlas.xy; \
       float caster = texture(input_shadow, atlas_uv).r;                    \
       RESULT = (proj.z - kShadowBias) <= caster ? 1.0 : 0.0;               \
       return RESULT;                                                       \
@@ -97,14 +101,13 @@ vec3 ViewPositionAt(vec2 uv) {
   }
 
 // Sunlight visibility at world point P (1 lit, 0 shadowed). Points outside all
-// cascades are treated as lit. [tiles] is the atlas's tile count, which spot,
-// point and cookie tiles add to.
-float ShadowVisibility(vec3 p, int count, int tiles) {
+// cascades are treated as lit.
+float ShadowVisibility(vec3 p, int count) {
   float result = 1.0;
-  TRY_CASCADE(0, p, tiles, result);
-  if (count > 1) TRY_CASCADE(1, p, tiles, result);
-  if (count > 2) TRY_CASCADE(2, p, tiles, result);
-  if (count > 3) TRY_CASCADE(3, p, tiles, result);
+  TRY_CASCADE(0, p, count, result);
+  if (count > 1) TRY_CASCADE(1, p, count, result);
+  if (count > 2) TRY_CASCADE(2, p, count, result);
+  if (count > 3) TRY_CASCADE(3, p, count, result);
   return 1.0;
 }
 
@@ -154,19 +157,15 @@ void main() {
   // the in-scatter into the first step near the camera; density scales the
   // overall thickness.
   int count = int(shadow.light_direction.w + 0.5);
-  int tiles = shadow.light_color.w > 0.5 ? int(shadow.light_color.w + 0.5)
-                                         : count;
-  float tile_res = float(textureSize(input_shadow, 0).y);
   float lit_sum = 0.0;
   for (int i = 0; i < kMaxSteps; i++) {
     if (i >= steps) break;
     vec3 p = ray_origin + ray_dir * (offset + float(i) * step_len);
-    float lit = ShadowVisibility(p, count, tiles);
+    float lit = ShadowVisibility(p, count);
     // The light's cookie shapes the shafts as it shapes the lit surfaces.
     if (lit > 0.0) {
       lit *= SampleShadowCookie(input_shadow, p, shadow.light_direction.xyz,
-                                shadow.cookie, shadow.cookie_transform,
-                                float(tiles - 1), float(tiles), tile_res);
+                                shadow.cookie, shadow.cookie_transform);
     }
     lit_sum += lit;
   }

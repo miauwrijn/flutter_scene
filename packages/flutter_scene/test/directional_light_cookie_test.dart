@@ -16,6 +16,7 @@ import 'package:flutter_scene/src/light.dart' show hasShadowCookieTile;
 // ignore: implementation_imports
 import 'package:flutter_scene/src/render/custom_render_pass.dart'
     show packPostShadowInfo;
+import 'package:flutter_scene/src/render/shadow_atlas_layout.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:vector_math/vector_math.dart';
 
@@ -165,18 +166,46 @@ void main() {
       expect(hasShadowCookieTile(null, hasCascades: true), isFalse);
     });
 
-    test('PostShadowInfo carries the tile count and an absent cookie', () {
+    test('PostShadowInfo carries an absent cookie as zeros', () {
       final info = Float32List.sublistView(
-        packPostShadowInfo(
-          const [],
-          Vector3(0, -1, 0),
-          Vector3(1, 1, 1),
-          totalTiles: 7,
-        ),
+        packPostShadowInfo(const [], Vector3(0, -1, 0), Vector3(1, 1, 1)),
       );
-      expect(info.length, 84);
-      expect(info[75], 7);
-      expect(info.sublist(76), everyElement(0));
+      expect(info.length, 88);
+      expect(info.sublist(80), everyElement(0));
+    });
+
+    test('the atlas plans the cookie a tile after every shadow tile', () {
+      final layout = ShadowAtlasLayout.plan(
+        cascadeCount: 2,
+        cascadeResolution: 1024,
+        spotResolutions: const [512],
+        pointFaceResolutions: const [256],
+        cookieResolution: 1024,
+      )!;
+      final cookie = layout.cookieTile!;
+      expect(cookie.size, 1024);
+      expect(layout.spotTiles, hasLength(1));
+      expect(layout.pointTiles, hasLength(2));
+      // No tile overlaps the cookie's.
+      for (final t in [
+        ...layout.cascadeTiles,
+        ...layout.spotTiles,
+        ...layout.pointTiles,
+      ]) {
+        final apart =
+            t.x + t.size <= cookie.x ||
+            cookie.x + cookie.size <= t.x ||
+            t.y + t.size <= cookie.y ||
+            cookie.y + cookie.size <= t.y;
+        expect(apart, isTrue, reason: '$t overlaps the cookie $cookie');
+      }
+      expect(
+        ShadowAtlasLayout.plan(
+          cascadeCount: 2,
+          cascadeResolution: 1024,
+        )!.cookieTile,
+        isNull,
+      );
     });
   });
 

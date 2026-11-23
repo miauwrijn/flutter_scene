@@ -231,6 +231,7 @@ class _ObjectMaskEncoder {
     );
     return f.length2 > 0 ? f.normalized() : Vector3(0, 0, -1);
   }();
+
   final bool _primaryView;
 
   static final gpu.Shader _maskShader = baseShaderLibrary['MaskFragment']!;
@@ -444,7 +445,7 @@ class _ObjectMaskEncoder {
           final packedWorldData = item.instanceWorldData;
           final packedWinding = item.instanceWorldWindingFlipped;
           if (item.visibleInstanceIndices == null &&
-              item.instanceAttributeFloats == attributeFloats &&
+              item.instanceAttributeFloats == 0 &&
               packedWorldData != null &&
               packedWinding != null) {
             final flipped = bindRetainedInstanceData(
@@ -473,9 +474,9 @@ class _ObjectMaskEncoder {
                 List.filled(instances.length, _white, growable: false),
             nodeWindingFlipped: item.windingFlipped,
             instanceWindingFlipped: item.instanceWindingFlipped,
+            indices: visible,
             attributeData: item.instanceAttributeData,
             attributeFloats: attributeFloats,
-            indices: visible,
             scratch: transientInstancePackingScratch,
           );
           transientInstancePackingScratch.releaseSingleBatch();

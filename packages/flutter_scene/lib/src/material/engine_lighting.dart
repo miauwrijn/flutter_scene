@@ -151,7 +151,11 @@ class EngineLightingUniforms {
     fragInfo[128] = cascades.isEmpty ? 0.0 : 1.0;
     fragInfo[129] = light?.shadowDepthBias ?? 0.0;
     fragInfo[130] = light?.shadowNormalBias ?? 0.0;
-    fragInfo[131] = light == null ? 0.0 : 1.0 / light.shadowMapResolution;
+    final atlas = lighting.shadowAtlas;
+    final cascadeResolution = atlas != null && atlas.cascadeResolution > 0
+        ? atlas.cascadeResolution
+        : light?.shadowMapResolution;
+    fragInfo[131] = cascadeResolution == null ? 0.0 : 1.0 / cascadeResolution;
     fragInfo[134] = light?.shadowFadeRange ?? 0.0;
     fragInfo[135] = light?.shadowSoftness ?? 0.0;
     fragInfo[136] = cascades.length.toDouble();
@@ -288,35 +292,39 @@ class EngineLightingUniforms {
     fragInfo[210] = depthRow?.z ?? 0.0;
     fragInfo[211] = depthRow?.w ?? 0.0;
     // directional_cookie [212..215] and directional_cookie_transform
-    // [216..219]: the cookie riding the shadow atlas as its last tile. The
-    // tile exists for the whole view (it follows the unmasked light), but a
-    // node outside the light's channels gets no sun and so no cookie.
+    // [216..219]: the cookie's atlas tile (its edge in texels, 0 for none;
+    // repeat; top-left corner in atlas UV) and its projection. The tile
+    // exists for the whole view (it follows the unmasked light), but a node
+    // outside the light's channels gets no sun and so no cookie.
     final cookieTile = hasShadowCookieTile(
-      lighting.directionalLight,
-      hasCascades: cascades.isNotEmpty,
-    );
-    final cookieLight = cookieTile ? light : null;
-    fragInfo[212] = cookieLight != null ? 1.0 : 0.0;
-    fragInfo[213] = (cookieLight?.cookieRepeat ?? false) ? 1.0 : 0.0;
-    fragInfo[214] = 0.0;
-    fragInfo[215] = 0.0;
-    fragInfo[216] = cookieLight == null ? 0.0 : 1.0 / cookieLight.cookieSize.x;
-    fragInfo[217] = cookieLight == null ? 0.0 : 1.0 / cookieLight.cookieSize.y;
-    fragInfo[218] = cookieLight?.cookieOffset.x ?? 0.0;
-    fragInfo[219] = cookieLight?.cookieOffset.y ?? 0.0;
-    // spot_shadow_params [12..15] (more of the unused SH region): the shared
-    // spot-shadow parameters. x is the total non-cascade tile count (spot
-    // tiles, then point-shadow tiles, then the cookie tile); the spot and
-    // point loops sample only lights holding a slot, and the shader uses it
-    // to size the shared shadow atlas.
-    fragInfo[12] =
-        (lighting.spotShadowCount +
-                lighting.pointShadowTileCount +
-                (cookieTile ? 1 : 0))
-            .toDouble();
-    fragInfo[13] = lighting.spotShadowDepthBias;
-    fragInfo[14] = lighting.spotShadowNormalBias;
-    fragInfo[15] = lighting.spotShadowSoftness;
+          lighting.directionalLight,
+          hasCascades: cascades.isNotEmpty,
+        )
+        ? atlas?.cookieTile
+        : null;
+    final cookieLight = cookieTile != null ? light : null;
+    if (cookieTile != null && cookieLight != null) {
+      final rect = cookieTile.uvRect(atlas!.width, atlas.height);
+      fragInfo[212] = cookieTile.size.toDouble();
+      fragInfo[213] = cookieLight.cookieRepeat ? 1.0 : 0.0;
+      fragInfo[214] = rect.x;
+      fragInfo[215] = rect.y;
+      fragInfo[216] = 1.0 / cookieLight.cookieSize.x;
+      fragInfo[217] = 1.0 / cookieLight.cookieSize.y;
+      fragInfo[218] = cookieLight.cookieOffset.x;
+      fragInfo[219] = cookieLight.cookieOffset.y;
+    } else {
+      fragInfo.fillRange(212, 220, 0.0);
+    }
+    // shadow_atlas_params [12..15] (more of the unused SH region). x is the
+    // spot plus point-shadow tile count, 0 disabling both; yz one cascade
+    // tile's extent in atlas UV, and w the cascades per atlas row.
+    fragInfo[12] = (lighting.spotShadowCount + lighting.pointShadowTileCount)
+        .toDouble();
+    final cascadeExtent = atlas?.cascadeUvExtent;
+    fragInfo[13] = cascadeExtent?.x ?? 0.0;
+    fragInfo[14] = cascadeExtent?.y ?? 0.0;
+    fragInfo[15] = (atlas?.cascadeColumns ?? 0).toDouble();
     // scene_inputs [16..19] (more of the unused SH region): gates for the
     // material scene-input samplers (bound only into materials that declare
     // engine_inputs) and the engine time. The accumulated snapshot exists only
