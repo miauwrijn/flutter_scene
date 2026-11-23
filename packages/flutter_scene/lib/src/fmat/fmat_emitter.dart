@@ -207,6 +207,23 @@ bool materialHasDepthSurface(FmatMaterial material) =>
     (material.alphaToCoverage || material.effectsDepth) &&
     material.engineInputs.isEmpty;
 
+/// Whether [material] ships its own object-mask fragments
+/// (`mask_surface: true`, one per [MaskSurfaceKind]): a surface material
+/// whose shader reads no engine scene inputs (the mask pass binds none).
+bool materialHasMaskSurface(FmatMaterial material) =>
+    material.maskSurface &&
+    material.domain == FmatDomain.surface &&
+    material.engineInputs.isEmpty &&
+    material.shadingModel != FmatShadingModel.shadowCatcher;
+
+/// The define every `mask_surface` variant is compiled with (beside its
+/// [MaskSurfaceKind.define]).
+const String kMaskSurfaceDefine = 'FLUTTER_SCENE_MASK_SURFACE';
+
+/// The bundle entry name of [material]'s object-mask fragment for [kind].
+String maskSurfaceEntryName(FmatMaterial material, MaskSurfaceKind kind) =>
+    '${material.name}${kind.suffix}';
+
 /// The bundle entry name of [material]'s depth-pass fragment for [kind].
 String depthSurfaceEntryName(FmatMaterial material, DepthSurfaceKind kind) =>
     '${material.name}${kind.suffix}';
@@ -215,6 +232,7 @@ String emitFragmentGlsl(
   FmatMaterial material, {
   Iterable<String> defines = const [],
   DepthSurfaceKind? depthSurface,
+  MaskSurfaceKind? maskSurface,
 }) {
   if (material.domain == FmatDomain.sky) {
     return _emitSkyGlsl(material, defines: defines);
@@ -228,6 +246,10 @@ String emitFragmentGlsl(
   );
   for (final define in defines) {
     sb.writeln('#define $define');
+  }
+  if (maskSurface != null) {
+    sb.writeln('#define $kMaskSurfaceDefine');
+    sb.writeln('#define ${maskSurface.define}');
   }
   if (material.shadingModel == FmatShadingModel.physical) {
     sb.writeln('#define FLUTTER_SCENE_PHYSICAL_MATERIAL');
@@ -393,6 +415,10 @@ String emitFragmentGlsl(
     _writeDepthSurfaceMain(sb, material, uniforms, samplers, depthSurface);
     return sb.toString();
   }
+  if (maskSurface != null) {
+    _writeMaskSurfaceMain(sb, material, uniforms, samplers, maskSurface);
+    return sb.toString();
+  }
 
   // The shaded output, in a function so main() can pick it, the debug view,
   // or a per-pixel split of the two without duplicating the tail.
@@ -530,6 +556,62 @@ void _writeDepthSurfaceMain(
       );
     case DepthSurfaceKind.shadow:
       sb.writeln('  frag_color = vec4(gl_FragCoord.z, 0.0, 0.0, 1.0);');
+  }
+  // The engine blocks the pass binds (the camera ones Surface() may read)
+  // are kept too, so binding them is always valid.
+  final lit = material.shadingModel != FmatShadingModel.unlit;
+  final keepAlive = [
+    ?_fragmentKeepAliveTerm(material, uniforms, samplers),
+    'view_info.camera_forward.x',
+    if (lit) 'frag_info.camera_position.x',
+  ].join(' + ');
+  sb.writeln('  if ($kFragmentKeepAliveInstance.keep_alive.x != 0.0) {');
+  sb.writeln(
+    '    frag_color.r += '
+    '$kFragmentKeepAliveInstance.keep_alive.x * ($keepAlive);',
+  );
+  sb.writeln('  }');
+  sb.writeln('}');
+}
+
+/// Writes the `main()` of the albedo object mask's fragment, from the
+/// material's own `Surface()`: the mask's `MaskInfo` color times the base
+/// color, alpha the `MaskInfo` alpha, as the engine's generic albedo mask
+/// writes. A `Surface()` that discards cuts the mask too.
+void _writeMaskSurfaceMain(
+  StringBuffer sb,
+  FmatMaterial material,
+  List<FmatParameter> uniforms,
+  List<FmatParameter> samplers,
+  MaskSurfaceKind kind,
+) {
+  sb.writeln('uniform MaskInfo {');
+  sb.writeln('  vec4 color;');
+  sb.writeln('}');
+  sb.writeln('mask_info;');
+  // The main shader declares the keep-alive block only when the material
+  // has a resource to keep; this one always keeps the camera blocks.
+  if (uniforms.isEmpty && samplers.isEmpty && material.engineInputs.isEmpty) {
+    sb.writeln('uniform $kFragmentKeepAliveBlock { vec4 keep_alive; }');
+    sb.writeln('$kFragmentKeepAliveInstance;');
+  }
+  sb.writeln();
+  sb.writeln('void main() {');
+  sb.writeln('  MaterialInputs material = InitMaterialInputs();');
+  sb.writeln('  Surface(material);');
+  switch (kind) {
+    case MaskSurfaceKind.albedo:
+      sb.writeln(
+        '  frag_color = vec4(mask_info.color.rgb * material.base_color.rgb, '
+        'mask_info.color.a);',
+      );
+    case MaskSurfaceKind.normal:
+      // World space, encoded like the engine's own normal mask; the per-item
+      // rgb is ignored there too.
+      sb.writeln(
+        '  frag_color = vec4(normalize(material.normal) * 0.5 + 0.5, '
+        'mask_info.color.a);',
+      );
   }
   // The engine blocks the pass binds (the camera ones Surface() may read)
   // are kept too, so binding them is always valid.
@@ -1002,6 +1084,11 @@ Map<String, Object?> buildSidecar(FmatMaterial material) {
       'depth_surface': <String, Object?>{
         for (final kind in DepthSurfaceKind.values)
           kind.sidecarKey: depthSurfaceEntryName(material, kind),
+      },
+    if (materialHasMaskSurface(material))
+      'mask_surface': <String, Object?>{
+        for (final kind in MaskSurfaceKind.values)
+          kind.sidecarKey: maskSurfaceEntryName(material, kind),
       },
     if (material.hasVertexStage)
       'vertex': <String, Object?>{

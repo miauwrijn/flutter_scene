@@ -565,6 +565,7 @@ FmatMaterial _build(
     'depth_write',
     'effects_depth',
     'depth_offset',
+    'mask_surface',
     'depth_test',
     'depth_layer',
     'parameters',
@@ -626,6 +627,21 @@ FmatMaterial _build(
     );
   }
   final effectsDepth = effectsDepthValue as bool? ?? false;
+
+  final maskSurfaceValue = tree['mask_surface'];
+  if (maskSurfaceValue != null && maskSurfaceValue is! bool) {
+    throw FmatException(
+      '`mask_surface` must be a boolean.',
+      fileName: fileName,
+    );
+  }
+  final maskSurface = maskSurfaceValue as bool? ?? false;
+  if (maskSurface && domain == FmatDomain.sky) {
+    throw FmatException(
+      '`mask_surface` applies to surface materials; a sky draws in no mask.',
+      fileName: fileName,
+    );
+  }
   if (effectsDepth && blending == FmatBlending.opaque) {
     throw FmatException(
       '`effects_depth` is for translucent materials; opaque ones already '
@@ -951,6 +967,7 @@ FmatMaterial _build(
     depthWrite: depthWrite,
     effectsDepth: effectsDepth,
     depthOffset: depthOffset,
+    maskSurface: maskSurface,
     depthTest: depthTest,
     depthLayer: depthLayer,
     parameters: parameters,
