@@ -23,13 +23,12 @@ uniform FragInfo {
   // the first of the once-diffuse-SH slots, which are unused now that SH is
   // sampled from sh_coefficients.)
   highp vec4 punctual_dims;
-  // Spot-shadow parameters (more of the unused SH region). x: total
-  // non-cascade shadow atlas tile count, the spot tiles then the point-shadow
-  // tiles (0 disables both; the tiles follow the directional cascades, and the
-  // per-light shadow data rides in the params texture). y: clip-space spot
-  // depth bias. z: world-space spot normal bias. w: spot PCF softness in
-  // texels (point lights carry per-light equivalents in their params rows).
-  highp vec4 spot_shadow_params;
+  // Shadow atlas placement (more of the unused SH region). x: the spot plus
+  // point-shadow tile count (0 disables both; each light's tiles and shadow
+  // parameters ride in its params row). yz: one cascade tile's extent in
+  // atlas UV. w: cascades per atlas row (the cascades fill a grid at the
+  // atlas's top-left corner).
+  highp vec4 shadow_atlas_params;
   // Material scene inputs (more of the unused SH region; see
   // Material.sceneInputs). x: the accumulated scene-color snapshot is bound
   // this draw (scene_opaque_color sampler, emitted only into materials that
@@ -192,9 +191,10 @@ uniform FragInfo {
   highp vec4 view_projection;
   // xyz: the camera's world-space position. w unused.
   highp vec4 camera_position;
-  // The directional light's cookie (see shadow_cookie.glsl). x: enabled,
-  // the cookie riding the shadow atlas as its last tile. y: repeat. zw
-  // unused. Zero when the light has no cookie or casts no shadow.
+  // The directional light's cookie (see shadow_cookie.glsl): its tile in the
+  // shadow atlas. x: the tile's edge in texels (0: no cookie). y: repeat. zw:
+  // the tile's top-left corner in atlas UV. Zero when the light has no
+  // cookie or casts no shadow.
   highp vec4 directional_cookie;
   // xy: 1 / the cookie's size in world units; zw: its offset.
   highp vec4 directional_cookie_transform;

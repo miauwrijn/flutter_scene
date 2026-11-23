@@ -20,29 +20,30 @@ import 'package:flutter_scene/src/render/shadow_pass.dart';
 import 'package:flutter_scene/src/shader_uniform_bindings.dart';
 import 'package:flutter_scene/src/shaders.dart';
 import 'package:flutter_scene/src/render/frame_transients.dart';
+import 'package:flutter_scene/src/render/shadow_atlas_layout.dart';
 import 'package:flutter_scene/src/scene_encoder.dart' show resolvePipeline;
 import 'package:flutter_scene/src/render/uniform_slots.dart';
 
 /// Packs the `PostShadowInfo` std140 block a depth-aware custom pass reads
 /// (exposed as [RenderPassContext.shadowInfo]) from the frame's [cascades],
-/// the light's world-space travel [direction], and its [color] premultiplied by
-/// intensity. Layout: `mat4 light_space_matrix[4]` (world -> cascade clip),
-/// `vec4 cascade_splits` (view-space split distance per cascade), `vec4
-/// light_direction` (xyz direction, w = cascade count), `vec4 light_color`
-/// (rgb, w = the atlas's tile count [totalTiles], spot, point and cookie
-/// tiles included; the cascade count when omitted), then the light's
-/// cookie as `vec4 cookie` (x enabled, y repeat) and `vec4
-/// cookie_transform` (xy 1 / size, zw offset), its tile the atlas's last
-/// (see `shadow_cookie.glsl`). A shader may declare only the leading
-/// fields it reads.
+/// the light's world-space travel [direction], its [color] premultiplied by
+/// intensity, and where the cascades sit in the shadow [atlas]. Layout:
+/// `mat4 light_space_matrix[4]` (world -> cascade clip), `vec4
+/// cascade_splits` (view-space split distance per cascade), `vec4
+/// light_direction` (xyz direction, w = cascade count), `vec4 light_color`,
+/// `vec4 cascade_atlas` (see [RenderPassContext.shadowInfo]), then the
+/// [cookieLight]'s cookie as `vec4 cookie` (x its atlas tile's edge in texels,
+/// 0 for none; y repeat; zw the tile's top-left corner in atlas UV) and `vec4
+/// cookie_transform` (xy 1 / size, zw offset); see `shadow_cookie.glsl`. A
+/// shader may declare only the leading fields it reads.
 ByteData packPostShadowInfo(
   List<ShadowCascade> cascades,
   Vector3 direction,
   Vector3 color, {
-  int? totalTiles,
+  ShadowAtlasLayout? atlas,
   DirectionalLight? cookieLight,
 }) {
-  final f = Float32List(84); // 4 mat4 + 5 vec4
+  final f = Float32List(88); // 4 mat4 + 6 vec4
   final count = cascades.length < 4 ? cascades.length : 4;
   for (var i = 0; i < count; i++) {
     f.setRange(i * 16, i * 16 + 16, cascades[i].lightSpaceMatrix.storage);
@@ -55,14 +56,24 @@ ByteData packPostShadowInfo(
   f[72] = color.x;
   f[73] = color.y;
   f[74] = color.z;
-  f[75] = (totalTiles ?? count).toDouble();
-  if (hasShadowCookieTile(cookieLight, hasCascades: count > 0)) {
-    f[76] = 1.0;
-    f[77] = cookieLight!.cookieRepeat ? 1.0 : 0.0;
-    f[80] = 1.0 / cookieLight.cookieSize.x;
-    f[81] = 1.0 / cookieLight.cookieSize.y;
-    f[82] = cookieLight.cookieOffset.x;
-    f[83] = cookieLight.cookieOffset.y;
+  if (atlas != null && atlas.cascadeColumns > 0) {
+    final extent = atlas.cascadeUvExtent;
+    f[76] = extent.x;
+    f[77] = extent.y;
+    f[78] = atlas.cascadeColumns.toDouble();
+  }
+  final cookieTile = atlas?.cookieTile;
+  if (cookieTile != null &&
+      hasShadowCookieTile(cookieLight, hasCascades: count > 0)) {
+    final rect = cookieTile.uvRect(atlas!.width, atlas.height);
+    f[80] = cookieTile.size.toDouble();
+    f[81] = cookieLight!.cookieRepeat ? 1.0 : 0.0;
+    f[82] = rect.x;
+    f[83] = rect.y;
+    f[84] = 1.0 / cookieLight.cookieSize.x;
+    f[85] = 1.0 / cookieLight.cookieSize.y;
+    f[86] = cookieLight.cookieOffset.x;
+    f[87] = cookieLight.cookieOffset.y;
   }
   return ByteData.sublistView(f);
 }
@@ -279,9 +290,10 @@ class RenderPassContext {
   gpu.Texture? get sceneDepthLinear =>
       _context.blackboard.get<gpu.Texture>(kLinearDepthBlackboardKey);
 
-  /// The shared shadow atlas (a horizontal strip of tiles, window-space depth
-  /// in the red channel): the directional cascades first, then one tile per
-  /// casting spot (see [spotShadows]). Non-null when the pass declared
+  /// The shared shadow atlas (square tiles, window-space depth in the red
+  /// channel, stored top-down): the directional cascades in a grid at its
+  /// top-left corner (see [shadowInfo]), one tile per casting spot (see
+  /// [spotShadows]), and the point lights' cube faces. Non-null when the pass declared
   /// [RenderInput.shadowMap] and a light cast this frame. Pair with
   /// [shadowInfo] for the cascades.
   gpu.Texture? get shadowMap =>
@@ -297,8 +309,11 @@ class RenderPassContext {
   /// The packed `PostShadowInfo` std140 uniform block matching [shadowMap]:
   /// four `mat4` world->cascade-clip matrices, a `vec4` of the cascades'
   /// view-space split distances, a `vec4` light direction (xyz world travel
-  /// direction, w = cascade count), and a `vec4` light color (rgb, premultiplied
-  /// by intensity). Bind it under a `PostShadowInfo` block via
+  /// direction, w = cascade count), a `vec4` light color (rgb, premultiplied
+  /// by intensity), and a `vec4` cascade atlas placement: xy one cascade
+  /// tile's extent in atlas UV and z the cascades per row, so cascade `i` with
+  /// tile UV `uv` samples `(vec2(i % z, i / z) + vec2(uv.x, 1.0 - uv.y)) * xy`.
+  /// Bind it under a `PostShadowInfo` block via
   /// [applyShader]'s `uniforms`. Null when [shadowMap] is null.
   ByteData? get shadowInfo =>
       _context.blackboard.get<ByteData>(kShadowUniformBlackboardKey);
