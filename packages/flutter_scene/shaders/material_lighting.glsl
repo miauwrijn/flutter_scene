@@ -790,17 +790,17 @@ highp vec4 EvaluateLighting(MaterialInputs material) {
 #ifdef FLUTTER_SCENE_LIGHTING_HOOKS
       light_context.distance_attenuation = distance_attenuation;
 #endif
-      // A photometric profile (texel 8.x: its first row, -1 = none): the
+      // A photometric profile (texel 10.x: its first row, -1 = none): the
       // relative intensity by angle from the light's axis (a spot's
-      // direction, a point's axis in texel 8.yzw). For a spot it is the beam,
+      // direction, a point's axis in texel 10.yzw). For a spot it is the beam,
       // replacing the cone below.
-      highp vec4 l8 = FetchPunctualTexel(light_row, 8);
-      bool profiled = l8.x > -0.5;
+      highp vec4 l10 = FetchPunctualTexel(light_row, 10);
+      bool profiled = l10.x > -0.5;
       if (profiled) {
         highp vec3 axis =
-            type > 1.5 ? FetchPunctualTexel(light_row, 2).xyz : l8.yzw;
+            type > 1.5 ? FetchPunctualTexel(light_row, 2).xyz : l10.yzw;
         radiance *= PhotometricProfile(
-            int(l8.x + 0.5), dot(normalize(axis), -punctual_light_vector));
+            int(l10.x + 0.5), dot(normalize(axis), -punctual_light_vector));
       }
       if (type > 1.5) {
         // Spot cone: a squared linear ramp on the cosine between the inner and
@@ -821,9 +821,9 @@ highp vec4 EvaluateLighting(MaterialInputs material) {
         // the geometric normal (the shadow is a geometric property).
 #ifndef FLUTTER_SCENE_SKIP_SHADOWS
         if (cone > 0.0 && l3.y > -0.5 &&
-            frag_info.spot_shadow_params.x > 0.5) {
-          float spot_shadow = SampleSpotShadow(
-              light_row, int(l3.y + 0.5), v_position, GetWorldNormal());
+            frag_info.shadow_atlas_params.x > 0.5) {
+          float spot_shadow =
+              SampleSpotShadow(light_row, v_position, GetWorldNormal());
           radiance *= spot_shadow;
 #ifdef FLUTTER_SCENE_LIGHTING_HOOKS
           light_context.shadow = spot_shadow;
@@ -833,11 +833,11 @@ highp vec4 EvaluateLighting(MaterialInputs material) {
       }
 #if !defined(FLUTTER_SCENE_SKIP_SHADOWS) && !defined(FLUTTER_SCENE_NO_POINT_SHADOWS)
       else if (type > 0.5 && l3.y > -0.5 &&
-               frag_info.spot_shadow_params.x > 0.5) {
+               frag_info.shadow_atlas_params.x > 0.5) {
         // Point shadow, when this light's cube faces ride the shared atlas
-        // (l3.y is its first tile after the cascades).
-        float point_shadow = SamplePointShadow(
-            light_row, l3.y, v_position, GetWorldNormal());
+        // (l3.y is its shadow slot).
+        float point_shadow =
+            SamplePointShadow(light_row, v_position, GetWorldNormal());
         radiance *= point_shadow;
 #ifdef FLUTTER_SCENE_LIGHTING_HOOKS
         light_context.shadow = point_shadow;
