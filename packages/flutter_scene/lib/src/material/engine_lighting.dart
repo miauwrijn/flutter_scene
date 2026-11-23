@@ -26,15 +26,16 @@ import 'package:flutter_scene/src/render/uniform_slots.dart';
 /// [PhysicallyBasedMaterial] and `PreprocessedMaterial` use it so the lighting
 /// packing lives in one place.
 class EngineLightingUniforms {
-  /// The float count of the full `FragInfo` block (848 bytes / 212 floats:
+  /// The float count of the full `FragInfo` block (880 bytes / 220 floats:
   /// the mat4 `environment_transform` ends at float 155, the `ssao_params`
   /// vec4 at floats 156..159, then the `radiance_blend` vec4 at floats
   /// 160..163, `ssao_lighting` at 164..167, `model_scale` at 168..171,
   /// `dielectric_f0` at 172..175, the five irradiance-field vec4s at
   /// 176..195, `froxel_grid` at 196..199, `view_projection` at 200..203, and
-  /// `camera_position` at 204..207, and `depth_projection` at 208..211).
-  /// See the layout map in the implementation.
-  static const fragInfoFloatCount = 212;
+  /// `camera_position` at 204..207, `depth_projection` at 208..211, and the
+  /// directional cookie's two vec4s at 212..219). See the layout map in the
+  /// implementation.
+  static const fragInfoFloatCount = 220;
 
   /// Index of the `dielectric_f0` vec4 in `FragInfo`. [packInto] writes the
   /// standard 0.04 dielectric reflectance; a material with a non-default
@@ -290,6 +291,31 @@ class EngineLightingUniforms {
     fragInfo[209] = depthRow?.y ?? 0.0;
     fragInfo[210] = depthRow?.z ?? 0.0;
     fragInfo[211] = depthRow?.w ?? 0.0;
+    // directional_cookie [212..215] and directional_cookie_transform
+    // [216..219]: the cookie's atlas tile (its edge in texels, 0 for none;
+    // repeat; top-left corner in atlas UV) and its projection. The tile
+    // exists for the whole view (it follows the unmasked light), but a node
+    // outside the light's channels gets no sun and so no cookie.
+    final cookieTile = hasShadowCookieTile(
+          lighting.directionalLight,
+          hasCascades: cascades.isNotEmpty,
+        )
+        ? atlas?.cookieTile
+        : null;
+    final cookieLight = cookieTile != null ? light : null;
+    if (cookieTile != null && cookieLight != null) {
+      final rect = cookieTile.uvRect(atlas!.width, atlas.height);
+      fragInfo[212] = cookieTile.size.toDouble();
+      fragInfo[213] = cookieLight.cookieRepeat ? 1.0 : 0.0;
+      fragInfo[214] = rect.x;
+      fragInfo[215] = rect.y;
+      fragInfo[216] = 1.0 / cookieLight.cookieSize.x;
+      fragInfo[217] = 1.0 / cookieLight.cookieSize.y;
+      fragInfo[218] = cookieLight.cookieOffset.x;
+      fragInfo[219] = cookieLight.cookieOffset.y;
+    } else {
+      fragInfo.fillRange(212, 220, 0.0);
+    }
     // shadow_atlas_params [12..15] (more of the unused SH region). x is the
     // spot plus point-shadow tile count, 0 disabling both; yz one cascade
     // tile's extent in atlas UV, and w the cascades per atlas row.

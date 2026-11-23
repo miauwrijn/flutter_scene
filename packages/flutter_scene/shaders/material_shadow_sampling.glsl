@@ -8,6 +8,8 @@
 // material_engine_lighting.glsl.
 
 #ifndef FLUTTER_SCENE_SKIP_SHADOWS
+#include <shadow_cookie.glsl>
+
 // Places a tile UV (v up, as `ndc * 0.5 + 0.5`) in the atlas tile whose
 // top-left corner is `origin` and extent `extent`, both in atlas UV. The atlas
 // is a render-to-texture target stored top-down, so a top-down texture's top
@@ -340,6 +342,14 @@ float SampleShadow(highp vec3 world_pos, vec3 n) {
   // Weight no cascade covered reads as lit.
   float shadow = shadow_sum + (1.0 - weight);
   return mix(shadow, 1.0, fade);
+}
+
+// The directional light's cookie at [world_pos] (1 = unaffected): its tile
+// of the shadow atlas, when the light has one (see shadow_cookie.glsl).
+float SampleDirectionalCookie(highp vec3 world_pos) {
+  return SampleShadowCookie(
+      shadow_map, world_pos, frag_info.directional_light_direction.xyz,
+      frag_info.directional_cookie, frag_info.directional_cookie_transform);
 }
 #endif
 

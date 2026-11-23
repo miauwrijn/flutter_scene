@@ -34,16 +34,21 @@ uniform PostCameraInfo {
 cam;
 
 // Per-cascade world->light-clip matrices, view-space split distances, the light
-// travel direction (xyz) with the cascade count in w, the light color, and the
-// cascades' atlas placement (xy one tile's UV extent, z cascades per row).
+// travel direction (xyz) with the cascade count in w, the light color, the
+// cascades' atlas placement (xy one tile's UV extent, z cascades per row), and
+// the light's cookie (see shadow_cookie.glsl and packPostShadowInfo).
 uniform PostShadowInfo {
   mat4 light_space_matrix[4];
   vec4 cascade_splits;
   vec4 light_direction;
   vec4 light_color;
   vec4 cascade_atlas;
+  vec4 cookie;
+  vec4 cookie_transform;
 }
 shadow;
+
+#include <shadow_cookie.glsl>
 
 // params0: (intensity, density, anisotropy g, step count).
 // params1: (max distance, jitter, -, -). color: rgb tint * the light color.
@@ -156,7 +161,13 @@ void main() {
   for (int i = 0; i < kMaxSteps; i++) {
     if (i >= steps) break;
     vec3 p = ray_origin + ray_dir * (offset + float(i) * step_len);
-    lit_sum += ShadowVisibility(p, count);
+    float lit = ShadowVisibility(p, count);
+    // The light's cookie shapes the shafts as it shapes the lit surfaces.
+    if (lit > 0.0) {
+      lit *= SampleShadowCookie(input_shadow, p, shadow.light_direction.xyz,
+                                shadow.cookie, shadow.cookie_transform);
+    }
+    lit_sum += lit;
   }
   float avg_lit = lit_sum / float(steps);
 

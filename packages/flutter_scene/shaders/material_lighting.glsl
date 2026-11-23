@@ -517,7 +517,8 @@ highp vec4 EvaluateLighting(MaterialInputs material) {
   shadow =
       (frag_info.has_directional_light > 0.5 && frag_info.casts_shadow > 0.5 &&
        facing > 0.0)
-          ? SampleShadow(v_position, GetWorldNormal())
+          ? SampleShadow(v_position, GetWorldNormal()) *
+                SampleDirectionalCookie(v_position)
           : 1.0;
 #endif
 #if !defined(FLUTTER_SCENE_SKIP_SSAO) && \

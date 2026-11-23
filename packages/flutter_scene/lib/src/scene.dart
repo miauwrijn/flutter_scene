@@ -196,7 +196,7 @@ enum AntiAliasingMode {
 
 /// Packs the frame's shadows into the shared atlas: the primary directional
 /// light's cascades, then each casting spot and point light at its own
-/// `shadowMapResolution`. Pure, so every view and capture of a frame plans
+/// `shadowMapResolution`, then the directional light's cookie. Pure, so every view and capture of a frame plans
 /// the same layout the punctual light rows were stamped with.
 ShadowAtlasLayout? _planShadowAtlas(
   DirectionalLightComponent? lightComponent,
@@ -216,6 +216,11 @@ ShadowAtlasLayout? _planShadowAtlas(
       for (final caster in pointShadowFrame?.casters ?? const [])
         caster.light.shadowMapResolution,
     ],
+    // The cookie rides the atlas as one more tile (no texture unit of its
+    // own), at the cascades' resolution.
+    cookieResolution: hasShadowCookieTile(light, hasCascades: cascaded)
+        ? light!.shadowMapResolution
+        : 0,
   );
 }
 
@@ -4333,6 +4338,7 @@ base class Scene implements SceneGraph {
           spotShadows: spotShadowFrame,
           pointShadows: pointShadowFrame,
           cachePlan: shadowCachePlan,
+          cookieLight: cascades.isNotEmpty ? light : null,
           shared:
               groupShadows?.atlas ??
               (cascades.isEmpty &&
@@ -4350,6 +4356,7 @@ base class Scene implements SceneGraph {
                   lightDirection ?? light!.direction,
                   light!.color * light.intensity,
                   atlas: shadowAtlas,
+                  cookieLight: light,
                 )
               : null,
         ),

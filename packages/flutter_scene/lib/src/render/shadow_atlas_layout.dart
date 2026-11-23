@@ -58,6 +58,7 @@ class ShadowAtlasLayout {
     required this.cascadeTiles,
     required this.spotTiles,
     required this.pointTiles,
+    this.cookieTile,
   });
 
   /// Plans the atlas for [cascadeCount] cascades at [cascadeResolution], one
@@ -68,6 +69,7 @@ class ShadowAtlasLayout {
     int cascadeResolution = 0,
     List<int> spotResolutions = const [],
     List<int> pointFaceResolutions = const [],
+    int cookieResolution = 0,
     int maxDimension = kShadowAtlasMaxDimension,
   }) {
     if (cascadeResolution <= 0) cascadeCount = 0;
@@ -83,6 +85,9 @@ class ShadowAtlasLayout {
         clampEdge(r * 2),
         clampEdge(r * 2),
       ],
+      // The directional light's cookie, after every shadow tile (see
+      // DirectionalLight.cookie).
+      if (cookieResolution > 0) clampEdge(cookieResolution),
     ];
     final cascadeRequest = cascadeCount == 0 ? 0 : clampEdge(cascadeResolution);
 
@@ -109,6 +114,7 @@ class ShadowAtlasLayout {
           // The caster budgets keep the minimum from overflowing; if it ever
           // does, the layout grows past the limit rather than failing.
           atMinimum ? 1 << 30 : maxDimension,
+          cookie: cookieResolution > 0,
         );
         if (layout != null) return layout;
         if (itemsAtMinimum) break;
@@ -121,8 +127,9 @@ class ShadowAtlasLayout {
     int cascadeEdge,
     List<int> sizes,
     int spotCount,
-    int maxDimension,
-  ) {
+    int maxDimension, {
+    bool cookie = false,
+  }) {
     final columns = cascadeCount == 0
         ? 0
         : math.min(cascadeCount, math.max(1, maxDimension ~/ cascadeEdge));
@@ -176,7 +183,11 @@ class ShadowAtlasLayout {
           ),
       ],
       spotTiles: best.tiles.sublist(0, spotCount),
-      pointTiles: best.tiles.sublist(spotCount),
+      pointTiles: best.tiles.sublist(
+        spotCount,
+        best.tiles.length - (cookie ? 1 : 0),
+      ),
+      cookieTile: cookie ? best.tiles.last : null,
     );
   }
 
@@ -241,6 +252,11 @@ class ShadowAtlasLayout {
   /// first holds faces 0 to 3 in quadrants, the second faces 4 and 5 in its
   /// top half.
   final List<ShadowAtlasTile> pointTiles;
+
+  /// The directional light's cookie tile (see `DirectionalLight.cookie`),
+  /// null when the frame has none. The shadow pass copies the cookie into it
+  /// each frame, and the lit and god-rays shaders sample it by its rect.
+  final ShadowAtlasTile? cookieTile;
 
   /// A cascade tile's extent in atlas UV.
   Vector2 get cascadeUvExtent =>
