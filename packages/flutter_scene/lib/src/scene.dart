@@ -4306,6 +4306,7 @@ base class Scene implements SceneGraph {
           viewLayerMask: view.layerMask,
           passIndex: beforeSceneIndex++,
           time: postTime,
+          primaryView: viewIndex >= 0,
         ),
       );
     }
@@ -4766,6 +4767,7 @@ base class Scene implements SceneGraph {
           viewLayerMask: view.layerMask,
           passIndex: 0,
           time: postTime,
+          primaryView: viewIndex >= 0,
         ),
       );
     }
@@ -4795,6 +4797,7 @@ base class Scene implements SceneGraph {
       height,
       view.layerMask,
       postTime,
+      primaryView: viewIndex >= 0,
     );
 
     // Depth of field on the linear HDR scene color, before the custom
@@ -4901,6 +4904,7 @@ base class Scene implements SceneGraph {
       height,
       view.layerMask,
       postTime,
+      primaryView: viewIndex >= 0,
     );
 
     // The display-referred chain is an ordered list of color-writing passes.
@@ -4943,6 +4947,7 @@ base class Scene implements SceneGraph {
           viewLayerMask: view.layerMask,
           passIndex: 0,
           time: postTime,
+          primaryView: viewIndex >= 0,
         ),
       );
     }
@@ -4960,6 +4965,7 @@ base class Scene implements SceneGraph {
           viewLayerMask: view.layerMask,
           passIndex: index,
           time: postTime,
+          primaryView: viewIndex >= 0,
         ),
       );
     }
@@ -5025,6 +5031,7 @@ base class Scene implements SceneGraph {
           viewLayerMask: view.layerMask,
           passIndex: index,
           time: postTime,
+          primaryView: viewIndex >= 0,
         ),
       );
     }
@@ -5289,8 +5296,9 @@ base class Scene implements SceneGraph {
     int width,
     int height,
     int viewLayerMask,
-    double time,
-  ) {
+    double time, {
+    required bool primaryView,
+  }) {
     var i = 0;
     for (final pass in _passesAt(stage)) {
       final output = pool.acquire(
@@ -5311,6 +5319,7 @@ base class Scene implements SceneGraph {
           viewLayerMask: viewLayerMask,
           passIndex: i,
           time: time,
+          primaryView: primaryView,
         ),
       );
       i++;
