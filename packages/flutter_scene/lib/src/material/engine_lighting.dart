@@ -654,6 +654,17 @@ class EngineLightingUniforms {
         // the portable choice.
         sampler: _nearestSampler,
       );
+      // The application's screen-space sun visibility (white: none). Only
+      // variants with a directional light declare it.
+      try {
+        pass.bindTexture(
+          shader.cachedUniformSlot('sun_visibility'),
+          Material.whitePlaceholder(lighting.sunVisibilityMap),
+          sampler: _clampLinearSampler,
+        );
+      } on Exception catch (error) {
+        if (!error.toString().contains('no texture named')) rethrow;
+      }
     }
     // The environment's diffuse SH coefficients, or the irradiance field's
     // atlas (whose first two rows are that same strip) when the field is on.

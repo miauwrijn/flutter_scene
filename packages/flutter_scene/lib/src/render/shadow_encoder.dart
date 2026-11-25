@@ -65,6 +65,7 @@ class ShadowEncoder {
     ShadowCasterFilter filter = ShadowCasterFilter.all,
     int casterChannelMask = 0xFF,
     this.receiverPlanes = const [],
+    this.cascadeIndex = -1,
   }) : _filter = filter,
        _casterChannelMask = casterChannelMask {
     frustum = Frustum.matrix(_lightSpaceMatrix);
@@ -88,6 +89,10 @@ class ShadowEncoder {
     _currentCullMode = _casterCullMode;
     _renderPass.setWindingOrder(gpu.WindingOrder.clockwise);
   }
+
+  /// The directional cascade this encoder renders, or -1
+  /// ([MeshDrawContext.shadowCascade]).
+  final int cascadeIndex;
 
   final gpu.RenderPass _renderPass;
   final TransientWriter _transientsBuffer;
@@ -224,6 +229,7 @@ class ShadowEncoder {
       MeshDrawPass.shadow,
       _cameraPosition,
       false,
+      shadowCascade: cascadeIndex,
     );
     try {
       if (selection.instanceCount == 0) return;

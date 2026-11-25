@@ -374,5 +374,9 @@
   "DisplayReferredCompositeFragment": {
     "type": "fragment",
     "file": "shaders/flutter_scene_display_referred_composite.frag"
+  },
+  "LinearDepthSurfacesFragment": {
+    "type": "fragment",
+    "file": "shaders/flutter_scene_linear_depth_surfaces.frag"
   }
 }

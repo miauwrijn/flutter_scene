@@ -124,6 +124,12 @@ enum SurfaceDebugChannel {
     rangeMax: 0.0,
   ),
 
+  /// How many opaque fragments land on each pixel: every one adds the same
+  /// small amount (additive blending, no depth test), so one layer is dark
+  /// red and about twenty-four are white. Fragments a material discards are
+  /// not counted. Nanite's overdraw view.
+  overdraw(19, 'overdraw', 'Overdraw', SurfaceDebugGroup.geometry),
+
   baseColor(20, 'base_color', 'Base color', SurfaceDebugGroup.surface),
   alpha(21, 'alpha', 'Alpha', SurfaceDebugGroup.surface),
   metallic(22, 'metallic', 'Metallic', SurfaceDebugGroup.surface),

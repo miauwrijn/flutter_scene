@@ -1252,6 +1252,12 @@ base class Scene implements SceneGraph {
   /// vertex shader that moves geometry beyond its bounds). Defaults to true.
   bool fitNearPlane = true;
 
+  /// The per-item colors of the prepass's surfaces (`RenderInput.surfaces`):
+  /// what a pass reading them would have passed `drawObjects` as `colorOf`
+  /// for the albedo and the normal masks. Null: the surfaces are not
+  /// produced.
+  PrepassSurfaceColors? prepassSurfaceColors;
+
   /// Linear exposure multiplier applied to the HDR scene color before
   /// tone mapping. `1.0` (the default) is neutral; see
   /// [physicalCameraExposure] to derive a value from camera settings.
@@ -4307,6 +4313,7 @@ base class Scene implements SceneGraph {
           passIndex: beforeSceneIndex++,
           time: postTime,
           primaryView: viewIndex >= 0,
+          shadowCascades: cascades,
         ),
       );
     }
@@ -4446,7 +4453,11 @@ base class Scene implements SceneGraph {
         projectionValid &&
         screenSpaceReflections.enabled;
     // A custom pass may request depth/normals; normals imply depth.
-    final wantCustomNormals = customInputs.contains(RenderInput.normals);
+    final surfaceColors = customInputs.contains(RenderInput.surfaces)
+        ? prepassSurfaceColors
+        : null;
+    final wantCustomNormals =
+        customInputs.contains(RenderInput.normals) || surfaceColors != null;
     final wantCustomDepth =
         wantCustomNormals || customInputs.contains(RenderInput.depth);
     // Flutter GPU does not expose whether a stored depth/stencil attachment is
@@ -4521,6 +4532,7 @@ base class Scene implements SceneGraph {
             farDepth: projection.far,
             layerMask: view.layerMask,
             writeNormals: wantSsr || wantCustomNormals || wantIrradianceField,
+            surfaceColors: surfaceColors,
             // The translucent depth patch depth-tests against this
             // attachment. Storing it (a non-transient attachment plus store
             // bandwidth) is paid whenever the patch is wanted, whether or
@@ -4628,6 +4640,26 @@ base class Scene implements SceneGraph {
           environmentMap: environmentMap,
         );
       }
+    }
+    // Custom passes between the prepass and the scene: they read the
+    // frame's depth and publish what the scene pass consumes (a sun
+    // visibility, say).
+    var afterPrepassIndex = 0;
+    for (final pass in _passesAt(RenderStage.afterDepthPrepass)) {
+      graph.addPass(
+        UserRenderGraphPass(
+          pass: pass,
+          camera: camera,
+          dimensions: pixelSize,
+          destination: null,
+          renderScene: renderScene,
+          viewLayerMask: view.layerMask,
+          passIndex: afterPrepassIndex++,
+          time: postTime,
+          primaryView: viewIndex >= 0,
+          shadowCascades: cascades,
+        ),
+      );
     }
     graph.addPass(
       ScenePass(

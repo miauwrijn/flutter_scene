@@ -204,8 +204,45 @@ Set<String> lightingHooksIn(String fragmentSource) {
 /// Whether [material] ships its own depth-pass fragments: an opaque cutout
 /// (`alpha_to_coverage`) whose shader reads no engine scene inputs.
 bool materialHasDepthSurface(FmatMaterial material) =>
-    (material.alphaToCoverage || material.effectsDepth) &&
+    (material.alphaToCoverage ||
+        material.effectsDepth ||
+        material.cutout ||
+        material.shadowCutout) &&
     material.engineInputs.isEmpty;
+
+final RegExp _discardPattern = RegExp(r'\bdiscard\s*;');
+
+/// Whether [material] draws through the main pass's coverage pre-draw: an
+/// opaque cutout whose `Surface()` discards. Its coverage fragment
+/// ([DepthSurfaceKind.coverage]) runs `Surface()` with the discards; its lit
+/// variants are compiled without them and shade, after the pre-draw, only
+/// the pixels it kept (equal depth test), each once — a discard in a lit
+/// shader turned off early depth and hidden-surface removal for every
+/// fragment of every layer of a canopy.
+bool materialHasCoverageSurface(FmatMaterial material) =>
+    material.cutout &&
+    materialHasDepthSurface(material) &&
+    material.blending == FmatBlending.opaque &&
+    _discardPattern.hasMatch(material.fragmentSource);
+
+/// The depth-surface kinds [material] ships.
+///
+/// A `cutout:`-only material (no `alpha_to_coverage`, no `effects_depth`)
+/// ships just its coverage fragment: its depth prepass and shadow maps keep
+/// the engine's plain depth shaders (running `Surface()` in every shadow
+/// cascade cost a canopy several times its frame).
+Iterable<DepthSurfaceKind> depthSurfaceKindsOf(FmatMaterial material) {
+  // The full set for alpha to coverage and displaced depth; a `cutout:`
+  // material only its coverage, a `shadow_cutout:` one only its shadow.
+  final full = material.alphaToCoverage || material.effectsDepth;
+  return DepthSurfaceKind.values.where(
+    (k) => switch (k) {
+      DepthSurfaceKind.coverage => materialHasCoverageSurface(material),
+      DepthSurfaceKind.shadow => full || material.shadowCutout,
+      _ => full,
+    },
+  );
+}
 
 /// Whether [material] ships its own object-mask fragments
 /// (`mask_surface: true`, one per [MaskSurfaceKind]): a surface material
@@ -215,6 +252,21 @@ bool materialHasMaskSurface(FmatMaterial material) =>
     material.domain == FmatDomain.surface &&
     material.engineInputs.isEmpty &&
     material.shadingModel != FmatShadingModel.shadowCatcher;
+
+/// The object-mask variants [material] is built with: all of them for a
+/// `mask_surface` material; for one that cuts its depth by its own
+/// `Surface()` (a depth surface), the prepass one alone — the prepass with
+/// surfaces draws it with its own cut, writing what the engine's masks
+/// would (white, the surface normal), not leaving those targets clear.
+List<MaskSurfaceKind> maskSurfaceKindsOf(FmatMaterial material) {
+  if (materialHasMaskSurface(material)) return MaskSurfaceKind.values;
+  if (materialHasDepthSurface(material) &&
+      material.domain == FmatDomain.surface &&
+      material.shadingModel != FmatShadingModel.shadowCatcher) {
+    return const [MaskSurfaceKind.prepass];
+  }
+  return const [];
+}
 
 /// The define every `mask_surface` variant is compiled with (beside its
 /// [MaskSurfaceKind.define]).
@@ -250,6 +302,9 @@ String emitFragmentGlsl(
   if (maskSurface != null) {
     sb.writeln('#define $kMaskSurfaceDefine');
     sb.writeln('#define ${maskSurface.define}');
+    if (maskSurface == MaskSurfaceKind.prepass) {
+      sb.writeln('#define FLUTTER_SCENE_SURFACE_TARGETS');
+    }
   }
   if (material.shadingModel == FmatShadingModel.physical) {
     sb.writeln('#define FLUTTER_SCENE_PHYSICAL_MATERIAL');
@@ -407,8 +462,15 @@ String emitFragmentGlsl(
 
   // Map compiler errors in the author's code back to the .fmat source line.
   sb.writeln('#line ${material.fragmentSourceLine}');
-  sb.write(material.fragmentSource);
-  if (!material.fragmentSource.endsWith('\n')) sb.writeln();
+  // A coverage material's lit variants: no discard (the pre-draw cut it).
+  final source =
+      depthSurface == null &&
+          maskSurface == null &&
+          materialHasCoverageSurface(material)
+      ? material.fragmentSource.replaceAll(_discardPattern, ';')
+      : material.fragmentSource;
+  sb.write(source);
+  if (!source.endsWith('\n')) sb.writeln();
   sb.writeln();
 
   if (depthSurface != null) {
@@ -519,6 +581,7 @@ void _writeDepthSurfaceMain(
       );
       sb.writeln('}');
     case DepthSurfaceKind.shadow:
+    case DepthSurfaceKind.coverage:
       break;
   }
   // The main shader declares the keep-alive block only when the material
@@ -556,6 +619,9 @@ void _writeDepthSurfaceMain(
       );
     case DepthSurfaceKind.shadow:
       sb.writeln('  frag_color = vec4(gl_FragCoord.z, 0.0, 0.0, 1.0);');
+    case DepthSurfaceKind.coverage:
+      // Overwritten by the lit draw that follows.
+      sb.writeln('  frag_color = vec4(0.0);');
   }
   // The engine blocks the pass binds (the camera ones Surface() may read)
   // are kept too, so binding them is always valid.
@@ -585,10 +651,33 @@ void _writeMaskSurfaceMain(
   List<FmatParameter> samplers,
   MaskSurfaceKind kind,
 ) {
-  sb.writeln('uniform MaskInfo {');
-  sb.writeln('  vec4 color;');
-  sb.writeln('}');
-  sb.writeln('mask_info;');
+  if (kind == MaskSurfaceKind.prepass) {
+    // The engine prepass blocks' layouts, so the pass binds them unchanged
+    // (flutter_scene_linear_depth_surfaces.frag).
+    sb.writeln('uniform DepthNormalInfo {');
+    sb.writeln('  vec4 camera_forward;');
+    sb.writeln('  vec4 camera_right;');
+    sb.writeln('  vec4 camera_up;');
+    sb.writeln('  vec4 roughness_uv_transform;');
+    sb.writeln('  vec4 roughness_uv_rotation;');
+    sb.writeln('}');
+    sb.writeln('info;');
+    sb.writeln('uniform PrepassSurfaceInfo {');
+    sb.writeln('  vec4 albedo_color;');
+    sb.writeln('  vec4 normal_color;');
+    sb.writeln('}');
+    sb.writeln('prepass_surface;');
+    sb.writeln('vec2 PrepassOctEncode(vec3 n) {');
+    sb.writeln('  n /= (abs(n.x) + abs(n.y) + abs(n.z));');
+    sb.writeln('  return n.z >= 0.0 ? n.xy : (1.0 - abs(n.yx)) *');
+    sb.writeln('      vec2(n.x >= 0.0 ? 1.0 : -1.0, n.y >= 0.0 ? 1.0 : -1.0);');
+    sb.writeln('}');
+  } else {
+    sb.writeln('uniform MaskInfo {');
+    sb.writeln('  vec4 color;');
+    sb.writeln('}');
+    sb.writeln('mask_info;');
+  }
   // The main shader declares the keep-alive block only when the material
   // has a resource to keep; this one always keeps the camera blocks.
   if (uniforms.isEmpty && samplers.isEmpty && material.engineInputs.isEmpty) {
@@ -612,6 +701,32 @@ void _writeMaskSurfaceMain(
         '  frag_color = vec4(normalize(material.normal) * 0.5 + 0.5, '
         'mask_info.color.a);',
       );
+    case MaskSurfaceKind.prepass:
+      sb
+        ..writeln(
+          '  float view_depth = -dot(v_viewvector, info.camera_forward.xyz);',
+        )
+        ..writeln('  vec3 n = normalize(material.normal);')
+        ..writeln('  vec3 view_normal = normalize(vec3(')
+        ..writeln('      dot(n, info.camera_right.xyz),')
+        ..writeln('      dot(n, info.camera_up.xyz),')
+        ..writeln('      dot(n, info.camera_forward.xyz)));')
+        ..writeln('  vec2 oct = PrepassOctEncode(view_normal);')
+        ..writeln(
+          '  frag_color = vec4(view_depth, oct.x, oct.y, '
+          'clamp(material.roughness, 0.0, 1.0));',
+        )
+        // The albedo mask draws a material without `mask_surface` white.
+        ..writeln(
+          material.maskSurface
+              ? '  frag_albedo = vec4(prepass_surface.albedo_color.rgb * '
+                    'material.base_color.rgb, prepass_surface.albedo_color.a);'
+              : '  frag_albedo = prepass_surface.albedo_color;',
+        )
+        ..writeln(
+          '  frag_normal = vec4(n * 0.5 + 0.5, '
+          'prepass_surface.normal_color.a);',
+        );
   }
   // The engine blocks the pass binds (the camera ones Surface() may read)
   // are kept too, so binding them is always valid.
@@ -1082,12 +1197,12 @@ Map<String, Object?> buildSidecar(FmatMaterial material) {
       'instance_record_bytes': material.instanceRecordBytes,
     if (materialHasDepthSurface(material))
       'depth_surface': <String, Object?>{
-        for (final kind in DepthSurfaceKind.values)
+        for (final kind in depthSurfaceKindsOf(material))
           kind.sidecarKey: depthSurfaceEntryName(material, kind),
       },
-    if (materialHasMaskSurface(material))
+    if (maskSurfaceKindsOf(material).isNotEmpty)
       'mask_surface': <String, Object?>{
-        for (final kind in MaskSurfaceKind.values)
+        for (final kind in maskSurfaceKindsOf(material))
           kind.sidecarKey: maskSurfaceEntryName(material, kind),
       },
     if (material.hasVertexStage)

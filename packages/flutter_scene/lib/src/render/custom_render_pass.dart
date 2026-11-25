@@ -101,6 +101,13 @@ enum RenderStage {
   /// [CustomRenderPass.inputs] are not produced for it.
   beforeScene,
 
+  /// After the depth prepass (and the ambient occlusion), before the scene
+  /// is drawn: the frame's depth, normals and shadows can be read
+  /// ([CustomRenderPass.inputs]) and what the scene pass consumes can be
+  /// published (see [RenderPassContext.publishSunVisibility]). No color
+  /// chain, as at [beforeScene].
+  afterDepthPrepass,
+
   /// Right after the scene is drawn (opaque and transparent), on the linear
   /// HDR scene color, before bloom and any HDR custom effects.
   afterScene,
@@ -136,6 +143,15 @@ enum RenderInput {
   /// View-space normals, octahedral-packed into the green/blue channels of the
   /// same buffer as [depth] (which this implies).
   normals,
+
+  /// The prepass's surfaces (which implies [normals]): the receiver albedo
+  /// and the shading normal a pixel, what the albedo and normal object masks
+  /// ([drawObjects] with [MaskContent.albedo] / [MaskContent.normal]) draw,
+  /// written by the prepass itself — no redraw. On
+  /// [RenderPassContext.sceneSurfaceAlbedo] / [sceneSurfaceNormal], with
+  /// the per-item colors of `Scene.prepassSurfaceColors` (none set: not
+  /// produced).
+  surfaces,
 
   /// The directional light's cascaded shadow map, on
   /// [RenderPassContext.shadowMap], with [RenderPassContext.shadowInfo] for its
@@ -204,6 +220,11 @@ abstract class CustomRenderPass {
   void execute(RenderPassContext context);
 }
 
+/// Render-graph blackboard key of the screen-space sun visibility a
+/// [RenderStage.afterDepthPrepass] pass published
+/// ([RenderPassContext.publishSunVisibility]).
+const String kSunVisibilityBlackboardKey = 'sun_visibility';
+
 /// The frame context handed to [CustomRenderPass.execute].
 ///
 /// A friendlier facade over the internal render graph. It exposes the
@@ -225,7 +246,13 @@ class RenderPassContext {
     this._passKey,
     this._time, {
     this.primaryView = false,
+    this.shadowCascades = const [],
   });
+
+  /// The frame's directional shadow cascades (what the shadow pass renders
+  /// after a [RenderStage.beforeScene] pass), in order; empty when the sun
+  /// casts none.
+  final List<ShadowCascade> shadowCascades;
 
   final RenderGraphContext _context;
 
@@ -296,6 +323,25 @@ class RenderPassContext {
   /// prepass wrote no normals, and `r32g32b32a32Float` when it did.
   gpu.Texture? get sceneDepthLinear =>
       _context.blackboard.get<gpu.Texture>(kLinearDepthBlackboardKey);
+
+  /// The prepass's receiver albedo ([RenderInput.surfaces]): rgb the base
+  /// color times the per-item color, a the per-item alpha. Null when not
+  /// produced.
+  gpu.Texture? get sceneSurfaceAlbedo =>
+      _context.blackboard.get<gpu.Texture>(kPrepassAlbedoBlackboardKey);
+
+  /// The prepass's shading normal ([RenderInput.surfaces]): world normal
+  /// n * 0.5 + 0.5, a the per-item alpha. Null when not produced.
+  gpu.Texture? get sceneSurfaceNormal =>
+      _context.blackboard.get<gpu.Texture>(kPrepassNormalBlackboardKey);
+
+  /// Publishes a screen-space sun visibility for this frame's scene pass
+  /// (from a [RenderStage.afterDepthPrepass] pass): the render target's size,
+  /// 1 lit .. 0 shadowed in red, stored top-down like the prepass's targets.
+  /// Every lit surface multiplies its sun shadow by it — a second shadow
+  /// source beside the cascades (an application's virtual shadow map, say).
+  void publishSunVisibility(gpu.Texture texture) =>
+      _context.blackboard.set(kSunVisibilityBlackboardKey, texture);
 
   /// The shared shadow atlas (square tiles, window-space depth in the red
   /// channel, stored top-down): the directional cascades in a grid at its
@@ -383,9 +429,9 @@ class RenderPassContext {
 
   // Whether this stage operates on the HDR scene color or the display image.
   Object get _chainKey => switch (stage) {
-    RenderStage.beforeScene => throw StateError(
-      'A RenderStage.beforeScene pass has no color chain: nothing of the '
-      'view is drawn yet.',
+    RenderStage.beforeScene || RenderStage.afterDepthPrepass => throw StateError(
+      'A RenderStage.beforeScene or afterDepthPrepass pass has no color '
+      'chain: nothing of the view is drawn yet.',
     ),
     RenderStage.afterScene ||
     RenderStage.beforeToneMapping => kSceneColorBlackboardKey,
@@ -558,6 +604,7 @@ class UserRenderGraphPass extends RenderGraphPass {
     required int viewLayerMask,
     required int passIndex,
     required double time,
+    this.shadowCascades = const [],
     bool primaryView = false,
   }) : _pass = pass,
        _primaryView = primaryView,
@@ -578,6 +625,7 @@ class UserRenderGraphPass extends RenderGraphPass {
   final int _passIndex;
   final double _time;
   final bool _primaryView;
+  final List<ShadowCascade> shadowCascades;
 
   @override
   String get name => _pass.name;
@@ -595,6 +643,7 @@ class UserRenderGraphPass extends RenderGraphPass {
       '${_pass.stage.name}_$_passIndex',
       _time,
       primaryView: _primaryView,
+      shadowCascades: shadowCascades,
     );
     _pass.execute(passContext);
     final destination = _destination;

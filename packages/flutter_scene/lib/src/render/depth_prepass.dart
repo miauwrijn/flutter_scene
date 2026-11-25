@@ -3,7 +3,8 @@ import 'dart:math' as math;
 
 import 'package:flutter_scene/src/render/viewport_camera.dart';
 import 'package:flutter_scene/src/render/depth_raster.dart';
-import 'package:flutter_scene/src/fmat/fmat_ast.dart' show DepthSurfaceKind;
+import 'package:flutter_scene/src/fmat/fmat_ast.dart'
+    show DepthSurfaceKind, MaskSurfaceKind;
 import 'package:flutter_scene/src/mesh_draw.dart';
 import 'package:flutter_scene/src/render/instance_packing.dart';
 import 'package:flutter_scene/src/render/mesh_draw_selection.dart';
@@ -43,6 +44,21 @@ const String kLinearDepthBlackboardKey = 'linear_depth';
 /// translucent surfaces against the opaque scene.
 const String kPrepassDepthStencilBlackboardKey = 'prepass_depth_stencil';
 
+/// Render-graph blackboard keys of the prepass's surfaces
+/// (`RenderInput.surfaces`): the receiver albedo (rgb, times the per-item
+/// color; a, the per-item alpha) and the shading normal (world, n * 0.5 +
+/// 0.5; a, the per-item alpha) — what the albedo and normal object masks
+/// draw, from the prepass itself.
+const String kPrepassAlbedoBlackboardKey = 'prepass_albedo';
+const String kPrepassNormalBlackboardKey = 'prepass_normal';
+
+/// The per-item colors the prepass's surfaces multiply in (see
+/// `Scene.prepassSurfaceColors`): the albedo target's and the normal's.
+typedef PrepassSurfaceColors = ({
+  Vector4 Function(Object node) albedo,
+  Vector4 Function(Object node) normal,
+});
+
 /// Renders the opaque scene's depth from the camera into a linear-depth
 /// color target and publishes it on the render-graph blackboard.
 ///
@@ -64,6 +80,7 @@ class DepthPrepass extends RenderGraphPass {
     required double farDepth,
     int layerMask = kRenderLayerAll,
     bool writeNormals = false,
+    this.surfaceColors,
     bool keepDepthStencil = false,
     Vector3? cameraRight,
     Vector3? cameraUp,
@@ -80,7 +97,7 @@ class DepthPrepass extends RenderGraphPass {
        _farDepth = farDepth,
        _layerMask = layerMask,
        _cullingPlanes = cullingPlanes,
-       _writeNormals = writeNormals,
+       _writeNormals = writeNormals || surfaceColors != null,
        _keepDepthStencil = keepDepthStencil,
        _cameraRight = cameraRight ?? Vector3.zero(),
        _cameraUp = cameraUp ?? Vector3.zero(),
@@ -104,6 +121,10 @@ class DepthPrepass extends RenderGraphPass {
   // shader (the depth-only position path carries no normal), so it is left
   // off when only ambient occlusion needs the prepass.
   final bool _writeNormals;
+
+  /// When set, the prepass also writes the surfaces (albedo, shading normal)
+  /// with these per-item colors (`RenderInput.surfaces`).
+  final PrepassSurfaceColors? surfaceColors;
 
   // When set, the depth-stencil attachment is stored (instead of the default
   // discard) and published, so [TranslucentDepthPatchPass] can test against
@@ -157,13 +178,42 @@ class DepthPrepass extends RenderGraphPass {
               debugName: 'depth_prepass_depth',
             ),
     );
-    final target = gpu.RenderTarget.singleColor(
-      gpu.ColorAttachment(
-        texture: linearDepth,
-        // Background texels (no geometry) read as the far plane, i.e. fully
-        // unoccluded for any consumer.
-        clearValue: Vector4(_farDepth, 0.0, 0.0, 1.0),
-      ),
+    final surfaces = surfaceColors;
+    gpu.Texture? albedo, normal;
+    if (surfaces != null) {
+      albedo = context.texturePool.acquire(
+        TransientTextureDescriptor.color(
+          width: width,
+          height: height,
+          // The linear depth's format: Flutter GPU builds a pass's pipeline
+          // with its first target's format for every target, so a target
+          // of another format took the writes as garbage (2026-11-25).
+          format: gpu.PixelFormat.r32g32b32a32Float,
+          debugName: 'prepass_albedo',
+        ),
+      );
+      normal = context.texturePool.acquire(
+        TransientTextureDescriptor.color(
+          width: width,
+          height: height,
+          format: gpu.PixelFormat.r32g32b32a32Float,
+          debugName: 'prepass_normal',
+        ),
+      );
+    }
+    final target = gpu.RenderTarget(
+      colorAttachments: [
+        gpu.ColorAttachment(
+          texture: linearDepth,
+          // Background texels (no geometry) read as the far plane, i.e. fully
+          // unoccluded for any consumer.
+          clearValue: Vector4(_farDepth, 0.0, 0.0, 1.0),
+        ),
+        if (albedo != null)
+          gpu.ColorAttachment(texture: albedo, clearValue: Vector4.zero()),
+        if (normal != null)
+          gpu.ColorAttachment(texture: normal, clearValue: Vector4.zero()),
+      ],
       depthStencilAttachment: gpu.DepthStencilAttachment(
         texture: depth,
         depthClearValue: depthRasterOf(_camera).clearDepth,
@@ -186,6 +236,7 @@ class DepthPrepass extends RenderGraphPass {
       _layerMask,
       _cullingPlanes,
       writeNormals: _writeNormals,
+      surfaceColors: surfaces,
       cameraRight: _cameraRight,
       cameraUp: _cameraUp,
       primaryView: _primaryView,
@@ -199,6 +250,11 @@ class DepthPrepass extends RenderGraphPass {
     rendererSubmissions.submit(commandBuffer);
 
     context.blackboard.set(kLinearDepthBlackboardKey, linearDepth);
+    if (albedo != null && normal != null) {
+      context.blackboard
+        ..set(kPrepassAlbedoBlackboardKey, albedo)
+        ..set(kPrepassNormalBlackboardKey, normal);
+    }
     if (_keepDepthStencil) {
       context.blackboard.set(kPrepassDepthStencilBlackboardKey, depth);
     }
@@ -348,9 +404,11 @@ class _DepthPrepassEncoder {
     required bool writeNormals,
     required Vector3 cameraRight,
     required Vector3 cameraUp,
+    PrepassSurfaceColors? surfaceColors,
     bool translucentPatch = false,
     bool primaryView = false,
   }) : _writeNormals = writeNormals,
+       _surfaceColors = surfaceColors,
        _translucentPatch = translucentPatch,
        _primaryView = primaryView {
     _renderPass.setDepthWriteEnable(true);
@@ -393,6 +451,9 @@ class _DepthPrepassEncoder {
   final int _layerMask;
   final List<Plane> _cullingPlanes;
   final bool _writeNormals;
+  final PrepassSurfaceColors? _surfaceColors;
+  static final Float32List _surfaceInfo = Float32List(8);
+  static final Vector4 _white = Vector4.all(1);
 
   // Whether this encodes a screen view's camera, for [MeshDrawSelector]s.
   final bool _primaryView;
@@ -410,6 +471,8 @@ class _DepthPrepassEncoder {
       baseShaderLibrary['LinearDepthMaskedFragment']!;
   static final gpu.Shader _maskedDepthNormalShader =
       baseShaderLibrary['LinearDepthNormalMaskedFragment']!;
+  static final gpu.Shader _surfacesShader =
+      baseShaderLibrary['LinearDepthSurfacesFragment']!;
 
   // The roughness map is a tiled material texture; sample it with repeat.
   static final gpu.SamplerOptions _roughnessSampler = gpu.SamplerOptions(
@@ -527,7 +590,21 @@ class _DepthPrepassEncoder {
                 : DepthSurfaceKind.linearDepth,
           );
     final masked = surfaceShader != null || item.material.depthAlphaMasked;
-    final fragmentShader = surfaceShader ?? _fragmentShaderFor(masked);
+    // With surfaces: a `mask_surface` material's own prepass fragment; else
+    // the engine's (the material's mask inputs), unless the material cuts
+    // its depth by its own Surface() (that wins: its coverage matters more
+    // than its surfaces, which stay clear there).
+    final surfaces = _surfaceColors;
+    final ownPrepass = surfaces == null
+        ? null
+        : item.material.maskSurfaceShader(MaskSurfaceKind.prepass);
+    final engineSurfaces =
+        surfaces != null && ownPrepass == null && surfaceShader == null;
+    final fragmentShader =
+        ownPrepass ??
+        (engineSurfaces ? _surfacesShader : null) ??
+        surfaceShader ??
+        _fragmentShaderFor(masked);
     // Unskinned geometry draws depth through a position-only shader and layout
     // (fetching only position); skinned geometry has no such variant, so it
     // falls back to its full vertex shader and bind. The normal-writing path
@@ -610,7 +687,7 @@ class _DepthPrepassEncoder {
             .clamp(0, 1)
             .toDouble();
       // A surface fragment takes its roughness from Surface() instead.
-      if (surfaceShader == null) {
+      if (surfaceShader == null && ownPrepass == null) {
         final roughness = item.material.reflectionRoughnessTexture;
         _renderPass.bindTexture(
           fragmentShader.cachedUniformSlot('metallic_roughness_texture'),
@@ -627,7 +704,41 @@ class _DepthPrepassEncoder {
       fragmentShader.cachedUniformSlot(_infoBlockName),
       _transientsBuffer.emplace(scratchBytesOf(_depthInfo)),
     );
-    if (surfaceShader != null) {
+    if (surfaces != null && (ownPrepass != null || engineSurfaces)) {
+      final node = item.sourceNode;
+      final a = node == null ? _white : surfaces.albedo(node);
+      final n = node == null ? _white : surfaces.normal(node);
+      _surfaceInfo
+        ..[0] = a.x
+        ..[1] = a.y
+        ..[2] = a.z
+        ..[3] = a.w
+        ..[4] = n.x
+        ..[5] = n.y
+        ..[6] = n.z
+        ..[7] = n.w;
+      _renderPass.bindUniform(
+        fragmentShader.cachedUniformSlot('PrepassSurfaceInfo'),
+        _transientsBuffer.emplace(scratchBytesOf(_surfaceInfo)),
+      );
+    }
+    if (ownPrepass != null) {
+      item.material.bindDepthSurface(
+        _renderPass,
+        fragmentShader,
+        _transientsBuffer,
+        cameraPosition: _cameraPosition,
+        cameraForward: _cameraForward,
+      );
+    } else if (engineSurfaces) {
+      item.material.bindMaskSurface(
+        _renderPass,
+        fragmentShader,
+        _transientsBuffer,
+        baseColor: true,
+        normal: true,
+      );
+    } else if (surfaceShader != null) {
       item.material.bindDepthSurface(
         _renderPass,
         fragmentShader,

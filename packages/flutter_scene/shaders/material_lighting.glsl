@@ -520,6 +520,15 @@ highp vec4 EvaluateLighting(MaterialInputs material) {
           ? SampleShadow(v_position, GetWorldNormal()) *
                 SampleDirectionalCookie(v_position)
           : 1.0;
+#ifndef FLUTTER_SCENE_SHADOW_CATCHER
+  // The application's screen-space sun visibility (a second shadow source;
+  // white when none): the render target's size, stored top-down like the
+  // prepass's targets, as the occlusion buffer is.
+  shadow = min(shadow,
+               texture(sun_visibility,
+                       gl_FragCoord.xy / vec2(textureSize(sun_visibility, 0)))
+                   .r);
+#endif
 #endif
 #if !defined(FLUTTER_SCENE_SKIP_SSAO) && \
     !defined(FLUTTER_SCENE_NO_SCREEN_SPACE_OCCLUSION) && \

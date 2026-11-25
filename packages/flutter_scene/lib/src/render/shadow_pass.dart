@@ -268,6 +268,7 @@ class ShadowPass extends RenderGraphPass {
       ShadowCasterFilter filter = ShadowCasterFilter.all,
       int casterChannelMask = 0xFF,
       List<Plane> receiverPlanes = const [],
+      int cascadeIndex = -1,
     }) {
       renderPass.setViewport(_viewport(tile));
       final encoder = ShadowEncoder(
@@ -279,6 +280,7 @@ class ShadowPass extends RenderGraphPass {
         filter: filter,
         casterChannelMask: casterChannelMask,
         receiverPlanes: receiverPlanes,
+        cascadeIndex: cascadeIndex,
       );
       _renderScene.cull(
         encoder.frustum,
@@ -309,6 +311,7 @@ class ShadowPass extends RenderGraphPass {
           filter: ShadowCasterFilter.dynamicOnly,
           casterChannelMask: _casterChannelMask,
           receiverPlanes: _receiverPlanesFor(c),
+          cascadeIndex: c,
         );
         for (final item in _renderScene.items) {
           encoder.submit(item);
@@ -321,6 +324,7 @@ class ShadowPass extends RenderGraphPass {
           _casterFaces,
           casterChannelMask: _casterChannelMask,
           receiverPlanes: _receiverPlanesFor(c),
+          cascadeIndex: c,
         );
       }
     }

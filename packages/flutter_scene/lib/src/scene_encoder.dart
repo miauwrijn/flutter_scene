@@ -12,6 +12,7 @@ import 'package:flutter_scene/src/camera.dart';
 import 'package:flutter_scene/src/geometry/geometry.dart';
 import 'package:flutter_scene/src/geometry/vertex_layout.dart';
 import 'package:flutter_scene/src/light.dart';
+import 'package:flutter_scene/src/fmat/fmat_ast.dart' show DepthSurfaceKind;
 import 'package:flutter_scene/src/fmat/material_registry.dart'
     show fmatSourcePathOf;
 import 'package:flutter_scene/src/material/instance_attributes.dart';
@@ -879,7 +880,15 @@ base class SceneEncoder {
   // Whether an opaque draw of [material] at cross-fade coverage [fade] cuts
   // itself out, and so takes the coverage pre-draw.
   static bool _cutsOut(Material material, double fade) =>
-      material.depthAlphaMasked || (fade != 1.0 && material.lodCrossFades);
+      material.depthAlphaMasked ||
+      material.depthSurfaceShader(DepthSurfaceKind.coverage) != null ||
+      (fade != 1.0 && material.lodCrossFades);
+
+  // The coverage pre-draw's fragment for [material]: a `.fmat` cutout's own
+  // (its `Surface()` and discards, see `materialHasCoverageSurface`), else
+  // the engine's mask-and-fade one.
+  static gpu.Shader _coverageShaderOf(Material material) =>
+      material.depthSurfaceShader(DepthSurfaceKind.coverage) ?? _coverageShader;
 
   // MaskInfo for a cross-fade without an alpha mask: a cutoff no alpha falls
   // below, over the white placeholder.
@@ -1086,7 +1095,7 @@ base class SceneEncoder {
       if (!fallback && _cutsOut(material, fade)) {
         coveragePipeline = tryResolvePipeline(
           materialVertex ?? geometry.vertexShader,
-          _coverageShader,
+          _coverageShaderOf(material),
           vertexLayout: geometry.instancedVertexLayoutFor(
             material.instanceAttributes,
             material.vertexAttributesFor(materialVertex),
@@ -1572,6 +1581,19 @@ base class SceneEncoder {
   // Binds the coverage pre-draw's fragment inputs: the cross-fade [fade] and
   // the material's alpha mask, or a mask that keeps everything.
   void _bindCoverage(Material material, double fade) {
+    final own = material.depthSurfaceShader(DepthSurfaceKind.coverage);
+    if (own != null) {
+      // A `.fmat` cutout's own coverage: its parameters, samplers and the
+      // camera blocks Surface() reads (the depth surfaces' bind).
+      material.bindDepthSurface(
+        _renderPass,
+        own,
+        _transientsBuffer,
+        cameraPosition: _cameraPosition,
+        cameraForward: _cameraForward,
+      );
+      return;
+    }
     final shader = _coverageShader;
     _coverageInfoScratch[0] = fade;
     _renderPass.bindUniform(
@@ -1713,7 +1735,7 @@ base class SceneEncoder {
         material: material,
         vertexShader: materialVertex ?? geometry.vertexShader,
         fragmentShader: _coveragePass
-            ? _coverageShader
+            ? _coverageShaderOf(material)
             : material.fragmentShaderForLighting(_lighting),
         pipeline: pipeline,
         batchedItems: batchedItems,
@@ -2199,6 +2221,22 @@ base class SceneEncoder {
   /// when the scene pass snapshots the opaque color between them.
   void flushOpaque() {
     _phase = DrawPhase.opaque;
+    // The overdraw view: every opaque fragment adds its share, none hides
+    // another.
+    final overdraw =
+        _debugView?.sceneView.channel == SurfaceDebugChannel.overdraw;
+    if (overdraw) {
+      _renderPass
+        ..setColorBlendEnable(true)
+        ..setColorBlendEquation(
+          gpu.ColorBlendEquation(
+            destinationColorBlendFactor: gpu.BlendFactor.one,
+            destinationAlphaBlendFactor: gpu.BlendFactor.one,
+          ),
+        )
+        ..setDepthCompareOperation(gpu.CompareFunction.always)
+        ..setDepthWriteEnable(false);
+    }
     // Froxel-lit fragments read their lights from the view's grid, so the
     // items' own light lists neither order nor split the opaque runs.
     final froxelLighting = _lighting.froxels != null;
@@ -2308,6 +2346,12 @@ base class SceneEncoder {
       _opaqueRecordPool.add(record);
     }
     _opaqueRecords.clear();
+    if (overdraw) {
+      _renderPass
+        ..setColorBlendEnable(false)
+        ..setDepthCompareOperation(_raster.nearerOrEqual)
+        ..setDepthWriteEnable(true);
+    }
   }
 
   // Encodes the opaque records [index, end) (one batchable run) with

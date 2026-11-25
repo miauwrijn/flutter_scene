@@ -4,6 +4,8 @@ import 'dart:ui' as ui;
 
 import 'package:flutter/foundation.dart' show debugPrint, visibleForTesting;
 import 'package:flutter_scene/src/depth_conflicts.dart' show DepthConflictIds;
+import 'package:flutter_scene/src/render/custom_render_pass.dart'
+    show kSunVisibilityBlackboardKey;
 import 'package:flutter_scene/src/render/viewport_camera.dart';
 import 'package:flutter_scene/src/gpu/gpu.dart' as gpu;
 import 'package:vector_math/vector_math.dart';
@@ -320,6 +322,9 @@ class ScenePass extends RenderGraphPass {
     final ssaoMap = context.blackboard.get<gpu.Texture>(
       kSsaoTextureBlackboardKey,
     );
+    final sunVisibilityMap = context.blackboard.get<gpu.Texture>(
+      kSunVisibilityBlackboardKey,
+    );
     // During an environment cross-fade, copy both environments' diffuse-SH
     // coefficients into one 9x2 composite so the lit shader reads them
     // through a single sampler. Without a cross-fade the primary's own 9x1
@@ -389,6 +394,7 @@ class ScenePass extends RenderGraphPass {
             ),
       cascades: shadowMap == null ? const [] : _cascades,
       ssaoMap: ssaoMap,
+      sunVisibilityMap: sunVisibilityMap,
       specularOcclusionMode: ssaoMap == null ? 0.0 : _specularOcclusionMode,
       ssaoDirectLightAffect: ssaoMap == null ? 0.0 : _ssaoDirectLightAffect,
       ssaoMultiBounce: ssaoMap == null ? 0.0 : _ssaoMultiBounce,

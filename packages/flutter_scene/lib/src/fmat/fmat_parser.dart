@@ -578,6 +578,8 @@ FmatMaterial _build(
     'environment_lighting',
     'directional_light',
     'alpha_to_coverage',
+    'cutout',
+    'shadow_cutout',
   };
   for (final key in tree.keys) {
     if (!knownKeys.contains(key)) {
@@ -698,6 +700,20 @@ FmatMaterial _build(
       fileName: fileName,
     );
   }
+
+  final cutoutValue = tree['cutout'];
+  if (cutoutValue != null && cutoutValue is! bool) {
+    throw FmatException('`cutout` must be a boolean.', fileName: fileName);
+  }
+  final cutout = cutoutValue as bool? ?? false;
+  final shadowCutoutValue = tree['shadow_cutout'];
+  if (shadowCutoutValue != null && shadowCutoutValue is! bool) {
+    throw FmatException(
+      '`shadow_cutout` must be a boolean.',
+      fileName: fileName,
+    );
+  }
+  final shadowCutout = shadowCutoutValue as bool? ?? false;
 
   final directionalLightValue = tree['directional_light'];
   if (directionalLightValue != null && directionalLightValue is! bool) {
@@ -983,6 +999,8 @@ FmatMaterial _build(
     environmentLighting: environmentLighting,
     directionalLight: directionalLight,
     alphaToCoverage: alphaToCoverage,
+    cutout: cutout,
+    shadowCutout: shadowCutout,
   );
 }
 

@@ -18,14 +18,16 @@ MeshDrawSelection beginMeshDraw(
   Geometry geometry,
   MeshDrawPass pass,
   Vector3 cameraPosition,
-  bool primaryView,
-) {
+  bool primaryView, {
+  int shadowCascade = -1,
+}) {
   final selector = item.drawSource?.drawSelector;
   if (selector == null) return MeshDrawSelection.all;
   _context
     ..pass = pass
     ..cameraPosition = cameraPosition
-    ..primaryView = primaryView;
+    ..primaryView = primaryView
+    ..shadowCascade = shadowCascade;
   final selection = selector(_context);
   if (selection.firstIndex != 0 || selection.indexCount != null) {
     geometry.setDrawWindow(selection.firstIndex, selection.indexCount);

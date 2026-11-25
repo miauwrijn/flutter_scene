@@ -11,7 +11,13 @@ enum DepthSurfaceKind {
   linearDepthNormal('DepthNormalSurface', 'linear_depth_normal'),
 
   /// A shadow map.
-  shadow('ShadowSurface', 'shadow');
+  shadow('ShadowSurface', 'shadow'),
+
+  /// The main pass's coverage pre-draw (see `materialHasCoverageSurface`):
+  /// `Surface()`'s own cut decides which pixels the lit draw after it shades
+  /// with an equal depth test, so the lit variants carry no discard and keep
+  /// early depth testing and hidden-surface removal.
+  coverage('CoverageSurface', 'coverage');
 
   const DepthSurfaceKind(this.suffix, this.sidecarKey);
 
@@ -29,7 +35,12 @@ enum MaskSurfaceKind {
   albedo('MaskAlbedo', 'albedo', 'FLUTTER_SCENE_MASK_SURFACE_ALBEDO'),
 
   /// The normal mask: `material.normal`, encoded `n * 0.5 + 0.5`.
-  normal('MaskNormal', 'normal', 'FLUTTER_SCENE_MASK_SURFACE_NORMAL');
+  normal('MaskNormal', 'normal', 'FLUTTER_SCENE_MASK_SURFACE_NORMAL'),
+
+  /// The depth prepass with surfaces (`RenderInput.surfaces`): the
+  /// linear-depth-and-normal target and, in two more, what [albedo] and
+  /// [normal] draw — one pass, no redraw.
+  prepass('MaskPrepass', 'prepass', 'FLUTTER_SCENE_MASK_SURFACE_PREPASS');
 
   const MaskSurfaceKind(this.suffix, this.sidecarKey, this.define);
 
@@ -350,6 +361,8 @@ class FmatMaterial {
     this.environmentLighting = true,
     this.directionalLight = true,
     this.alphaToCoverage = false,
+    this.cutout = false,
+    this.shadowCutout = false,
   });
 
   final String name;
@@ -372,6 +385,19 @@ class FmatMaterial {
   /// (`alpha_to_coverage:`, default false), for crisp, sort-free cutouts
   /// such as foliage cards.
   final bool alphaToCoverage;
+
+  /// Whether `Surface()` cuts the surface out with `discard` (`cutout:`,
+  /// default false): the depth passes then run its own cut (its depth
+  /// surfaces), and an opaque one draws through the main pass's coverage
+  /// pre-draw, its lit shading once per pixel without a discard (see
+  /// `materialHasCoverageSurface`).
+  final bool cutout;
+
+  /// Whether the shadow maps run `Surface()`'s own cut (`shadow_cutout:`,
+  /// default false): the material ships its shadow fragment only, so its
+  /// shadow has the shape it draws (a leaf's, not its quad's) while the
+  /// depth prepass keeps the engine's plain depth shader.
+  final bool shadowCutout;
 
   /// The rendering contract this `.fmat` targets (surface material or sky).
   final FmatDomain domain;

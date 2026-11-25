@@ -1209,6 +1209,7 @@ class Lighting {
     this.shadowAtlas,
     this.cascades = const [],
     this.ssaoMap,
+    this.sunVisibilityMap,
     this.specularOcclusionMode = 0.0,
     this.ssaoDirectLightAffect = 0.0,
     this.ssaoMultiBounce = 0.0,
@@ -1381,6 +1382,11 @@ class Lighting {
   /// factor in `.r`), or null when occlusion is off. When set, it modulates
   /// indirect lighting in the shader.
   final gpu.Texture? ssaoMap;
+
+  /// An application's screen-space sun visibility for this frame (red,
+  /// 1 lit .. 0 shadowed), multiplied into the sun's shadow; null: none
+  /// (see `RenderPassContext.publishSunVisibility`).
+  final gpu.Texture? sunVisibilityMap;
 
   /// How indirect specular is occluded: `0` leaves it on the diffuse
   /// occlusion factor, `1` derives a dedicated specular occlusion. Mirrors

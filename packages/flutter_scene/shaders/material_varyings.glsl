@@ -11,7 +11,15 @@ in highp vec2 v_texture_coords_1;
 in vec4 v_color;
 in vec4 v_tangent;
 
+#ifdef FLUTTER_SCENE_SURFACE_TARGETS
+// The depth prepass with surfaces (RenderInput.surfaces): its linear depth
+// target, then the receiver albedo and the shading normal.
+layout(location = 0) out vec4 frag_color;
+layout(location = 1) out vec4 frag_albedo;
+layout(location = 2) out vec4 frag_normal;
+#else
 out vec4 frag_color;
+#endif
 
 // A shader that takes only the varyings (the depth and mask passes) defines
 // FLUTTER_SCENE_NO_VIEW_INFO to leave the block out. Declared but unread, it

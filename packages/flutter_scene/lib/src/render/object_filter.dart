@@ -439,13 +439,16 @@ class _ObjectMaskEncoder {
         if (visible != null && visible.isEmpty) return;
         if (dataSlot != null) {
           bindDraw(item.worldTransform);
-          // Every instance in view and no per-instance attributes: the record
-          // the color pass retains on the GPU is this one, so bind it rather
-          // than packing it again.
+          // Every instance in view, its record as wide as the full vertex
+          // stage reads (the material's instance attributes, as the depth
+          // prepass checks): the record the color pass retains on the GPU
+          // is this one, so bind it rather than packing it again. Requiring
+          // no attributes at all packed a GPU-placed draw's whole capacity
+          // (identity records, a million of them) every frame.
           final packedWorldData = item.instanceWorldData;
           final packedWinding = item.instanceWorldWindingFlipped;
           if (item.visibleInstanceIndices == null &&
-              item.instanceAttributeFloats == 0 &&
+              item.instanceAttributeFloats == attributeFloats &&
               packedWorldData != null &&
               packedWinding != null) {
             final flipped = bindRetainedInstanceData(

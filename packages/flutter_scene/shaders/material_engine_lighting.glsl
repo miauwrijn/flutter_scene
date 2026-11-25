@@ -31,6 +31,14 @@ uniform sampler2D brdf_lut;
 #ifndef FLUTTER_SCENE_SKIP_SHADOWS
 uniform highp sampler2D shadow_map;
 #endif
+#if !defined(FLUTTER_SCENE_SKIP_SHADOWS) && \
+    !defined(FLUTTER_SCENE_NO_DIRECTIONAL_LIGHT) && \
+    !defined(FLUTTER_SCENE_SHADOW_CATCHER)
+// An application's screen-space sun visibility (red, 1 lit .. 0 shadowed;
+// RenderPassContext.publishSunVisibility), multiplied into the sun's shadow.
+// A white placeholder when there is none.
+uniform sampler2D sun_visibility;
+#endif
 #if !defined(FLUTTER_SCENE_SHADOW_CATCHER) && !defined(FLUTTER_SCENE_CUSTOM_AMBIENT)
 // The environment's diffuse SH coefficients and, when the world-space
 // irradiance field is on, that field's probe atlas. Coefficient i sits at

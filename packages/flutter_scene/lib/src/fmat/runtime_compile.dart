@@ -20,11 +20,12 @@ import 'package:flutter_scene/src/fmat/fmat.dart';
 import 'package:flutter_scene/src/fmat/fmat_emitter.dart'
     show
         depthSurfaceEntryName,
+        depthSurfaceKindsOf,
         emitFragmentGlsl,
         kDebugViewsDefine,
         kRadianceCubeDefine,
         materialHasDepthSurface,
-        materialHasMaskSurface,
+        maskSurfaceKindsOf,
         maskSurfaceEntryName,
         materialSamplesEnvironment,
         radianceCubeEntryName;
@@ -188,7 +189,7 @@ final class FmatRuntimeCompiler {
           ),
         },
       if (materialHasDepthSurface(compiled.material))
-        for (final kind in DepthSurfaceKind.values)
+        for (final kind in depthSurfaceKindsOf(compiled.material))
           depthSurfaceEntryName(compiled.material, kind): {
             'type': 'fragment',
             'file': _writeShader(
@@ -197,16 +198,15 @@ final class FmatRuntimeCompiler {
               emitFragmentGlsl(compiled.material, depthSurface: kind),
             ),
           },
-      if (materialHasMaskSurface(compiled.material))
-        for (final kind in MaskSurfaceKind.values)
-          maskSurfaceEntryName(compiled.material, kind): {
-            'type': 'fragment',
-            'file': _writeShader(
-              genDir,
-              '${maskSurfaceEntryName(compiled.material, kind)}.frag',
-              emitFragmentGlsl(compiled.material, maskSurface: kind),
-            ),
-          },
+      for (final kind in maskSurfaceKindsOf(compiled.material))
+        maskSurfaceEntryName(compiled.material, kind): {
+          'type': 'fragment',
+          'file': _writeShader(
+            genDir,
+            '${maskSurfaceEntryName(compiled.material, kind)}.frag',
+            emitFragmentGlsl(compiled.material, maskSurface: kind),
+          ),
+        },
       for (final MapEntry(key: vertexEntry, value: vertexGlsl)
           in compiled.vertexGlsl.entries)
         vertexEntry: {

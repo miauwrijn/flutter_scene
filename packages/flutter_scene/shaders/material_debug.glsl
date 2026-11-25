@@ -101,6 +101,9 @@ vec2 debug_active_range;
 #define DEBUG_CHANNEL_UV_RANGE 76.0
 // Custom.
 #define DEBUG_CHANNEL_CUSTOM 80.0
+// Geometry, but listed here: each fragment adds a twenty-fourth (the pass
+// blends additively with no depth test; see SceneEncoder.flushOpaque).
+#define DEBUG_CHANNEL_OVERDRAW 19.0
 
 // 0 when no view is active, 1 for a whole-viewport view, 2 for a split
 // against the lit result, 3 for a split between two views.
@@ -387,6 +390,8 @@ vec4 DebugSurfaceOutputFor(MaterialInputs material) {
       vec3 p = v_position;
       out_color = vec3(DebugScalar(p.x).x, DebugScalar(p.y).x,
                        DebugScalar(p.z).x);
+    } else if (channel == DEBUG_CHANNEL_OVERDRAW) {
+      out_color = vec3(1.0, 0.45, 0.15) / 24.0;
     } else if (channel == DEBUG_CHANNEL_FACE_ORIENTATION) {
       out_color = gl_FrontFacing ? vec3(0.45, 0.6, 1.0) : vec3(1.0, 0.15, 0.1);
     } else if (channel == DEBUG_CHANNEL_UV0_CHECKER) {

@@ -24,6 +24,7 @@ final class MeshDrawContext {
     required this.pass,
     required this.cameraPosition,
     required this.primaryView,
+    this.shadowCascade = -1,
   });
 
   /// The pass being encoded.
@@ -37,6 +38,11 @@ final class MeshDrawContext {
   /// Whether the pass renders for a screen view's camera. False for texture
   /// views, reflection captures, and shadow maps.
   bool primaryView;
+
+  /// The directional light's cascade a [MeshDrawPass.shadow] draw renders,
+  /// in the order the frame computed them; -1 for any other pass or tile
+  /// (spot and point shadows). Lets a selector draw a per-cascade list.
+  int shadowCascade;
 }
 
 /// The part of a mesh to draw.

@@ -19,11 +19,12 @@ import 'fmat.dart';
 import 'fmat_emitter.dart'
     show
         depthSurfaceEntryName,
+        depthSurfaceKindsOf,
         kDebugViewsDefine,
         kLightmapDefine,
         kRadianceCubeDefine,
         materialHasDepthSurface,
-        materialHasMaskSurface,
+        maskSurfaceKindsOf,
         maskSurfaceEntryName,
         lightmapEntryName,
         materialSamplesEnvironment,
@@ -712,19 +713,18 @@ Map<String, String> emitFragmentShaderVariants(
   // Cutouts cut the depth passes by their own surface alpha.
   final depthSurfaces = <String, String>{
     if (materialHasDepthSurface(material))
-      for (final kind in DepthSurfaceKind.values)
+      for (final kind in depthSurfaceKindsOf(material))
         depthSurfaceEntryName(material, kind): emitFragmentGlsl(
           material,
           depthSurface: kind,
         ),
     // A `mask_surface` material fills the albedo and normal object masks
     // itself.
-    if (materialHasMaskSurface(material))
-      for (final kind in MaskSurfaceKind.values)
-        maskSurfaceEntryName(material, kind): emitFragmentGlsl(
-          material,
-          maskSurface: kind,
-        ),
+    for (final kind in maskSurfaceKindsOf(material))
+      maskSurfaceEntryName(material, kind): emitFragmentGlsl(
+        material,
+        maskSurface: kind,
+      ),
   };
   if (!materialSamplesEnvironment(material)) {
     return <String, String>{
