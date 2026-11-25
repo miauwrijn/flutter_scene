@@ -345,6 +345,7 @@ class FmatMaterial {
     this.depthWrite = false,
     this.effectsDepth = false,
     this.depthOffset = false,
+    this.writableVaryings = false,
     this.maskSurface = false,
     this.depthTest = FmatDepthTest.lessEqual,
     this.depthLayer = 0,
@@ -433,6 +434,16 @@ class FmatMaterial {
   /// maps still see the polygon. Opt-in because a shader that writes depth
   /// gives up early depth rejection for every surface drawn with it.
   final bool depthOffset;
+
+  /// Whether `Surface()` may set the fragment's world position, normal and
+  /// view vector (`writable_varyings:`, default false): `v_position`,
+  /// `v_normal` and `v_viewvector` become globals, initialised from the
+  /// varyings by `InitMaterialInputs()`, that the lighting, shadows and
+  /// fog read after `Surface()`. A deferred resolve shades a surface its
+  /// polygon is not (a visibility buffer drawn as one full-screen
+  /// triangle); `GetWorldNormal()` then returns `v_normal` unflipped, the
+  /// polygon's facing meaning nothing.
+  final bool writableVaryings;
 
   /// Whether the material's own `Surface()` fills the albedo and normal
   /// object masks (`mask_surface:`, default false), what a custom pass reads

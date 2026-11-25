@@ -207,7 +207,8 @@ bool materialHasDepthSurface(FmatMaterial material) =>
     (material.alphaToCoverage ||
         material.effectsDepth ||
         material.cutout ||
-        material.shadowCutout) &&
+        material.shadowCutout ||
+        material.writableVaryings) &&
     material.engineInputs.isEmpty;
 
 final RegExp _discardPattern = RegExp(r'\bdiscard\s*;');
@@ -234,7 +235,12 @@ bool materialHasCoverageSurface(FmatMaterial material) =>
 Iterable<DepthSurfaceKind> depthSurfaceKindsOf(FmatMaterial material) {
   // The full set for alpha to coverage and displaced depth; a `cutout:`
   // material only its coverage, a `shadow_cutout:` one only its shadow.
-  final full = material.alphaToCoverage || material.effectsDepth;
+  // A `writable_varyings` material's surface is not its polygon: every
+  // depth pass runs its Surface() (the polygon's own depth is nothing).
+  final full =
+      material.alphaToCoverage ||
+      material.effectsDepth ||
+      material.writableVaryings;
   return DepthSurfaceKind.values.where(
     (k) => switch (k) {
       DepthSurfaceKind.coverage => materialHasCoverageSurface(material),
@@ -314,6 +320,9 @@ String emitFragmentGlsl(
   }
   if (material.depthOffset) {
     sb.writeln('#define $kMaterialDepthOffsetDefine');
+  }
+  if (material.writableVaryings) {
+    sb.writeln('#define FLUTTER_SCENE_WRITABLE_VARYINGS');
   }
   if (material.engineInputs.contains('filtered_scene_color') ||
       !material.environmentLighting) {
@@ -1169,6 +1178,7 @@ Map<String, Object?> buildSidecar(FmatMaterial material) {
     if (material.depthWrite) 'depth_write': true,
     if (material.effectsDepth) 'effects_depth': true,
     if (material.depthOffset) 'depth_offset': true,
+    if (material.writableVaryings) 'writable_varyings': true,
     if (material.depthTest != FmatDepthTest.lessEqual)
       'depth_test': material.depthTest.token,
     if (material.depthLayer != 0) 'depth_layer': material.depthLayer,

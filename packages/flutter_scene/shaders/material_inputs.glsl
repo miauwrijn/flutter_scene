@@ -90,6 +90,11 @@ struct MaterialInputs {
 // surface normal (NOT a constant), so a lit Surface() that never assigns
 // material.normal still shades with the geometry's curvature.
 MaterialInputs InitMaterialInputs() {
+#ifdef FLUTTER_SCENE_WRITABLE_VARYINGS
+  v_position = v_position_in;
+  v_normal = v_normal_in;
+  v_viewvector = v_viewvector_in;
+#endif
   MaterialInputs material;
   material.base_color = vec4(1.0);
   material.normal = GetWorldNormal();

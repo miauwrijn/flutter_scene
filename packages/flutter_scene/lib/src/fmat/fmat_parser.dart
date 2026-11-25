@@ -565,6 +565,7 @@ FmatMaterial _build(
     'depth_write',
     'effects_depth',
     'depth_offset',
+    'writable_varyings',
     'mask_surface',
     'depth_test',
     'depth_layer',
@@ -660,6 +661,14 @@ FmatMaterial _build(
     );
   }
   final depthOffset = depthOffsetValue as bool? ?? false;
+  final writableValue = tree['writable_varyings'];
+  if (writableValue != null && writableValue is! bool) {
+    throw FmatException(
+      '`writable_varyings` must be a boolean.',
+      fileName: fileName,
+    );
+  }
+  final writableVaryings = writableValue as bool? ?? false;
   if (depthOffset && domain == FmatDomain.sky) {
     throw FmatException(
       '`depth_offset` applies to surface materials; a sky writes no depth.',
@@ -983,6 +992,7 @@ FmatMaterial _build(
     depthWrite: depthWrite,
     effectsDepth: effectsDepth,
     depthOffset: depthOffset,
+    writableVaryings: writableVaryings,
     maskSurface: maskSurface,
     depthTest: depthTest,
     depthLayer: depthLayer,

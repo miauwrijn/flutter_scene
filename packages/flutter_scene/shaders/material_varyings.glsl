@@ -3,9 +3,21 @@
 // output. Plus convenience accessors a material's Surface() function can call
 // instead of touching the raw varyings.
 
+#ifdef FLUTTER_SCENE_WRITABLE_VARYINGS
+// A `writable_varyings` material: the varyings under other names (same
+// order, so the same locations), and globals Surface() may overwrite
+// (InitMaterialInputs copies them in).
+in highp vec3 v_position_in;
+in vec3 v_normal_in;
+in highp vec3 v_viewvector_in;
+highp vec3 v_position;
+vec3 v_normal;
+highp vec3 v_viewvector;
+#else
 in highp vec3 v_position; // world-space position
 in vec3 v_normal; // world-space normal, unit per vertex, renormalize
 in highp vec3 v_viewvector; // camera_position - vertex_position (world space)
+#endif
 in highp vec2 v_texture_coords;
 in highp vec2 v_texture_coords_1;
 in vec4 v_color;
@@ -47,8 +59,12 @@ highp vec3 GetWorldPosition() { return v_position; }
 // Normalized world-space geometric normal (before any normal-map perturbation).
 // Back-facing fragments use the reversed normal required by two-sided lighting.
 vec3 GetWorldNormal() {
+#ifdef FLUTTER_SCENE_WRITABLE_VARYINGS
+  return normalize(v_normal);
+#else
   float face_direction = gl_FrontFacing ? 1.0 : -1.0;
   return normalize(v_normal) * face_direction;
+#endif
 }
 
 #ifndef FLUTTER_SCENE_NO_VIEW_INFO
